@@ -222,6 +222,7 @@ impl Dispatcher {
                             call: inv.call.clone(),
                             provider_call_id: inv.body.get("call_id").and_then(|v| v.as_str()).map(str::to_owned),
                             text: format!("Error: the tool server at {} did not accept this call ({why}).", inv.endpoint),
+                            images: vec![],
                         },
                     });
                 } else {
@@ -251,6 +252,19 @@ pub fn invocation(thread: &str, call: &str, provider_call_id: Option<&str>, oper
     })
 }
 
+/// Images one tool result may carry; more are named in its text and left out.
+pub const MAX_IMAGES: usize = 4;
+
+/// An image content part as a data URL: MCP's `{"type":"image","data":<base64>,"mimeType":...}` or an OpenAI
+/// `image_url` part. Only inline data is taken: a node asked to fetch a URL could be pointed anywhere.
+fn image_url(c: &Value) -> Option<String> {
+    let u = match c.get("data").and_then(|d| d.as_str()) {
+        Some(d) => format!("data:{};base64,{d}", c.get("mimeType").or_else(|| c.get("mime_type")).and_then(|m| m.as_str()).unwrap_or("image/png")),
+        None => c.pointer("/image_url/url").and_then(|u| u.as_str())?.to_owned(),
+    };
+    u.starts_with("data:image/").then_some(u)
+}
+
 /// A callback body (rap_protocol::RapCallback) as the event it queues; None for kinds that carry nothing
 /// for the conversation (view updates).
 pub fn callback_event(body: &Value) -> Result<Option<Event>> {
@@ -264,17 +278,24 @@ pub fn callback_event(body: &Value) -> Result<Option<Event>> {
         "tool_result" => {
             let call = body.get("id").and_then(|i| i.as_str()).context("tool_result has no id")?.to_owned();
             let mut text = body.get("text").and_then(|t| t.as_str()).unwrap_or("").to_owned();
+            let mut images = Vec::new();
             for c in body.get("content").and_then(|c| c.as_array()).into_iter().flatten() {
                 match c.get("type").and_then(|t| t.as_str()) {
                     Some("text") => {
                         if !text.is_empty() { text.push('\n'); }
                         text.push_str(c.get("text").and_then(|t| t.as_str()).unwrap_or(""));
                     }
+                    Some("image") | Some("image_url") => match image_url(c) {
+                        Some(u) if images.len() < MAX_IMAGES => images.push(u),
+                        Some(_) => text.push_str(&format!("\n[an image beyond the first {MAX_IMAGES} was left out]")),
+                        None => text.push_str("\n[an image that is not inline data was left out]"),
+                    },
                     Some(other) => text.push_str(&format!("\n[{other} content omitted]")),
                     None => {}
                 }
             }
-            Event { id: format!("result-{call}-{}", short_hash(&text)), thread, due_ms: 0, created_ms: 0, attempts: 0, kind: EventKind::ToolResult { call, provider_call_id, text } }
+            let id = format!("result-{call}-{}", short_hash(&format!("{text}{}", images.concat())));
+            Event { id, thread, due_ms: 0, created_ms: 0, attempts: 0, kind: EventKind::ToolResult { call, provider_call_id, text, images } }
         }
         "subscription_event" => {
             let call = body.get("tool_call_id").and_then(|i| i.as_str()).context("subscription_event has no tool_call_id")?.to_owned();
@@ -304,4 +325,37 @@ pub fn short_hash(s: &str) -> String {
         h = h.wrapping_mul(0x100000001b3);
     }
     format!("{h:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_result_keeps_inline_images_only() {
+        let body = json!({"type": "tool_result", "group_id": "thread-1", "id": "c1", "text": "look",
+            "content": [{"type": "text", "text": "a frame"},
+                        {"type": "image", "data": "AAA=", "mimeType": "image/jpeg"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBB="}},
+                        {"type": "image_url", "image_url": {"url": "https://elsewhere/x.png"}},
+                        {"type": "image", "data": "CCC=", "mimeType": "text/html"}]});
+        let ev = callback_event(&body).unwrap().unwrap();
+        let EventKind::ToolResult { text, images, .. } = &ev.kind else { panic!("{ev:?}") };
+        assert_eq!(images, &vec!["data:image/jpeg;base64,AAA=".to_owned(), "data:image/png;base64,BBB=".to_owned()]);
+        assert!(text.starts_with("look\na frame"), "{text}");
+        assert_eq!(text.matches("not inline data was left out").count(), 2, "{text}");
+        // the same text with other images is another event, not a duplicate
+        let mut other = body.clone();
+        other["content"][1]["data"] = json!("ZZZ=");
+        assert_ne!(callback_event(&other).unwrap().unwrap().id, ev.id);
+    }
+
+    #[test]
+    fn past_four_images_are_named_not_sent() {
+        let parts: Vec<Value> = (0..6).map(|i| json!({"type": "image", "data": format!("D{i}"), "mimeType": "image/png"})).collect();
+        let ev = callback_event(&json!({"type": "tool_result", "group_id": "t", "id": "c", "content": parts})).unwrap().unwrap();
+        let EventKind::ToolResult { text, images, .. } = &ev.kind else { panic!() };
+        assert_eq!(images.len(), MAX_IMAGES);
+        assert_eq!(text.matches("beyond the first 4").count(), 2);
+    }
 }

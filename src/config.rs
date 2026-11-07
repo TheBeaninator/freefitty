@@ -109,6 +109,10 @@ pub struct Config {
     /// the guard against the node's context limit and does nothing until a thread reaches it.
     #[serde(default = "d_true")]
     pub window: bool,
+    /// Images a request shows as pictures, newest first; older ones become a line saying they left the view.
+    /// Every image in view is paid for on every turn (about 1000 tokens each on strixite).
+    #[serde(default = "d_keep_images")]
+    pub keep_images: usize,
     /// Tokens the view may reach before a cut; 0 = the nodes' context length minus the output cap and a margin.
     #[serde(default)]
     pub window_tokens: u64,
@@ -134,6 +138,7 @@ fn d_model() -> String { "qwen3.8-flash-next".into() }
 fn d_slots() -> u32 { 2 }
 fn d_spill() -> u64 { 16_384 }
 fn d_true() -> bool { true }
+fn d_keep_images() -> usize { 4 }
 fn d_grant_check() -> u64 { 5 }
 fn d_toolset_refresh() -> u64 { 300 }
 fn d_max_output() -> u64 { 4096 }

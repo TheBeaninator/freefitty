@@ -60,7 +60,13 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
             return (axum::http::StatusCode::OK, Json(json!({"choices": [{"message": message}], "usage": {"prompt_tokens": 1}})));
         }
     }
-    let message = if last["role"] == "tool" {
+    let shown: Vec<String> = last["content"].as_array().into_iter().flatten()
+        .filter_map(|p| p.pointer("/image_url/url").and_then(|u| u.as_str()).map(str::to_owned)).collect();
+    let message = if !shown.is_empty() {
+        // a tool's images arrive as a user message after its result: say what was seen and what came before
+        let before = &msgs[msgs.len() - 2];
+        json!({"role": "assistant", "content": format!("saw {} image(s) {} after {}: {}", shown.len(), shown.join(","), before["role"].as_str().unwrap_or(""), before["content"].as_str().unwrap_or(""))})
+    } else if last["role"] == "tool" {
         json!({"role": "assistant", "content": format!("done: {content}")})
     } else if let Some(n) = content.strip_prefix("recall ") {
         // the model asks for a stored message back
@@ -103,7 +109,12 @@ async fn invoke(State(t): State<Arc<FakeTools>>, Json(inv): Json<Value>) -> &'st
     assert_eq!(inv["operation"], "echo");
     assert!(inv["arguments"]["text"].is_string(), "arguments were repaired to an object: {}", inv["arguments"]);
     let cb = inv["callback_url"].as_str().unwrap().to_owned();
-    let result = json!({"type": "tool_result", "group_id": inv["group_id"], "id": inv["id"], "call_id": inv["call_id"], "text": format!("echo: {}", inv["arguments"]["text"].as_str().unwrap())});
+    let mut result = json!({"type": "tool_result", "group_id": inv["group_id"], "id": inv["id"], "call_id": inv["call_id"], "text": format!("echo: {}", inv["arguments"]["text"].as_str().unwrap())});
+    if inv["arguments"]["text"] == "picture" {
+        // an MCP image part beside the text, and one that is a remote URL (left out: only inline data goes on)
+        result["content"] = json!([{"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"},
+                                   {"type": "image_url", "image_url": {"url": "http://example.invalid/x.png"}}]);
+    }
     let delay = if inv["arguments"]["text"] == "slow" { 6000 } else { 200 };
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -642,5 +653,25 @@ async fn a_wrong_estimate_is_corrected_by_the_node_and_the_turn_runs() {
     assert_eq!(th["window"]["cuts"], json!(1));
     assert_eq!(th["prompt_tokens"], json!(100), "the node's real count from the successful turn replaces the overflow's");
     assert!(api.get("/dlq").await.as_array().unwrap().is_empty());
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tools_image_reaches_the_model() {
+    let h = harness().await;
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let sent = api.say("echo picture", None).await;
+    let t = sent["thread"].as_str().unwrap().to_owned();
+    // the first output is the turn that calls the tool; the answer to the result comes after it
+    let mut text = String::new();
+    for _ in 0..3 {
+        let out = api.output(&t, 15).await.expect("a reply");
+        text = out["text"].as_str().unwrap().to_owned();
+        if text.starts_with("saw") { break; }
+    }
+    assert!(text.starts_with("saw 1 image(s) data:image/png;base64,iVBORw0KGgo= after tool: echo: picture"), "{text}");
+    assert!(text.contains("[1 image(s) follow]"), "the tool message says images follow: {text}");
+    assert!(text.contains("not inline data was left out"), "the remote URL is named, not fetched: {text}");
     r.shutdown().await;
 }

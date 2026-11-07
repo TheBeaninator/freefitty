@@ -94,6 +94,14 @@ daemon resumes invocations a crash left unacknowledged. Results come back to
 `<callback_base>/rap/callback/<callback_token>` (or with the token as a bearer); a result posted twice queues
 once. A result for a call the thread no longer waits on is still appended as a tool message.
 
+**Images.** A result may carry images beside its text: MCP `{"type": "image", "data", "mimeType"}` parts or
+`image_url` parts with a `data:image/...` URL, up to four per result. The tool message says how many follow, and
+after the batch's tool messages one user message per result shows them as `image_url` parts, so a strixite node
+with vision on sees them. A remote image URL is named in the text and not sent (a node asked to fetch it could be
+pointed anywhere). Each image counts as 1400 tokens in the estimate, not its base64 bytes, and a request shows
+only the newest `keep_images` (4) as pictures; older ones become a line saying they left the view. The callback
+body limit (`max_body_bytes`) bounds what a tool can send, so a tool should downscale before it posts.
+
 **API** (`listen`, loopback by default):
 
 ```

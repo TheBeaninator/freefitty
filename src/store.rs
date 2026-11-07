@@ -39,7 +39,16 @@ pub enum EventKind {
     /// A person's (or pod-ff's) message.
     User { text: String, #[serde(default)] metadata: Value },
     /// A tool's result, including a sleep's wake-up: `call` is the tool call id the model made.
-    ToolResult { call: String, #[serde(default)] provider_call_id: Option<String>, text: String },
+    /// `images` are data:image/... URLs the tool returned beside its text; the model sees them in a user message
+    /// right after the batch's tool messages (a tool message carries text only in the templates).
+    ToolResult {
+        call: String,
+        #[serde(default)]
+        provider_call_id: Option<String>,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
+    },
     /// A subscription event a tool posted on its own.
     Subscription { call: String, text: String, #[serde(default)] r#final: bool },
     /// Refocus the thread before its next turn: fold what came before into notes around `focus`.

@@ -16,9 +16,56 @@ use crate::store::PendingCall;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
-/// Bytes / 4 of one message, as everywhere else.
+/// What one image costs in a node's prompt, as an estimate: strixite fits an image to about 1000 tokens, and
+/// pod-hands view_image never sends one past 1024 px on a side. Its base64 bytes say nothing about it.
+pub const IMAGE_TOKENS: u64 = 1400;
+
+/// Bytes / 4 of one message, as everywhere else, with each image counted as IMAGE_TOKENS instead of its bytes.
 pub fn weigh(m: &Value) -> u64 {
-    (serde_json::to_vec(m).map(|b| b.len()).unwrap_or(0) / 4) as u64
+    let bytes = serde_json::to_vec(m).map(|b| b.len()).unwrap_or(0);
+    let urls: Vec<&str> = image_urls(m).collect();
+    let data: usize = urls.iter().map(|u| u.len()).sum();
+    (bytes.saturating_sub(data) / 4) as u64 + urls.len() as u64 * IMAGE_TOKENS
+}
+
+fn image_urls(m: &Value) -> impl Iterator<Item = &str> {
+    m.get("content").and_then(|c| c.as_array()).into_iter().flatten().filter_map(|p| p.pointer("/image_url/url").and_then(|u| u.as_str()))
+}
+
+/// The user message that shows a tool's images to the model: a label, then one image_url part per image.
+pub fn image_message(label: &str, images: &[String]) -> Value {
+    let mut parts = vec![json!({"type": "text", "text": label})];
+    parts.extend(images.iter().map(|u| json!({"type": "image_url", "image_url": {"url": u}})));
+    json!({"role": "user", "content": parts})
+}
+
+/// A message's words: the string content, or the text parts of a list with `[image]` for each image.
+pub fn text_of(m: &Value) -> String {
+    match m.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts.iter().map(|p| match p.get("type").and_then(|t| t.as_str()) {
+            Some("text") => p.get("text").and_then(|t| t.as_str()).unwrap_or("").to_owned(),
+            Some("image_url") => "[image]".to_owned(),
+            _ => String::new(),
+        }).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" "),
+        _ => String::new(),
+    }
+}
+
+/// Only the newest `keep` images stay pictures in a view; older ones become a line saying so. Every image in
+/// view is paid for on every turn, and a thread looking at many frames would otherwise carry them all.
+pub fn fade_images(view: &mut [Value], keep: usize) {
+    let mut seen = 0usize;
+    for m in view.iter_mut().rev() {
+        let Some(parts) = m.get_mut("content").and_then(|c| c.as_array_mut()) else { continue };
+        for p in parts.iter_mut().rev() {
+            if p.get("type").and_then(|t| t.as_str()) != Some("image_url") { continue; }
+            seen += 1;
+            if seen > keep {
+                *p = json!({"type": "text", "text": "[an image shown earlier is out of view; view it again to see it]"});
+            }
+        }
+    }
 }
 
 fn role(m: &Value) -> &str {
@@ -97,7 +144,7 @@ pub fn notice(history: &[Value], low: usize, from: usize) -> String {
     let mut skipped = 0usize;
     for (k, m) in gone.iter().enumerate() {
         if role(m) != "user" { continue; }
-        let text: String = m.get("content").and_then(|c| c.as_str()).unwrap_or("").chars().take(NOTICE_MSG_CHARS).collect();
+        let text: String = text_of(m).chars().take(NOTICE_MSG_CHARS).collect();
         let line = format!(" #{}: {:?}", low + k, text.trim());
         if used + line.len() > NOTICE_CHARS { skipped += 1; continue; }
         used += line.len();
@@ -113,7 +160,7 @@ pub fn render(i: usize, m: &Value) -> String {
     let mut s = format!("#{i} {}", role(m));
     if let Some(id) = m.get("tool_call_id").and_then(|v| v.as_str()) { s.push_str(&format!(" (result of {id})")); }
     s.push_str(": ");
-    if let Some(c) = m.get("content").and_then(|c| c.as_str()) { s.push_str(c); }
+    s.push_str(&text_of(m));
     for tc in m.get("tool_calls").and_then(|t| t.as_array()).into_iter().flatten() {
         s.push_str(&format!("\n  [call {} {}({})]", tc.get("id").and_then(|v| v.as_str()).unwrap_or(""),
             tc.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or(""),
@@ -250,6 +297,28 @@ pub fn replay(history: &[Value], budget: u64, target: u64, scale: f64, fixed: u6
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_image_weighs_its_estimate_not_its_bytes() {
+        let big = format!("data:image/png;base64,{}", "A".repeat(400_000));
+        let m = image_message("[image(s) from tool call c1]", &[big]);
+        let w = weigh(&m);
+        assert!((IMAGE_TOKENS..IMAGE_TOKENS + 100).contains(&w), "weighs {w}");
+        assert_eq!(text_of(&m), "[image(s) from tool call c1] [image]");
+        assert!(render(3, &m).ends_with("[image(s) from tool call c1] [image]"));
+    }
+
+    #[test]
+    fn only_the_newest_images_stay_in_view() {
+        let img = |n: &str| image_message(n, &[format!("data:image/png;base64,{n}")]);
+        let mut v = vec![json!({"role": "user", "content": "hi"}), img("a"), img("b"), img("c")];
+        fade_images(&mut v, 2);
+        let urls: Vec<&str> = v.iter().flat_map(|m| image_urls(m).collect::<Vec<_>>()).collect();
+        assert_eq!(urls, vec!["data:image/png;base64,b", "data:image/png;base64,c"]);
+        assert!(text_of(&v[1]).contains("out of view"), "{}", text_of(&v[1]));
+        fade_images(&mut v, 0);
+        assert_eq!(v.iter().map(|m| image_urls(m).count()).sum::<usize>(), 0);
+    }
     use super::*;
 
     fn user(t: &str) -> Value { json!({"role": "user", "content": t}) }

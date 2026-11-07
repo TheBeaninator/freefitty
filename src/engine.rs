@@ -42,7 +42,7 @@ pub enum Outcome {
 const UNKNOWN_TOOL_ROUNDS: usize = 3;
 
 pub fn tokens(v: &[Value]) -> u64 {
-    (serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0) / 4) as u64
+    v.iter().map(window::weigh).sum()
 }
 
 /// The bytes / 4 estimate scaled up by `scale` (never down: a node that reports fewer tokens than the estimate,
@@ -153,6 +153,8 @@ impl Engine {
         let mut new_messages: Vec<Value> = Vec::new();
         let mut reply_to: Option<String> = None;
         let mut refocus: Option<Option<String>> = None;
+        // images go after every tool message of the batch: a user message between two results would split them
+        let mut image_messages: Vec<Value> = Vec::new();
         for (_, ev) in &live {
             match &ev.kind {
                 EventKind::User { text, .. } => {
@@ -161,7 +163,7 @@ impl Engine {
                     new_messages.push(json!({"role": "user", "content": text}));
                     reply_to = Some(ev.id.clone());
                 }
-                EventKind::ToolResult { call, text, .. } => {
+                EventKind::ToolResult { call, text, images, .. } => {
                     // a result for a call nobody is waiting on (a late one, a thread moved here from another
                     // host) is said in the user role: a tool message with no call before it breaks the template
                     // the stored tool message names the call by the id the assistant message carries (the model's
@@ -169,11 +171,13 @@ impl Engine {
                     let awaited = meta.pending.iter().any(|p| &p.id == call);
                     let shown_id = meta.pending.iter().find(|p| &p.id == call).and_then(|p| p.provider_call_id.clone()).unwrap_or_else(|| call.clone());
                     meta.pending.retain(|p| &p.id != call);
+                    let text = if images.is_empty() { text.clone() } else { format!("{text}\n[{} image(s) follow]", images.len()) };
                     new_messages.push(if awaited {
                         json!({"role": "tool", "tool_call_id": shown_id, "content": text})
                     } else {
                         json!({"role": "user", "content": format!("[late result for tool call {call}] {text}")})
                     });
+                    if !images.is_empty() { image_messages.push(window::image_message(&format!("[image(s) from tool call {shown_id}]"), images)); }
                 }
                 EventKind::Subscription { call, text, r#final } => {
                     if *r#final { meta.pending.retain(|p| &p.id != call); }
@@ -184,6 +188,7 @@ impl Engine {
                 }
             }
         }
+        new_messages.extend(image_messages);
         if reply_to.is_none() { reply_to = live.last().map(|(_, e)| e.id.clone()); }
 
         let prefix = prefix(&self.system, &self.store, &meta)?;
@@ -235,6 +240,7 @@ impl Engine {
         // ---- the model's turn --------------------------------------------------------------------
         let mut messages = view.clone();
         messages.extend(new_messages.iter().cloned());
+        window::fade_images(&mut messages, self.cfg.keep_images);
         let sent_est = tokens(&messages);
         let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "max_tokens": self.cfg.max_output_tokens, "stream": false});
 
@@ -260,6 +266,7 @@ impl Engine {
                             if let Some((v, _)) = self.window_cut(thread, &mut meta, &prefix, &history, &pending_at_start, &new_messages, est).await {
                                 let mut msgs = v;
                                 msgs.extend(new_messages.iter().cloned());
+                                window::fade_images(&mut msgs, self.cfg.keep_images);
                                 body["messages"] = Value::Array(msgs);
                                 recut = true;
                                 rounds -= 1;
@@ -455,6 +462,7 @@ impl Engine {
         let cut = view.len() - (n - keep_from) as usize;
         let mut messages: Vec<Value> = view[..cut].to_vec();
         messages.push(json!({"role": "user", "content": instruction}));
+        window::fade_images(&mut messages, self.cfg.keep_images);
         // the same tools as every turn, so the node's cache serves the view; the prompt asks for text only
         // tool_choice none keeps the model from answering the ask with a tool call; a node that does not know
         // the field (400) gets the request again without it
@@ -528,7 +536,7 @@ fn wake(thread: &str, call: &Call, due_ms: u64, text: String) -> Event {
         due_ms,
         created_ms: 0,
         attempts: 0,
-        kind: EventKind::ToolResult { call: call.id.clone(), provider_call_id: call.provider_call_id.clone(), text },
+        kind: EventKind::ToolResult { call: call.id.clone(), provider_call_id: call.provider_call_id.clone(), text, images: vec![] },
     }
 }
 
