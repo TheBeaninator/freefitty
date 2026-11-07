@@ -55,11 +55,12 @@ pub struct Config {
     /// Tokens the model may write per turn.
     #[serde(default = "d_max_output")]
     pub max_output_tokens: u64,
-    /// Prompt tokens a thread may reach (bytes / 4) before its turns end in an error reply; 0 = the nodes'
-    /// context length minus the output cap.
+    /// Prompt tokens a thread may reach before its turns end in an error reply; 0 = the nodes' context length
+    /// minus the output cap. The estimate is bytes / 4, scaled up by how the node counted the last turn.
     #[serde(default)]
     pub max_context_tokens: u64,
-    /// Seconds one slice may take: the model call plus the commit.
+    /// Seconds one request to a node may take. The wait for a free slot is not counted: a turn queued behind
+    /// other threads waits as long as it must (the queue's `oldest_due_s` shows it).
     #[serde(default = "d_slice_timeout")]
     pub slice_timeout_s: u64,
     /// Delivery attempts before a thread's events dead-letter.

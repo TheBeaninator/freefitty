@@ -9,14 +9,16 @@ use std::time::Duration;
 
 struct FakeModel {
     fail: AtomicBool,
+    /// slots the node reports busy with other work
+    busy: AtomicUsize,
     calls: AtomicUsize,
     /// the next notes answer is cut off (finish_reason length)
     cut_notes: AtomicBool,
     bodies: std::sync::Mutex<Vec<Value>>,
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok", "model": "fake", "slots": 2, "busy_slots": 0, "queued": 0, "context_length": 262144}))
+async fn health(State(m): State<Arc<FakeModel>>) -> Json<Value> {
+    Json(json!({"status": "ok", "model": "fake", "slots": 2, "busy_slots": m.busy.load(Ordering::Relaxed), "queued": 0, "context_length": 262144}))
 }
 
 /// The script: a user message starting with "sleep" calls the sleep tool for 1 s, "echo X" calls the echo
@@ -32,6 +34,10 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
     assert_eq!(msgs[0]["role"], "system");
     let last = msgs.last().cloned().unwrap_or(Value::Null);
     let content = last["content"].as_str().unwrap_or("").to_owned();
+    if content.starts_with("overflow") {
+        // what strixite answers when the prompt does not fit
+        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": {"message": "the prompt is 267832 tokens; the context holds 262144 (prompt + at least max_tokens)"}})));
+    }
     let tool_names: Vec<&str> = body["tools"].as_array().expect("every request carries tools").iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
     assert!(tool_names.contains(&"sleep") && tool_names.contains(&"echo"), "tools offered: {tool_names:?}");
     if content.starts_with("Stop working and refocus") {
@@ -117,7 +123,7 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
-    let model = Arc::new(FakeModel { fail: AtomicBool::new(false), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()) });
+    let model = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(0), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()) });
     let model_url = serve(Router::new().route("/health", get(health)).route("/v1/chat/completions", post(completions)).route("/cache/export", post(export)).with_state(model.clone())).await;
     let tools = Arc::new(FakeTools { base: String::new(), invocations: AtomicUsize::new(0) });
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -503,5 +509,46 @@ async fn a_migrated_history_continues_under_its_thread_id() {
     assert_eq!(msgs[1]["content"], "first ask");
     assert_eq!(msgs[3]["tool_call_id"], "call_old");
     assert_eq!(api.get("/threads/moved-1/messages?tail=1").await.as_array().unwrap().len(), 1);
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_context_closes_the_thread_at_once() {
+    let h = harness().await;
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.say("hello", Some("thread-full")).await;
+    assert_eq!(api.output("thread-full", 10).await.unwrap()["text"], "hi: hello");
+    let before = h.model.calls.load(Ordering::Relaxed);
+    let sent = api.say("overflow now", Some("thread-full")).await;
+    let out = api.output("thread-full", 10).await.expect("the error reply");
+    assert_eq!(out["metadata"]["kind"], "error");
+    assert_eq!(out["metadata"]["reply_to"], sent["id"]);
+    assert!(out["text"].as_str().unwrap().contains("context full"), "{out}");
+    assert_eq!(h.model.calls.load(Ordering::Relaxed), before + 1, "one request, no retries");
+    let th = api.get("/threads/thread-full").await;
+    assert!(th["closed"].as_str().unwrap().contains("context full"), "{th}");
+    assert_eq!(api.get("/dlq").await.as_array().unwrap().len(), 1);
+    // the node's own count scales the estimate for the next turn (the fake reports 100 tokens for a small prompt, so no scaling here)
+    assert!(th["prompt_tokens"].as_u64().unwrap() > 0 && th["prompt_est"].as_u64().unwrap() > 0, "{th}");
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn waiting_for_a_slot_is_not_a_timeout() {
+    let mut h = harness().await;
+    h.cfg.slice_timeout_s = 1;
+    h.model.busy.store(2, Ordering::Relaxed);
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let sent = api.say("hello", Some("thread-wait")).await;
+    assert!(api.output("thread-wait", 3).await.is_none(), "the node is full: nothing runs");
+    assert_eq!(h.model.calls.load(Ordering::Relaxed), 0);
+    h.model.busy.store(0, Ordering::Relaxed);
+    let out = api.output("thread-wait", 10).await.expect("the turn after the slot frees");
+    assert_eq!(out["text"], "hi: hello");
+    assert_eq!(out["metadata"]["reply_to"], sent["id"]);
+    assert!(api.get("/dlq").await.as_array().unwrap().is_empty(), "a 3 s wait under a 1 s slice timeout is not a failure");
+    assert!(api.get("/health").await["router"]["waited"].as_u64().unwrap() >= 1);
     r.shutdown().await;
 }

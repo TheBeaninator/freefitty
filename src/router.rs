@@ -74,6 +74,8 @@ pub struct Turn {
     pub prompt_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
     pub finish_reason: Option<String>,
+    /// How long the turn waited for a free slot before its request went out.
+    pub waited_ms: u64,
 }
 
 #[derive(Debug)]
@@ -274,6 +276,7 @@ impl Router {
         let tokens = (serde_json::to_vec(body).map(|b| b.len()).unwrap_or(0) / 4) as u64;
         let mut avoid = Vec::new();
         let total = self.cfg.nodes.len();
+        let placed_at = Instant::now();
         loop {
             let (i, from) = self.place(home, tokens, &avoid).await.map_err(|e| ChatError::Transient(e.to_string()))?;
             let (url, from_url) = {
@@ -322,7 +325,9 @@ impl Router {
                 return Err(if status.as_u16() == 400 { ChatError::Rejected(msg) } else { ChatError::Transient(msg) });
             }
             let v: Value = serde_json::from_slice(&text).map_err(|e| ChatError::Transient(format!("{url}: not JSON: {e}")))?;
-            return parse_turn(&v, url).map_err(ChatError::Transient);
+            let mut turn = parse_turn(&v, url).map_err(ChatError::Transient)?;
+            turn.waited_ms = placed_at.elapsed().as_millis() as u64;
+            return Ok(turn);
         }
     }
 
@@ -365,6 +370,7 @@ fn parse_turn(v: &Value, url: String) -> Result<Turn, String> {
         node: url,
         prompt_tokens: usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()),
         cached_tokens: usage.and_then(|u| u.pointer("/prompt_tokens_details/cached_tokens")).and_then(|v| v.as_u64()),
+        waited_ms: 0,
     })
 }
 

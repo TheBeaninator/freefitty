@@ -149,7 +149,10 @@ impl Queue {
     async fn slice(&self, thread: String, batch: Vec<(u64, Event)>) {
         let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
         let reply_to = batch.iter().rev().find_map(|(_, e)| match e.kind { crate::store::EventKind::User { .. } => Some(e.id.clone()), _ => None });
-        let outcome = tokio::time::timeout(Duration::from_secs(self.engine.cfg.slice_timeout_s + 30), self.engine.slice(&thread, &batch)).await.unwrap_or_else(|_| Outcome::Transient("slice timed out".into()));
+        // no clock here: `slice_timeout_s` bounds each request to a node (the router's client), and the wait for a
+        // free slot is not the thread's fault. Before 2026-11-07 a slice that queued behind long prompts for 15 min
+        // failed "slice timed out" three times and dead-lettered; `/health` oldest_due_s is where the wait shows.
+        let outcome = self.engine.slice(&thread, &batch).await;
         let result = match outcome {
             Outcome::Done => {
                 let mut ev = self.events.lock().unwrap();

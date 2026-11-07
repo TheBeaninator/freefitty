@@ -53,9 +53,12 @@ their deletion are as durable as everything else. Two daemons cannot open one da
 slice in flight is skipped, so a conversation never runs twice at once and stays strictly ordered however many
 threads run. A failed slice retries after `retry_after_s` and dead-letters after `max_attempts`, with an error
 reply so the operator sees it; `dlq redrive` puts the events back with their ids kept, so a turn that had
-committed is not run again. An error no retry fixes (the context is full) dead-letters at once and closes the
+committed is not run again. An error no retry fixes (the context is full, by FreeFitty's estimate or by the node's
+own 400) dead-letters at once and closes the
 thread. While no node is up nothing starts, so an outage costs no attempts. On SIGTERM nothing new starts and
-running slices finish; give the unit `TimeoutStopSec` at least `slice_timeout_s`. If the scheduler or the server
+running slices finish; give the unit `TimeoutStopSec` at least `slice_timeout_s`. `slice_timeout_s` bounds one
+request to a node; a turn queued behind other threads waits for its slot as long as it must, and that wait shows in
+`/health` as `oldest_due_s` and in the turn's log line. If the scheduler or the server
 ever ends on its own the process exits with status 3, so systemd restarts a whole daemon rather than leaving one
 that answers `/health` and takes no work.
 
@@ -132,7 +135,7 @@ and the kept tail is held under half of `compact_at_tokens` when that is set. Af
 node is forgotten: its cached state covers only the prefix now, so the router places it fresh.
 
 `freefitty show THREAD` marks where the live view starts and `show --live` prints what the model sees;
-`GET /threads/{id}` reports `compaction` (from, focus, count, truncated) and `live_tokens`.
+`GET /threads/{id}` reports `compaction` (from, focus, count, truncated), `live_tokens` (bytes / 4) and `prompt_tokens`, the node's own count for the last turn.
 
 ## Preloaded experts, off by default
 

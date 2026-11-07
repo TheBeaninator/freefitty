@@ -42,6 +42,20 @@ pub fn tokens(v: &[Value]) -> u64 {
     (serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0) / 4) as u64
 }
 
+/// The bytes / 4 estimate scaled up by how densely the node tokenized this thread's last turn. Only up: a
+/// node that reports fewer tokens than the estimate (a fake, a different accounting) never makes the guard
+/// looser than bytes / 4.
+pub fn calibrated(est: u64, meta: &ThreadMeta) -> u64 {
+    if meta.prompt_est == 0 || meta.prompt_tokens <= meta.prompt_est { return est; }
+    (est as f64 * meta.prompt_tokens as f64 / meta.prompt_est as f64) as u64
+}
+
+/// A node's 400 that says the prompt does not fit its context: no retry fixes it.
+pub fn is_context_overflow(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("context") && (m.contains("token") || m.contains("length"))
+}
+
 /// The shared prefix: the system prompt, then the expert's own messages. The system message is always the
 /// first and the same for every thread, so every node's cache serves it to all of them.
 pub fn prefix(system: &str, store: &Store, meta: &ThreadMeta) -> anyhow::Result<Vec<Value>> {
@@ -163,7 +177,7 @@ impl Engine {
 
         // ---- refocus -----------------------------------------------------------------------------
         let mut view = live_view(&prefix, &meta, &history, &pending_at_start);
-        let mut est = tokens(&view) + tokens(&new_messages);
+        let mut est = calibrated(tokens(&view) + tokens(&new_messages), &meta);
         if self.cfg.compaction && (refocus.is_some() || (self.cfg.compact_at_tokens > 0 && est > self.cfg.compact_at_tokens)) {
             let focus = refocus.clone().flatten();
             match self.refocus(thread, &meta, &view, &history, &defs, focus, est).await? {
@@ -171,7 +185,7 @@ impl Engine {
                     meta.compactions.push(c);
                     meta.node = None;
                     view = live_view(&prefix, &meta, &history, &pending_at_start);
-                    est = tokens(&view) + tokens(&new_messages);
+                    est = calibrated(tokens(&view) + tokens(&new_messages), &meta);
                     if self.cfg.compact_at_tokens > 0 && est > self.cfg.compact_at_tokens {
                         tracing::warn!("{thread}: still ~{est} tokens after refocusing (the kept tail or the new messages are large)");
                     }
@@ -197,6 +211,7 @@ impl Engine {
         // ---- the model's turn --------------------------------------------------------------------
         let mut messages = view;
         messages.extend(new_messages.iter().cloned());
+        let sent_est = tokens(&messages);
         let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "max_tokens": self.cfg.max_output_tokens, "stream": false});
 
         let mut reply_text = String::new();
@@ -207,11 +222,20 @@ impl Engine {
             rounds += 1;
             let turn = match self.router.chat(meta.node.as_deref(), &body).await {
                 Ok(t) => t,
+                // the node says the prompt does not fit: the thread is done, retrying only repeats the refusal
+                Err(ChatError::Rejected(e)) if is_context_overflow(&e) => return Ok(Outcome::Fatal(format!("context full: {e}"))),
                 Err(ChatError::Transient(e)) | Err(ChatError::Rejected(e)) => return Ok(Outcome::Transient(e)),
             };
             meta.node = Some(turn.node.clone());
+            let waited = if turn.waited_ms >= 1000 { format!(", waited {} s for a slot", turn.waited_ms / 1000) } else { String::new() };
             if let (Some(p), Some(c)) = (turn.prompt_tokens, turn.cached_tokens) {
-                tracing::info!("{thread}: turn on {} ({p} prompt tokens, {c} from its cache)", turn.node);
+                tracing::info!("{thread}: turn on {} ({p} prompt tokens, {c} from its cache{waited})", turn.node);
+            } else if !waited.is_empty() {
+                tracing::info!("{thread}: turn on {}{waited}", turn.node);
+            }
+            if let Some(p) = turn.prompt_tokens.filter(|&p| p > 0) {
+                meta.prompt_tokens = p;
+                meta.prompt_est = sent_est.max(1);
             }
             let (assistant, calls) = normalize(&turn.message);
             new_messages.push(assistant.clone());
@@ -440,6 +464,23 @@ fn until(args: &Value) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimates_scale_up_only() {
+        let mut m = ThreadMeta::default();
+        assert_eq!(calibrated(1000, &m), 1000);
+        m.prompt_est = 1000; m.prompt_tokens = 1300;
+        assert_eq!(calibrated(2000, &m), 2600);
+        m.prompt_tokens = 10;
+        assert_eq!(calibrated(2000, &m), 2000, "a node that counts fewer never loosens the guard");
+    }
+
+    #[test]
+    fn overflow_messages_are_fatal() {
+        assert!(is_context_overflow("http://n:5300 answered 400 Bad Request: {\"error\":{\"message\":\"the prompt is 267832 tokens; the context holds 262144\"}}"));
+        assert!(is_context_overflow("This model's maximum context length is 262144 tokens"));
+        assert!(!is_context_overflow("400 Bad Request: unknown field tool_choice"));
+    }
 
     #[test]
     fn args_repaired() {

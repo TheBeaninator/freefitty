@@ -118,6 +118,12 @@ pub struct ThreadMeta {
     /// Set when a turn ended in an error the thread cannot recover from (context full).
     #[serde(default)]
     pub closed: Option<String>,
+    /// The node's own prompt-token count for the last turn, and the bytes / 4 estimate of what was sent then:
+    /// their ratio corrects the estimate for the next turn (the tokenizer is denser than 4 bytes a token).
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub prompt_est: u64,
     /// What the newest stored message is: user, tool_result, assistant_text, tool_call or assistant_empty.
     /// A watcher reads "stopped talking" here: assistant_empty, or tool_call with nothing pending.
     #[serde(default)]
