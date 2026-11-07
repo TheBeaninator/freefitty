@@ -11,7 +11,7 @@ We describe a small, air-gapped cluster of AMD Strix Halo nodes that runs autono
 - **The Elephant-Goldfish Model (EGM)** is the division of labour: long-lived elephant threads hold context, short cold goldfish threads do work and die.
 - **The Optical Memory Fabric (OMF)** is the research track asking how much memory a cached token can carry, through rendered pages, vision tokens and direct reuse of KV segments.
 
-The paper states the thesis, reports the measurements that support it so far (bit-exact KV restore 2.5 to 17.7x faster than prefill, 6x state compression with facts intact, order-independent splicing of two segments, ~95% cache reuse on live work), and names the two experiments that join the layers: an expert that reads rendered pages, and a thread composed from several frozen experts.
+The paper states the thesis, reports the measurements that support it so far (bit-exact KV restore 2.5 to 17.7x faster than prefill, 6x state compression with facts intact, order-independent splicing of two segments, ~95% cache reuse on live work), and names the three experiments that join the layers: an expert that reads rendered pages, a thread composed from several frozen experts, and goldfish born from experts that elephants can make.
 
 ## 1. Introduction
 
@@ -84,7 +84,7 @@ An end-to-end test on FreeFitty's predecessor, against the same engine and cache
 
 EGM also serves as a quality gate. The goldfish-intake experiment put a cold reader in front of a card, asking it to restate the card from its text and named files alone, and ran it retrospectively over twelve review-failed and eighteen clean cards. It caught two of the twelve misreads at a mean of 94.5 GPU-seconds with no false positives, and showed that nine of the twelve review failures were execution failures, not comprehension failures; it is adopted on the re-queue path, not on every pick. The same shape drives a generative game's creative director: one elephant holds a world's canon, goldfish generators produce slices of it.
 
-What EGM contributes to the architecture is the claim that memory should be unevenly distributed. Not every agent needs the history; most need a document and a question. The cache makes the elephant affordable, the actor system makes its sleep free, and the goldfish keeps the expensive context from leaking into work that does not need it.
+What EGM contributes to the architecture is the claim that memory should be unevenly distributed. Not every agent needs the history; most need a document and a question. The cache makes the elephant affordable, the actor system makes its sleep free, and the goldfish keeps the expensive context from leaking into work that does not need it. The expert is where the two meet: a goldfish born from an expert borrows a reading as a cache hit instead of a per-spawn paste, and an elephant that freezes its notes into a new expert has made a specialized goldfish for the work in front of it.
 
 ## 6. OMF: how much memory a token can carry
 
@@ -158,10 +158,11 @@ The table reads as one argument. The engine's state is exact, compact beyond a f
 
 ## 9. Open questions and the next two experiments
 
-Two experiments are queued to join the layers, the second depending on the first.
+Three experiments are queued to join the layers; the second depends on the first.
 
 1. **An expert that reads rendered pages**. Experts gain an image read kind built as image parts. Threads born from an image expert and from a text expert of the same facts are compared at equal prompt tokens on a dedicated worker: exact-fact recall, first-turn cached tokens and time to first token over ten or more threads each. The open question is whether an image prefix is cached byte-identically across threads at all, and whether a page carries more exact facts per cached token than its text.
 2. **A thread composed from several frozen experts**. A thread starts from two experts and reuses the cache of both. The report measures recall against one concatenated expert and time to first token against re-prefill, and states whether the splice runs through strixite's export and import of segments, as the splice measurement did offline, or through prefix ordering alone.
+3. **Goldfish born from experts, elephants that make them.** The goldfish tool gains an expert parameter, so a specialized goldfish is one cached prefix shared by every spawn, and an elephant gains a tool that freezes its notes into a named expert it can spawn from in the same round. The report compares expert goldfish against inline-document goldfish on cached tokens, time to first token and verdict agreement, and elephant-frozen experts against document-built ones on exact-fact recall, with every elephant-made expert listed with its provenance.
 
 Behind them sit the questions the measurements have not answered:
 
