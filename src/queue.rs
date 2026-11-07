@@ -57,6 +57,10 @@ impl Queue {
         if self.store.is_processed(&ev.id)? {
             return Ok(None);
         }
+        // the same result posted twice before a slice picked it: the second copy must not queue either
+        if self.events.lock().unwrap().values().any(|e| e.id == ev.id) {
+            return Ok(None);
+        }
         if ev.created_ms == 0 { ev.created_ms = now_ms(); }   // the mirror's copy ages from now too
         let seq = self.store.push(ev.clone())?;
         self.events.lock().unwrap().insert(seq, ev);
@@ -69,6 +73,11 @@ impl Queue {
         for (s, e) in items { ev.insert(s, e); }
         drop(ev);
         self.notify.notify_one();
+    }
+
+    /// A slice of this thread is running right now.
+    pub fn is_inflight(&self, thread: &str) -> bool {
+        self.inflight.lock().unwrap().contains(thread)
     }
 
     pub fn forget_thread(&self, thread: &str) {
@@ -147,6 +156,16 @@ impl Queue {
     }
 
     async fn slice(&self, thread: String, batch: Vec<(u64, Event)>) {
+        // the in-flight mark and the running count are released however this ends, a panic included
+        struct Release<'a>(&'a Queue, &'a str);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.inflight.lock().unwrap().remove(self.1);
+                self.0.running.fetch_sub(1, Ordering::Relaxed);
+                self.0.notify.notify_one();
+            }
+        }
+        let _release = Release(self, &thread);
         let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
         let reply_to = batch.iter().rev().find_map(|(_, e)| match e.kind { crate::store::EventKind::User { .. } => Some(e.id.clone()), _ => None });
         // no clock here: `slice_timeout_s` bounds each request to a node (the router's client), and the wait for a
@@ -192,9 +211,6 @@ impl Queue {
             }
         };
         if let Err(e) = result { tracing::error!("{thread}: store failed after the slice: {e:#}"); }
-        self.inflight.lock().unwrap().remove(&thread);
-        self.running.fetch_sub(1, Ordering::Relaxed);
-        self.notify.notify_one();
     }
 
     /// Mirror events the store has that the map does not (the slice's new wake-ups).

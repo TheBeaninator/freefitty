@@ -163,6 +163,9 @@ pub struct Invocation {
     pub body: Value,
     pub attempts: u32,
     pub created_ms: u64,
+    /// Not posted again before this time (backoff after a failed attempt).
+    #[serde(default)]
+    pub next_ms: u64,
 }
 
 /// Everything one slice changes, committed in one transaction after the model answered.
@@ -271,6 +274,13 @@ impl Store {
             let mut rp = w.open_table(REPLIES)?;
             let seqs: Vec<u64> = rp.iter()?.filter_map(|e| e.ok()).filter(|(_, v)| dec::<Reply>(v.value()).map(|r| r.thread == thread).unwrap_or(false)).map(|(k, _)| k.value()).collect();
             for s in seqs { rp.remove(s)?; }
+            // its dead letters and the invocations still to post, whose callbacks would otherwise recreate it
+            let mut dlq = w.open_table(DLQ)?;
+            let seqs: Vec<u64> = dlq.iter()?.filter_map(|e| e.ok()).filter(|(_, v)| dec::<Event>(v.value()).map(|e| e.thread == thread).unwrap_or(false)).map(|(k, _)| k.value()).collect();
+            for s in seqs { dlq.remove(s)?; }
+            let mut inv = w.open_table(INVOCATIONS)?;
+            let calls: Vec<String> = inv.iter()?.filter_map(|e| e.ok()).filter(|(_, v)| dec::<Invocation>(v.value()).map(|i| i.thread == thread).unwrap_or(false)).map(|(k, _)| k.value().to_owned()).collect();
+            for c in calls { inv.remove(c.as_str())?; }
         }
         w.commit()?;
         Ok(())
@@ -347,6 +357,21 @@ impl Store {
             out.push((k.value(), dec(v.value())?));
         }
         Ok(out)
+    }
+
+    /// Forget processed ids older than `before_ms` (a duplicate of an event that old is not coming). Rows written
+    /// before 2026-11-07 hold a seq, which reads as 1970 and goes with the first sweep.
+    pub fn expire_processed(&self, before_ms: u64) -> Result<usize> {
+        let w = self.db.begin_write()?;
+        let n;
+        {
+            let mut t = w.open_table(PROCESSED)?;
+            let old: Vec<String> = t.iter()?.filter_map(|e| e.ok()).filter(|(_, v)| v.value() < before_ms).map(|(k, _)| k.value().to_owned()).collect();
+            n = old.len();
+            for k in old { t.remove(k.as_str())?; }
+        }
+        w.commit()?;
+        Ok(n)
     }
 
     pub fn is_processed(&self, id: &str) -> Result<bool> {
@@ -490,7 +515,8 @@ impl Store {
             m.updated_ms = now_ms();
             threads.insert(c.thread, enc(&m).as_slice())?;
             for s in &c.done { events.remove(*s)?; }
-            for id in &c.done_ids { processed.insert(id.as_str(), c.done.first().copied().unwrap_or(0))?; }
+            let ran_at = now_ms();
+            for id in &c.done_ids { processed.insert(id.as_str(), ran_at)?; }
             for (text, reply_to, kind, extra) in c.replies {
                 let seq = Self::next_seq(&mut meta)?;
                 let r = Reply { seq, thread: c.thread.to_owned(), text, reply_to, kind, metadata: extra, created_ms: now_ms() };
@@ -579,13 +605,14 @@ impl Store {
         Ok(())
     }
 
-    pub fn invocation_attempt(&self, call: &str, attempts: u32) -> Result<()> {
+    pub fn invocation_attempt(&self, call: &str, attempts: u32, next_ms: u64) -> Result<()> {
         let w = self.db.begin_write()?;
         {
             let mut t = w.open_table(INVOCATIONS)?;
             let found = t.get(call)?.map(|v| dec::<Invocation>(v.value())).transpose()?;
             if let Some(mut inv) = found {
                 inv.attempts = attempts;
+                inv.next_ms = next_ms;
                 t.insert(call, enc(&inv).as_slice())?;
             }
         }

@@ -351,6 +351,7 @@ async fn experts_from_thread(State(app): Shared, headers: HeaderMap, Path(id): P
 
 async fn delete_thread(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
     if let Err(r) = operator(&app, &headers) { return *r; }
+    if app.queue.is_inflight(&id) { return err(StatusCode::CONFLICT, "a slice of this thread is running; try again when it has committed"); }
     app.queue.forget_thread(&id);
     match app.store.delete_thread(&id) {
         Ok(()) => Json(json!({"deleted": id})).into_response(),

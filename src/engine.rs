@@ -164,10 +164,13 @@ impl Engine {
                 EventKind::ToolResult { call, text, .. } => {
                     // a result for a call nobody is waiting on (a late one, a thread moved here from another
                     // host) is said in the user role: a tool message with no call before it breaks the template
+                    // the stored tool message names the call by the id the assistant message carries (the model's
+                    // own when it gave one), so a template or validator that pairs them finds the pair
                     let awaited = meta.pending.iter().any(|p| &p.id == call);
+                    let shown_id = meta.pending.iter().find(|p| &p.id == call).and_then(|p| p.provider_call_id.clone()).unwrap_or_else(|| call.clone());
                     meta.pending.retain(|p| &p.id != call);
                     new_messages.push(if awaited {
-                        json!({"role": "tool", "tool_call_id": call, "content": text})
+                        json!({"role": "tool", "tool_call_id": shown_id, "content": text})
                     } else {
                         json!({"role": "user", "content": format!("[late result for tool call {call}] {text}")})
                     });
@@ -316,7 +319,12 @@ impl Engine {
                         }
                         reply_text.push_str(&format!("\n[Tool Call: sleep_until with arguments {}]", call.args));
                     }
-                    rap::SLEEP_UNTIL_EVENT => {}
+                    rap::SLEEP_UNTIL_EVENT => {
+                        // nothing is pending for this call: the next event or message wakes the thread anyway. Its
+                        // result is written now, so the transcript is whole and a watcher does not read a stall
+                        new_messages.push(json!({"role": "tool", "tool_call_id": call.shown_id(), "content": "Waiting for the next event or message."}));
+                        reply_text.push_str(&format!("\n[Tool Call: sleep_until_event_or_input with arguments {}]", call.args));
+                    }
                     rap::REFOCUS if self.cfg.compaction => {
                         // the refocus runs at the start of the next slice, before the result is answered
                         let focus = call.args.get("focus").and_then(|f| f.as_str()).map(|f| f.chars().take(2000).collect::<String>());
@@ -334,6 +342,7 @@ impl Engine {
                                 body: rap::invocation(thread, &call.id, call.provider_call_id.as_deref(), name, call.args.clone(), &self.callback_url),
                                 attempts: 0,
                                 created_ms: 0,
+                                next_ms: 0,
                             });
                             meta.pending.push(call.pending());
                             reply_text.push_str(&format!("\n[Tool Call: {name} with arguments {}]", call.args));
@@ -347,11 +356,11 @@ impl Engine {
             let names: Vec<String> = defs.iter().filter_map(|d| d.pointer("/function/name").and_then(|n| n.as_str()).map(str::to_owned)).collect();
             let answered = unknown.len() + recalled.len();
             for (c, text) in &recalled {
-                new_messages.push(json!({"role": "tool", "tool_call_id": c.id, "content": text}));
+                new_messages.push(json!({"role": "tool", "tool_call_id": c.shown_id(), "content": text}));
                 reply_text.push_str(&format!("\n[Tool Call: recall with arguments {}]", c.args));
             }
             for u in &unknown {
-                new_messages.push(json!({"role": "tool", "tool_call_id": u.id, "content": format!("Error: there is no tool named {:?}. The tools are: {}", u.name, names.join(", "))}));
+                new_messages.push(json!({"role": "tool", "tool_call_id": u.shown_id(), "content": format!("Error: there is no tool named {:?}. The tools are: {}", u.name, names.join(", "))}));
             }
             if !unknown.is_empty() && (rounds >= UNKNOWN_TOOL_ROUNDS || !events.is_empty() || !invocations.is_empty()) {
                 reply_text.push_str(&format!("\n[Error: the model called tools that do not exist: {}]", unknown.iter().map(|u| u.name.as_str()).collect::<Vec<_>>().join(", ")));
@@ -502,6 +511,11 @@ struct Call {
 }
 
 impl Call {
+    /// The id the stored assistant message carries for this call: the model's own when it gave one.
+    fn shown_id(&self) -> String {
+        self.provider_call_id.clone().unwrap_or_else(|| self.id.clone())
+    }
+
     fn pending(&self) -> PendingCall {
         PendingCall { id: self.id.clone(), name: self.name.clone(), provider_call_id: self.provider_call_id.clone(), arguments: self.args.to_string() }
     }

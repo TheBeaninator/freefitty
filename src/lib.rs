@@ -124,6 +124,12 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
                 Err(e) => tracing::warn!("expiring replies: {e:#}"),
                 _ => {}
             }
+            // processed event ids guard against a duplicate delivery; none comes weeks later
+            match s.expire_processed(store::now_ms().saturating_sub(4 * days * 86_400_000)) {
+                Ok(n) if n > 0 => tracing::info!("{n} processed event id(s) forgotten"),
+                Err(e) => tracing::warn!("expiring processed ids: {e:#}"),
+                _ => {}
+            }
         }
     }));
 

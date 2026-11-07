@@ -191,7 +191,9 @@ impl Dispatcher {
                     Vec::new()
                 }
             };
+            let now = crate::store::now_ms();
             for inv in pending {
+                if inv.next_ms > now { continue; }   // backing off after a failure; the 30 s tick returns to it
                 self.post(inv).await;
             }
             let _ = tokio::time::timeout(Duration::from_secs(30), self.notify.notified()).await;
@@ -223,8 +225,10 @@ impl Dispatcher {
                         },
                     });
                 } else {
-                    tracing::warn!("invocation {} to {}: {why}; attempt {attempts}", inv.call, inv.endpoint);
-                    let _ = self.store.invocation_attempt(&inv.call, attempts);
+                    // 30 s, 60 s, 120 s ... up to 10 min between attempts, so a kick from every commit does not burn them
+                    let wait_ms = (30_000u64 << (attempts - 1).min(5)).min(600_000);
+                    tracing::warn!("invocation {} to {}: {why}; attempt {attempts}, next in {} s", inv.call, inv.endpoint, wait_ms / 1000);
+                    let _ = self.store.invocation_attempt(&inv.call, attempts, crate::store::now_ms() + wait_ms);
                 }
             }
         }
