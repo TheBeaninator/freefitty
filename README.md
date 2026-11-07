@@ -182,9 +182,11 @@ These came from the pod's weeks on freefinity; each one is a design point here r
 ## Deploy on the pod
 
 `deploy/freefitty.service` is a user unit for pod-control: binary in `~/.local/bin`, config and data under
-`/data/pod/freefitty`. Name the unit as it is or add it to pod-mem-guard's protected patterns; the guard stops
-untagged idle transient units under memory pressure. pod-ff and pod-hands speak this API as they spoke
-freefinity's: point them at the new port and token.
+`/data/pod/freefitty`. It is an enabled unit, not a transient one, so pod-mem-guard never takes it for an idle
+stray. pod-ff and pod-hands speak this API as they spoke freefinity's: `/data/pod/freefitty/.env` carries
+`FREEFINITY_PORT`, `BRIDGE_TOKEN` (the operator token) and `CALLBACK_TOKEN` for them, and their units set
+`FF_STACK` to that directory. pod-ff reads thread sizes and last turns from `/threads` and prunes with `DELETE`
+when the stack directory holds a `freefitty.toml`.
 
 ## Tests
 
