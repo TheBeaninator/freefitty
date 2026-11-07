@@ -225,14 +225,23 @@ async fn thread(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) 
 struct ViewQuery {
     #[serde(default)]
     view: Option<String>,
+    /// Only the newest N messages of the chosen view.
+    #[serde(default)]
+    tail: Option<usize>,
 }
 
-/// The stored history, or with `?view=live` what the model sees (prefix, refocus bridge, kept history).
+/// The stored history, or with `?view=live` what the model sees (prefix, refocus bridge, kept history);
+/// `?tail=N` keeps the newest N.
 async fn messages(State(app): Shared, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<ViewQuery>) -> Response {
     if let Err(r) = operator(&app, &headers) { return *r; }
     let r = if q.view.as_deref() == Some("live") { app.engine.view(&id) } else { app.store.messages(&id) };
     match r {
-        Ok(ms) => Json(ms).into_response(),
+        Ok(mut ms) => {
+            if let Some(n) = q.tail {
+                ms.drain(..ms.len().saturating_sub(n));
+            }
+            Json(ms).into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }

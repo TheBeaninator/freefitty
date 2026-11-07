@@ -93,7 +93,7 @@ once. A result for a call the thread no longer waits on is still appended as a t
 POST /say                 {text, thread?, metadata?}       -> {thread, id}         operator token
 GET  /output?wait&thread  the oldest uncollected reply; removed once sent          operator token
 GET  /threads             id, size, pending calls, last message kind, node, closed  operator token
-GET  /threads/{id}        and /threads/{id}/messages; DELETE forgets the thread     operator token
+GET  /threads/{id}        and /threads/{id}/messages[?view=live][&tail=N]; DELETE forgets the thread  operator token
 GET  /dlq                 POST /dlq/redrive, /dlq/drop with {thread?}              operator token
 POST /rap/callback        or /rap/callback/{token}: a tool's result                callback token
 GET  /health              nodes, router counts, queue (with the oldest due wait), store counts
