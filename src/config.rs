@@ -76,6 +76,31 @@ pub struct Config {
     /// Replies nobody collected are kept this many days.
     #[serde(default = "d_reply_days")]
     pub reply_retention_days: u64,
+
+    /// Refocusing (compaction): the model gets a `refocus` tool, the operator `POST /threads/{id}/compact`,
+    /// and the thread's history before the cut is replaced, for the model, by notes it wrote around a focal
+    /// point. The history itself stays on disk. Off: none of that exists.
+    #[serde(default)]
+    pub compaction: bool,
+    /// Live-view tokens (bytes / 4) past which a thread refocuses on its own; 0 = only when asked.
+    #[serde(default)]
+    pub compact_at_tokens: u64,
+    /// Newest history messages kept verbatim after the notes (the tail is also held under half of
+    /// `compact_at_tokens` when that is set).
+    #[serde(default = "d_keep")]
+    pub compact_keep_messages: u64,
+    /// Cap on the notes the model writes.
+    #[serde(default = "d_summary_tokens")]
+    pub compact_summary_tokens: u64,
+    /// A file whose contents replace the built-in refocus instruction (src/compact.md).
+    #[serde(default)]
+    pub compact_prompt_file: Option<PathBuf>,
+    /// Directory of `<name>.toml` expert definitions, read at start and on `POST /experts/reload`; empty = none.
+    #[serde(default)]
+    pub experts_dir: Option<PathBuf>,
+    /// Experts whose prefix is read into every node's cache once the nodes are up.
+    #[serde(default)]
+    pub warm_on_start: Vec<String>,
 }
 
 fn d_listen() -> String { "127.0.0.1:8081".into() }
@@ -92,6 +117,8 @@ fn d_retry() -> u64 { 15 }
 fn d_down_wait() -> u64 { 120 }
 fn d_max_body() -> usize { 1 << 20 }
 fn d_reply_days() -> u64 { 4 }
+fn d_keep() -> u64 { 2 }
+fn d_summary_tokens() -> u64 { 2048 }
 
 impl Default for Config {
     fn default() -> Self {
@@ -124,6 +151,18 @@ impl Config {
         if !self.callback_base.is_empty() && !self.callback_base.starts_with("http") {
             bail!("callback_base must be a URL");
         }
+        if self.compact_at_tokens > 0 {
+            if !self.compaction { bail!("compact_at_tokens needs compaction = true"); }
+            if self.max_context_tokens > 0 && self.compact_at_tokens >= self.max_context_tokens {
+                bail!("compact_at_tokens must be under max_context_tokens");
+            }
+            if self.compact_at_tokens <= 4 * self.compact_summary_tokens {
+                bail!("compact_at_tokens must be over four times compact_summary_tokens");
+            }
+        }
+        if !self.warm_on_start.is_empty() && self.experts_dir.is_none() {
+            bail!("warm_on_start needs experts_dir");
+        }
         Ok(())
     }
 
@@ -135,6 +174,15 @@ impl Config {
     pub fn callback_url(&self) -> String {
         let base = if self.callback_base.is_empty() { format!("http://{}", self.listen) } else { self.callback_base.clone() };
         format!("{}/rap/callback/{}", base.trim_end_matches('/'), self.callback_token)
+    }
+
+    pub fn compact_prompt(&self) -> Result<String> {
+        Ok(match &self.compact_prompt_file {
+            Some(f) => std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?,
+            None => include_str!("compact.md").to_owned(),
+        }
+        .trim()
+        .to_owned())
     }
 
     pub fn system_prompt(&self) -> Result<String> {

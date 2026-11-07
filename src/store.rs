@@ -26,6 +26,7 @@ const DLQ: TableDefinition<u64, &[u8]> = TableDefinition::new("dlq");
 const REPLIES: TableDefinition<u64, &[u8]> = TableDefinition::new("replies");
 const INVOCATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("invocations");
 const TOOLSETS: TableDefinition<&str, &[u8]> = TableDefinition::new("toolsets");
+const EXPERTS: TableDefinition<&str, &[u8]> = TableDefinition::new("experts");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
 pub fn now_ms() -> u64 {
@@ -41,6 +42,8 @@ pub enum EventKind {
     ToolResult { call: String, #[serde(default)] provider_call_id: Option<String>, text: String },
     /// A subscription event a tool posted on its own.
     Subscription { call: String, text: String, #[serde(default)] r#final: bool },
+    /// Refocus the thread before its next turn: fold what came before into notes around `focus`.
+    Compact { #[serde(default)] focus: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -62,6 +65,38 @@ pub struct PendingCall {
     pub name: String,
     #[serde(default)]
     pub provider_call_id: Option<String>,
+    /// The arguments JSON the model wrote, so the call can be shown again after a compaction.
+    #[serde(default)]
+    pub arguments: String,
+}
+
+/// One refocus: from here on the model sees `summary` in place of the history before `from`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Compaction {
+    /// History index the live view starts at.
+    pub from: u64,
+    pub summary: String,
+    #[serde(default)]
+    pub focus: Option<String>,
+    pub at_ms: u64,
+    /// Messages this summary replaced (since the previous `from`).
+    pub summarized: u64,
+    pub tokens_before: u64,
+    /// The summary hit `compact_summary_tokens` and may be missing its end.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// A preloaded expert: two messages (documents read, acknowledgement) a thread may start from, after the
+/// system prompt. Stored by "name@hash"; a thread pins the version it was born with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Expert {
+    pub name: String,
+    pub hash: String,
+    pub description: String,
+    pub messages: Vec<Value>,
+    pub bytes: u64,
+    pub loaded_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -87,6 +122,12 @@ pub struct ThreadMeta {
     /// A watcher reads "stopped talking" here: assistant_empty, or tool_call with nothing pending.
     #[serde(default)]
     pub last: String,
+    /// Refocuses so far, oldest first; the last one shapes the live view.
+    #[serde(default)]
+    pub compactions: Vec<Compaction>,
+    /// "name@hash" of the expert prefix this thread was born with.
+    #[serde(default)]
+    pub expert: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +202,7 @@ impl Store {
             w.open_table(REPLIES)?;
             w.open_table(INVOCATIONS)?;
             w.open_table(TOOLSETS)?;
+            w.open_table(EXPERTS)?;
             w.open_table(META)?;
         }
         w.commit()?;
@@ -244,6 +286,21 @@ impl Store {
         }
         w.commit()?;
         Ok(seq)
+    }
+
+    /// Create a thread pinned to an expert version before its first event is queued.
+    pub fn new_thread_with_expert(&self, thread: &str, key: &str, first: &Event) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut threads = w.open_table(THREADS)?;
+            if threads.get(thread)?.is_none() {
+                let md = match &first.kind { EventKind::User { metadata, .. } => metadata.clone(), _ => Value::Null };
+                let t = ThreadMeta { created_ms: now_ms(), updated_ms: now_ms(), metadata: md, expert: Some(key.to_owned()), ..Default::default() };
+                threads.insert(thread, enc(&t).as_slice())?;
+            }
+        }
+        w.commit()?;
+        Ok(())
     }
 
     pub fn events(&self) -> Result<Vec<(u64, Event)>> {
@@ -512,6 +569,57 @@ impl Store {
         w.open_table(TOOLSETS)?.insert(url, enc(manifest).as_slice())?;
         w.commit()?;
         Ok(())
+    }
+
+    // ---- compaction and experts -------------------------------------------------------------------
+
+    /// Record a refocus: its own transaction, touching only the thread's compactions and node, so a crash
+    /// between it and the slice's commit leaves a consistent thread (the events are still queued; the
+    /// re-run finds the compacted view and does not summarize again).
+    pub fn compact(&self, thread: &str, c: &Compaction) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut threads = w.open_table(THREADS)?;
+            let found = threads.get(thread)?.map(|v| dec::<ThreadMeta>(v.value())).transpose()?;
+            if let Some(mut m) = found {
+                m.compactions.push(c.clone());
+                m.node = None;
+                threads.insert(thread, enc(&m).as_slice())?;
+            }
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    pub fn expert(&self, key: &str) -> Result<Option<Expert>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(EXPERTS)?;
+        Ok(match t.get(key)? { Some(v) => Some(dec(v.value())?), None => None })
+    }
+
+    pub fn experts(&self) -> Result<Vec<Expert>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(EXPERTS)?;
+        let mut out = Vec::new();
+        for e in t.iter()? {
+            let (_, v) = e?;
+            out.push(dec(v.value())?);
+        }
+        Ok(out)
+    }
+
+    /// Store a version; the key. Same bytes, same key: a no-op.
+    pub fn save_expert(&self, e: &Expert) -> Result<String> {
+        let key = format!("{}@{}", e.name, e.hash);
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(EXPERTS)?;
+            if t.get(key.as_str())?.is_none() {
+                t.insert(key.as_str(), enc(e).as_slice())?;
+            }
+        }
+        w.commit()?;
+        Ok(key)
     }
 
     pub fn counts(&self) -> Result<Value> {

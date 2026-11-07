@@ -32,9 +32,11 @@ pub struct Tools {
 pub const SLEEP: &str = "sleep";
 pub const SLEEP_UNTIL: &str = "sleep_until";
 pub const SLEEP_UNTIL_EVENT: &str = "sleep_until_event_or_input";
+pub const REFOCUS: &str = "refocus";
 
-pub fn builtin_defs() -> Vec<Value> {
-    vec![
+/// The built-in tools; `refocus` only with compaction on.
+pub fn builtin_defs(compaction: bool) -> Vec<Value> {
+    let mut v = vec![
         json!({"type": "function", "function": {"name": SLEEP,
             "description": "Sleep for a number of seconds, then continue. The agent holds nothing while asleep; any message that arrives first wakes it early.",
             "parameters": {"type": "object", "properties": {
@@ -49,7 +51,14 @@ pub fn builtin_defs() -> Vec<Value> {
         json!({"type": "function", "function": {"name": SLEEP_UNTIL_EVENT,
             "description": "Wait with no timer: the agent runs again only when a message, tool result or event arrives.",
             "parameters": {"type": "object", "properties": {}}}}),
-    ]
+    ];
+    if compaction {
+        v.push(json!({"type": "function", "function": {"name": REFOCUS,
+            "description": "Refocus: before your next turn you will write notes around a focal point, and those notes replace the conversation before them as your memory. Use it when the context has grown muddled with superseded ideas, stale output or finished branches. The full history stays stored.",
+            "parameters": {"type": "object", "properties": {
+                "focus": {"type": "string", "description": "The focal point the notes should be written around, in a sentence"}}}}}));
+    }
+    v
 }
 
 impl Tools {
@@ -63,7 +72,7 @@ impl Tools {
             let endpoint = m.get("endpoint").and_then(|e| e.as_str()).with_context(|| format!("{url}: manifest has no endpoint"))?.to_owned();
             for tool in m.get("tools").and_then(|t| t.as_array()).into_iter().flatten() {
                 let name = tool.get("name").and_then(|n| n.as_str()).with_context(|| format!("{url}: a tool has no name"))?.to_owned();
-                if [SLEEP, SLEEP_UNTIL, SLEEP_UNTIL_EVENT].contains(&name.as_str()) || t.by_name.contains_key(&name) {
+                if [SLEEP, SLEEP_UNTIL, SLEEP_UNTIL_EVENT, REFOCUS].contains(&name.as_str()) || t.by_name.contains_key(&name) {
                     bail!("{url}: tool name {name:?} is taken");
                 }
                 let def = json!({"type": "function", "function": {

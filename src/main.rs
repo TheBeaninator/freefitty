@@ -44,12 +44,29 @@ enum Cmd {
         text: String,
         #[arg(short, long)]
         thread: Option<String>,
+        /// Start the thread from this expert's prefix.
+        #[arg(short, long)]
+        expert: Option<String>,
     },
     /// Send a message and print the thread's replies as they arrive (Ctrl-C to stop).
     Chat {
         text: String,
         #[arg(short, long)]
         thread: Option<String>,
+        #[arg(short, long)]
+        expert: Option<String>,
+    },
+    /// Refocus a thread before its next turn (compaction must be on); --focus names the focal point.
+    Compact {
+        thread: String,
+        #[arg(short, long)]
+        focus: Option<String>,
+    },
+    /// Experts: list, reload, warm NAME, freeze THREAD NAME [DESCRIPTION].
+    Experts {
+        #[arg(default_value = "list")]
+        action: String,
+        args: Vec<String>,
     },
     /// Print replies as they arrive, every thread's or one thread's.
     Watch {
@@ -58,8 +75,12 @@ enum Cmd {
     },
     /// List threads.
     Threads,
-    /// Print a thread's stored conversation.
-    Show { thread: String },
+    /// Print a thread's stored conversation, or with --live what the model sees.
+    Show {
+        thread: String,
+        #[arg(long)]
+        live: bool,
+    },
     /// Forget a thread: its conversation, queued events and replies.
     Rm { thread: String },
     /// Dead letters: list, redrive or drop them (one thread's with --thread).
@@ -110,14 +131,14 @@ async fn main() -> Result<()> {
             running.shutdown().await;
             Ok(())
         }
-        Cmd::Say { text, thread } => {
+        Cmd::Say { text, thread, expert } => {
             let c = Client::new(&cli.config)?;
-            println!("{}", c.say(&text, thread.as_deref()).await?);
+            println!("{}", c.say(&text, thread.as_deref(), expert.as_deref()).await?);
             Ok(())
         }
-        Cmd::Chat { text, thread } => {
+        Cmd::Chat { text, thread, expert } => {
             let c = Client::new(&cli.config)?;
-            let sent = c.say(&text, thread.as_deref()).await?;
+            let sent = c.say(&text, thread.as_deref(), expert.as_deref()).await?;
             let t = sent["thread"].as_str().unwrap_or_default().to_owned();
             eprintln!("thread {t}");
             c.watch(Some(&t)).await
@@ -132,9 +153,39 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Show { thread } => {
-            let v = Client::new(&cli.config)?.get(&format!("/threads/{thread}/messages")).await?;
-            for m in v.as_array().into_iter().flatten() {
+        Cmd::Compact { thread, focus } => {
+            let body = focus.map(|f| json!({"focus": f})).unwrap_or(json!({}));
+            println!("{}", Client::new(&cli.config)?.post(&format!("/threads/{thread}/compact"), &body).await?);
+            Ok(())
+        }
+        Cmd::Experts { action, args } => {
+            let c = Client::new(&cli.config)?;
+            match (action.as_str(), args.as_slice()) {
+                ("list", _) => {
+                    let v = c.get("/experts").await?;
+                    if v.as_array().is_some_and(|a| a.is_empty()) { println!("no experts (experts_dir in the config, or `experts freeze`)"); }
+                    for e in v.as_array().into_iter().flatten() {
+                        println!("{:<24} ~{:>7} tokens  {:>3} thread(s){}  {}", s(&e["name"]), e["est_tokens"].as_u64().unwrap_or(0), e["threads"].as_u64().unwrap_or(0),
+                            match e["threads_on_older_versions"].as_u64() { Some(n) if n > 0 => format!(" (+{n} on older versions)"), _ => String::new() }, s(&e["description"]));
+                    }
+                }
+                ("reload", _) => println!("{}", c.post("/experts/reload", &json!({})).await?),
+                ("warm", [name]) => println!("{}", serde_json::to_string_pretty(&c.post(&format!("/experts/{name}/warm"), &json!({})).await?)?),
+                ("freeze", [thread, name, rest @ ..]) => println!("{}", c.post(&format!("/experts/from-thread/{thread}"), &json!({"name": name, "description": rest.join(" ")})).await?),
+                _ => bail!("usage: experts [list | reload | warm NAME | freeze THREAD NAME [DESCRIPTION]]"),
+            }
+            Ok(())
+        }
+        Cmd::Show { thread, live } => {
+            let c = Client::new(&cli.config)?;
+            let v = c.get(&format!("/threads/{thread}/messages{}", if live { "?view=live" } else { "" })).await?;
+            let compaction = if live { None } else { c.get(&format!("/threads/{thread}")).await.ok().and_then(|t| if t["compaction"].is_null() { None } else { Some(t["compaction"].clone()) }) };
+            for (i, m) in v.as_array().into_iter().flatten().enumerate() {
+                if let Some(cp) = &compaction {
+                    if cp["from"].as_u64() == Some(i as u64) {
+                        println!("--- refocused here: the {} messages above are replaced for the model by these notes{} ---", cp["from"], cp["focus"].as_str().map(|f| format!(" (focus: {f})")).unwrap_or_default());
+                    }
+                }
                 let role = s(&m["role"]);
                 let content = m["content"].as_str().unwrap_or("");
                 println!("--- {role}");
@@ -228,9 +279,10 @@ impl Client {
         Self::check(self.http.delete(format!("{}{path}", self.base)).bearer_auth(&self.token).send().await.context("is the daemon running?")?).await
     }
 
-    async fn say(&self, text: &str, thread: Option<&str>) -> Result<Value> {
+    async fn say(&self, text: &str, thread: Option<&str>, expert: Option<&str>) -> Result<Value> {
         let mut body = json!({"text": text});
         if let Some(t) = thread { body["thread"] = json!(t); }
+        if let Some(e) = expert { body["expert"] = json!(e); }
         self.post("/say", &body).await
     }
 

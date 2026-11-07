@@ -6,11 +6,15 @@
 //! after that commit are invocations posted and replies handed out. A crash before the commit re-runs the
 //! slice from the same events; one after it cannot run the turn twice, because the events are gone and
 //! their ids are recorded as processed.
+//!
+//! What the model sees is the *live view*: the shared prefix (the system prompt, then the thread's expert
+//! messages if it has one), the bridge left by the last refocus (a framing line and the model's own notes with
+//! the calls still awaited), then the history from the refocus point. The history itself is never changed.
 
 use crate::config::Config;
 use crate::rap::{self, ToolBox};
 use crate::router::{ChatError, Router};
-use crate::store::{now_ms, Commit, Event, EventKind, Invocation, PendingCall, Store, ThreadMeta};
+use crate::store::{now_ms, Commit, Compaction, Event, EventKind, Invocation, PendingCall, Store, ThreadMeta};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -20,6 +24,7 @@ pub struct Engine {
     pub router: Arc<Router>,
     pub tools: Arc<ToolBox>,
     pub system: String,
+    pub compact_prompt: String,
     pub callback_url: String,
 }
 
@@ -33,12 +38,65 @@ pub enum Outcome {
 
 const UNKNOWN_TOOL_ROUNDS: usize = 3;
 
+pub fn tokens(v: &[Value]) -> u64 {
+    (serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0) / 4) as u64
+}
+
+/// The shared prefix: the system prompt, then the expert's own messages. The system message is always the
+/// first and the same for every thread, so every node's cache serves it to all of them.
+pub fn prefix(system: &str, store: &Store, meta: &ThreadMeta) -> anyhow::Result<Vec<Value>> {
+    let mut p = vec![json!({"role": "system", "content": system})];
+    if let Some(key) = &meta.expert {
+        let e = store.expert(key)?.ok_or_else(|| anyhow::anyhow!("expert {key} is not stored"))?;
+        p.extend(e.messages);
+    }
+    Ok(p)
+}
+
+/// What the model sees: prefix + bridge + history[from..]. `pending` is the thread's pending list as read at
+/// slice start; a call whose assistant message is inside the kept history is not shown twice.
+pub fn live_view(prefix: &[Value], meta: &ThreadMeta, history: &[Value], pending: &[PendingCall]) -> Vec<Value> {
+    let mut v: Vec<Value> = prefix.to_vec();
+    if let Some(c) = meta.compactions.last() {
+        let from = (c.from as usize).min(history.len());
+        let tail = &history[from..];
+        let shown: Vec<&str> = tail
+            .iter()
+            .flat_map(|m| m.get("tool_calls").and_then(|t| t.as_array()).into_iter().flatten())
+            .filter_map(|tc| tc.get("id").and_then(|i| i.as_str()))
+            .collect();
+        let calls: Vec<Value> = pending
+            .iter()
+            .filter(|p| !shown.contains(&p.id.as_str()) && !p.provider_call_id.as_deref().is_some_and(|c| shown.contains(&c)))
+            .map(|p| json!({"id": p.provider_call_id.clone().unwrap_or_else(|| p.id.clone()), "type": "function",
+                "function": {"name": p.name, "arguments": if p.arguments.is_empty() { "{}".to_owned() } else { p.arguments.clone() }}}))
+            .collect();
+        let focus = c.focus.as_deref().map(|f| format!(" Focus: {f}")).unwrap_or_default();
+        v.push(json!({"role": "user", "content": format!("[Refocus. The conversation so far is replaced by your notes, which follow.{focus}]")}));
+        let mut notes = json!({"role": "assistant", "content": c.summary});
+        if !calls.is_empty() { notes["tool_calls"] = Value::Array(calls); }
+        v.push(notes);
+        v.extend(tail.iter().cloned());
+    } else {
+        v.extend(history.iter().cloned());
+    }
+    v
+}
+
 impl Engine {
     pub async fn slice(&self, thread: &str, batch: &[(u64, Event)]) -> Outcome {
         match self.run(thread, batch).await {
             Ok(o) => o,
             Err(e) => Outcome::Transient(format!("store: {e:#}")),
         }
+    }
+
+    /// The live view of a stored thread, for the API.
+    pub fn view(&self, thread: &str) -> anyhow::Result<Vec<Value>> {
+        let meta = self.store.thread(thread)?.unwrap_or_default();
+        let history = self.store.messages(thread)?;
+        let p = prefix(&self.system, &self.store, &meta)?;
+        Ok(live_view(&p, &meta, &history, &meta.pending))
     }
 
     async fn run(&self, thread: &str, batch: &[(u64, Event)]) -> anyhow::Result<Outcome> {
@@ -63,15 +121,15 @@ impl Engine {
         }
 
         // ---- the new messages ------------------------------------------------------------------
+        let pending_at_start = meta.pending.clone();
         let mut new_messages: Vec<Value> = Vec::new();
         let mut reply_to: Option<String> = None;
+        let mut refocus: Option<Option<String>> = None;
         for (_, ev) in &live {
             match &ev.kind {
                 EventKind::User { text, .. } => {
-                    // a person spoke while tool calls are outstanding: the template needs a result per call
-                    for p in meta.pending.drain(..) {
-                        new_messages.push(json!({"role": "tool", "tool_call_id": p.id, "content": "(no result yet; it arrives as a later message)"}));
-                    }
+                    // a person may speak while tool calls are outstanding: the calls stay pending and their
+                    // results land later as tool messages (the templates render that)
                     new_messages.push(json!({"role": "user", "content": text}));
                     reply_to = Some(ev.id.clone());
                 }
@@ -83,25 +141,55 @@ impl Engine {
                     if *r#final { meta.pending.retain(|p| &p.id != call); }
                     new_messages.push(json!({"role": "user", "content": format!("[event for tool call {call}] {text}")}));
                 }
+                EventKind::Compact { focus } => {
+                    if self.cfg.compaction { refocus = Some(focus.clone()); } else { tracing::warn!("{thread}: a refocus was asked for but compaction is off"); }
+                }
             }
         }
         if reply_to.is_none() { reply_to = live.last().map(|(_, e)| e.id.clone()); }
 
-        let mut messages = vec![json!({"role": "system", "content": self.system})];
-        messages.extend(self.store.messages(thread)?);
-        messages.extend(new_messages.iter().cloned());
+        let prefix = prefix(&self.system, &self.store, &meta)?;
+        let history = self.store.messages(thread)?;
+        let tools = self.tools.current().await;
+        let mut defs = rap::builtin_defs(self.cfg.compaction);
+        defs.extend(tools.defs.iter().cloned());
+
+        // ---- refocus -----------------------------------------------------------------------------
+        let mut view = live_view(&prefix, &meta, &history, &pending_at_start);
+        let mut est = tokens(&view) + tokens(&new_messages);
+        if self.cfg.compaction && (refocus.is_some() || (self.cfg.compact_at_tokens > 0 && est > self.cfg.compact_at_tokens)) {
+            let focus = refocus.clone().flatten();
+            match self.refocus(thread, &meta, &view, &history, &defs, focus, est).await? {
+                Refocused::Done(c) => {
+                    meta.compactions.push(c);
+                    meta.node = None;
+                    view = live_view(&prefix, &meta, &history, &pending_at_start);
+                    est = tokens(&view) + tokens(&new_messages);
+                    if self.cfg.compact_at_tokens > 0 && est > self.cfg.compact_at_tokens {
+                        tracing::warn!("{thread}: still ~{est} tokens after refocusing (the kept tail or the new messages are large)");
+                    }
+                }
+                Refocused::Nothing => {
+                    if refocus.is_some() { tracing::info!("{thread}: refocus asked for, nothing to fold yet"); }
+                }
+                Refocused::Failed(why) => return Ok(Outcome::Transient(why)),
+            }
+        }
+        if new_messages.is_empty() {
+            // only a refocus was asked for: no turn
+            self.store.commit(Commit { thread, meta, messages: vec![], done, done_ids, replies: vec![], events: vec![], invocations: vec![] })?;
+            return Ok(Outcome::Done);
+        }
 
         // ---- room in the context -----------------------------------------------------------------
-        let est = (serde_json::to_vec(&messages)?.len() / 4) as u64;
         let limit = if self.cfg.max_context_tokens > 0 { self.cfg.max_context_tokens } else { self.router.context_length().await.saturating_sub(self.cfg.max_output_tokens) };
         if limit > 0 && est > limit {
             return Ok(Outcome::Fatal(format!("context full: about {est} tokens, the limit is {limit}")));
         }
 
         // ---- the model's turn --------------------------------------------------------------------
-        let tools = self.tools.current().await;
-        let mut defs = rap::builtin_defs();
-        defs.extend(tools.defs.iter().cloned());
+        let mut messages = view;
+        messages.extend(new_messages.iter().cloned());
         let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "max_tokens": self.cfg.max_output_tokens, "stream": false});
 
         let mut reply_text = String::new();
@@ -146,6 +234,14 @@ impl Engine {
                         reply_text.push_str(&format!("\n[Tool Call: sleep_until with arguments {}]", call.args));
                     }
                     rap::SLEEP_UNTIL_EVENT => {}
+                    rap::REFOCUS if self.cfg.compaction => {
+                        // the refocus runs at the start of the next slice, before the result is answered
+                        let focus = call.args.get("focus").and_then(|f| f.as_str()).map(|f| f.chars().take(2000).collect::<String>());
+                        events.push(Event { id: format!("refocus-{}", call.id), thread: thread.to_owned(), due_ms: 0, created_ms: 0, attempts: 0, kind: EventKind::Compact { focus } });
+                        events.push(wake(thread, call, 0, "Refocused: your notes now stand in for the conversation before them.".into()));
+                        meta.pending.push(call.pending());
+                        reply_text.push_str(&format!("\n[Tool Call: refocus with arguments {}]", call.args));
+                    }
                     name => match tools.get(name) {
                         Some(tool) => {
                             invocations.push(Invocation {
@@ -165,9 +261,9 @@ impl Engine {
             }
             if unknown.is_empty() { break; }
             // the model asked for tools that do not exist: tell it in the same slice and let it try again
-            let names: Vec<String> = tools.defs.iter().filter_map(|d| d.pointer("/function/name").and_then(|n| n.as_str()).map(str::to_owned)).collect();
+            let names: Vec<String> = defs.iter().filter_map(|d| d.pointer("/function/name").and_then(|n| n.as_str()).map(str::to_owned)).collect();
             for u in &unknown {
-                new_messages.push(json!({"role": "tool", "tool_call_id": u.id, "content": format!("Error: there is no tool named {:?}. The tools are: sleep, sleep_until, sleep_until_event_or_input, {}", u.name, names.join(", "))}));
+                new_messages.push(json!({"role": "tool", "tool_call_id": u.id, "content": format!("Error: there is no tool named {:?}. The tools are: {}", u.name, names.join(", "))}));
             }
             if rounds >= UNKNOWN_TOOL_ROUNDS || !events.is_empty() || !invocations.is_empty() {
                 reply_text.push_str(&format!("\n[Error: the model called tools that do not exist: {}]", unknown.iter().map(|u| u.name.as_str()).collect::<Vec<_>>().join(", ")));
@@ -187,6 +283,76 @@ impl Engine {
         self.store.commit(Commit { thread, meta, messages: new_messages, done, done_ids, replies, events, invocations })?;
         Ok(Outcome::Done)
     }
+
+    /// Ask the model for its notes and record the refocus. The cut keeps `compact_keep_messages` newest
+    /// history messages (fewer while they alone are over half of `compact_at_tokens`), moved earlier past
+    /// leading tool results so the tail never opens with an answer whose call is gone.
+    #[allow(clippy::too_many_arguments)]
+    async fn refocus(&self, thread: &str, meta: &ThreadMeta, view: &[Value], history: &[Value], defs: &[Value], focus: Option<String>, est: u64) -> anyhow::Result<Refocused> {
+        let n = history.len() as u64;
+        let from = meta.compactions.last().map(|c| c.from).unwrap_or(0);
+        let mut keep = self.cfg.compact_keep_messages.min(n.saturating_sub(from));
+        if self.cfg.compact_at_tokens > 0 {
+            while keep > 1 && tokens(&history[(n - keep) as usize..]) > self.cfg.compact_at_tokens / 2 { keep -= 1; }
+        }
+        let mut keep_from = n - keep;
+        while keep_from > from && history[keep_from as usize].get("role").and_then(|r| r.as_str()) == Some("tool") { keep_from -= 1; }
+        if keep_from <= from {
+            return Ok(Refocused::Nothing);
+        }
+        let mut instruction = self.compact_prompt.clone();
+        if let Some(f) = &focus { instruction.push_str(&format!("\n\nThe focal point to write around: {f}")); }
+        let awaited: Vec<String> = meta.pending.iter().map(|p| format!("{} ({})", p.id, p.name)).collect();
+        if !awaited.is_empty() { instruction.push_str(&format!("\n\nTool calls still awaiting results: {}", awaited.join(", "))); }
+        // the messages the notes replace: the view up to the cut (the prefix and bridge included), then the ask
+        let cut = view.len() - (n - keep_from) as usize;
+        let mut messages: Vec<Value> = view[..cut].to_vec();
+        messages.push(json!({"role": "user", "content": instruction}));
+        // the same tools as every turn, so the node's cache serves the view; the prompt asks for text only
+        // tool_choice none keeps the model from answering the ask with a tool call; a node that does not know
+        // the field (400) gets the request again without it
+        let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "tool_choice": "none", "max_tokens": self.cfg.compact_summary_tokens, "stream": false});
+        let mut truncated = false;
+        let mut summary = String::new();
+        for attempt in 0..2 {
+            let turn = match self.router.chat(meta.node.as_deref(), &body).await {
+                Ok(t) => t,
+                Err(ChatError::Transient(e)) => return Ok(Refocused::Failed(format!("refocus: {e}"))),
+                Err(ChatError::Rejected(_)) if body.get("tool_choice").is_some() => {
+                    body.as_object_mut().unwrap().remove("tool_choice");
+                    match self.router.chat(meta.node.as_deref(), &body).await {
+                        Ok(t) => t,
+                        Err(e) => return Ok(Refocused::Failed(format!("refocus: {e}"))),
+                    }
+                }
+                Err(ChatError::Rejected(e)) => return Ok(Refocused::Failed(format!("refocus: the node refused the request: {e}"))),
+            };
+            let content = turn.message.get("content").and_then(|c| c.as_str()).unwrap_or("").trim().to_owned();
+            if content.is_empty() {
+                let calls = turn.message.get("tool_calls").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
+                let reasoning = turn.message.get("reasoning_content").or(turn.message.get("reasoning")).and_then(|r| r.as_str()).map(|r| r.len()).unwrap_or(0);
+                return Ok(Refocused::Failed(format!("refocus: the model wrote no notes (finish_reason {:?}, {calls} tool call(s), {reasoning} chars of reasoning)", turn.finish_reason)));
+            }
+            let cut_short = turn.finish_reason.as_deref() == Some("length");
+            summary = content;
+            if !cut_short { truncated = false; break; }
+            truncated = true;
+            if attempt == 0 {
+                tracing::info!("{thread}: notes hit the cap, asking for half the length");
+                body["messages"].as_array_mut().unwrap().last_mut().unwrap()["content"] = json!(format!("{instruction}\n\nWrite at most half of what you would otherwise; the previous attempt was cut off."));
+            }
+        }
+        let c = Compaction { from: keep_from, summary, focus, at_ms: now_ms(), summarized: keep_from - from, tokens_before: est, truncated };
+        self.store.compact(thread, &c)?;
+        tracing::info!("{thread}: refocused at {keep_from} ({} messages folded, ~{est} tokens before{})", c.summarized, if truncated { ", notes truncated" } else { "" });
+        Ok(Refocused::Done(c))
+    }
+}
+
+enum Refocused {
+    Done(Compaction),
+    Nothing,
+    Failed(String),
 }
 
 #[derive(Debug, Clone)]
@@ -199,7 +365,7 @@ struct Call {
 
 impl Call {
     fn pending(&self) -> PendingCall {
-        PendingCall { id: self.id.clone(), name: self.name.clone(), provider_call_id: self.provider_call_id.clone() }
+        PendingCall { id: self.id.clone(), name: self.name.clone(), provider_call_id: self.provider_call_id.clone(), arguments: self.args.to_string() }
     }
 }
 
@@ -264,11 +430,6 @@ fn until(args: &Value) -> Result<u64, String> {
     Ok((local.timestamp_millis().max(0)) as u64)
 }
 
-#[allow(dead_code)]
-pub fn thread_meta_default() -> ThreadMeta {
-    ThreadMeta::default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +448,29 @@ mod tests {
         let due = until(&json!({"date": "2030-01-01", "time": "00:00", "timezone": "UTC"})).unwrap();
         assert_eq!(due, 1_893_456_000_000);
         assert!(until(&json!({"date": "2030-01-01"})).is_err());
+    }
+
+    #[test]
+    fn live_view_bridges_pending_calls_once() {
+        let prefix = vec![json!({"role": "system", "content": "s"})];
+        let history = vec![
+            json!({"role": "user", "content": "a"}),
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "p1", "type": "function", "function": {"name": "run", "arguments": "{}"}}]}),
+            json!({"role": "user", "content": "b"}),
+        ];
+        let pending = vec![
+            PendingCall { id: "x-0".into(), name: "run".into(), provider_call_id: Some("p1".into()), arguments: "{}".into() },
+            PendingCall { id: "y-0".into(), name: "echo".into(), provider_call_id: None, arguments: "{\"t\":1}".into() },
+        ];
+        let mut meta = ThreadMeta::default();
+        assert_eq!(live_view(&prefix, &meta, &history, &pending).len(), 4);
+        meta.compactions.push(Compaction { from: 1, summary: "notes".into(), focus: Some("f".into()), at_ms: 0, summarized: 1, tokens_before: 0, truncated: false });
+        let v = live_view(&prefix, &meta, &history, &pending);
+        assert_eq!(v.len(), 1 + 2 + 2);
+        assert_eq!(v[2]["content"], "notes");
+        let calls = v[2]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1, "p1 is in the kept tail; only y-0 is bridged: {calls:?}");
+        assert_eq!(calls[0]["id"], "y-0");
+        assert!(v[1]["content"].as_str().unwrap().contains("Focus: f"));
     }
 }

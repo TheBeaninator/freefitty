@@ -8,6 +8,7 @@
 pub mod api;
 pub mod config;
 pub mod engine;
+pub mod experts;
 pub mod queue;
 pub mod rap;
 pub mod router;
@@ -57,7 +58,11 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
     let router = router::Router::new(&cfg, &mut tasks);
     let tools = rap::ToolBox::start(cfg.clone(), store.clone(), &mut tasks).await?;
     let system = cfg.system_prompt()?;
-    let engine = Arc::new(engine::Engine { cfg: cfg.clone(), store: store.clone(), router: router.clone(), tools: tools.clone(), system, callback_url: cfg.callback_url() });
+    let compact_prompt = cfg.compact_prompt()?;
+    let experts = experts::Experts::new();
+    let loaded = experts.load(&cfg, &store).await?;
+    if !loaded.is_empty() { tracing::info!("experts: {}", loaded.join(", ")); }
+    let engine = Arc::new(engine::Engine { cfg: cfg.clone(), store: store.clone(), router: router.clone(), tools: tools.clone(), system, compact_prompt, callback_url: cfg.callback_url() });
     let replies = Arc::new(Notify::new());
 
     // the dispatcher's failures become events; the queue is built after it, so it reaches the queue through a slot
@@ -69,10 +74,27 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
         }
     }), &mut tasks);
     let d = dispatcher.clone();
-    let queue = queue::Queue::new(store.clone(), engine, replies.clone(), Box::new(move || d.kick()))?;
+    let queue = queue::Queue::new(store.clone(), engine.clone(), replies.clone(), Box::new(move || d.kick()))?;
     let _ = queue_slot.set(Arc::downgrade(&queue));
 
-    let app = api::App::new(cfg.clone(), store.clone(), queue.clone(), router, tools, replies);
+    let app = api::App::new(cfg.clone(), store.clone(), queue.clone(), router.clone(), tools.clone(), replies, engine.clone(), experts.clone());
+
+    // the experts named in warm_on_start are read into every node's cache once a node is up
+    if !cfg.warm_on_start.is_empty() {
+        let (cfg2, store2, router2, tools2, experts2, engine2) = (cfg.clone(), store.clone(), router.clone(), tools.clone(), experts.clone(), engine.clone());
+        tasks.push(tokio::spawn(async move {
+            while !router2.any_up().await { tokio::time::sleep(std::time::Duration::from_secs(1)).await; }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let mut defs = rap::builtin_defs(cfg2.compaction);
+            defs.extend(tools2.current().await.defs.iter().cloned());
+            for name in &cfg2.warm_on_start {
+                match experts2.warm(name, &store2, &router2, &engine2.system, &defs).await {
+                    Ok(r) => tracing::info!("warm {name}: {}", serde_json::to_string(&r).unwrap_or_default()),
+                    Err(e) => tracing::warn!("warm {name}: {e:#}"),
+                }
+            }
+        }));
+    }
     let routes = api::routes(app.clone());
     let fault = Arc::new(Notify::new());
     let stop = Arc::new(Notify::new());

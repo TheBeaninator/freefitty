@@ -128,6 +128,9 @@ impl Queue {
             if inflight.contains(&ev.thread) || skipped.contains(&ev.thread) { continue; }
             if ev.due_ms > now {
                 next_due = Some(next_due.map_or(ev.due_ms, |d| d.min(ev.due_ms)));
+                // a timer lets later events of its thread run first; a failed event waiting for its retry
+                // holds the thread, so what came after it never runs ahead of it
+                if ev.attempts > 0 { skipped.insert(ev.thread.clone()); }
                 continue;
             }
             if let Some(b) = batches.iter_mut().find(|(t, _)| t == &ev.thread) {

@@ -11,6 +11,8 @@
 //! token can only deliver results. Bodies are capped; nothing user-supplied is logged.
 
 use crate::config::{self, Config};
+use crate::engine::{self, Engine};
+use crate::experts::{self, Experts};
 use crate::queue::Queue;
 use crate::rap::{self, ToolBox};
 use crate::router::Router;
@@ -36,13 +38,16 @@ pub struct App {
     pub router: Arc<Router>,
     pub tools: Arc<ToolBox>,
     pub replies: Arc<Notify>,
+    pub engine: Arc<Engine>,
+    pub experts: Arc<Experts>,
     pub started_ms: u64,
     output_lock: Mutex<()>,
 }
 
 impl App {
-    pub fn new(cfg: Config, store: Arc<Store>, queue: Arc<Queue>, router: Arc<Router>, tools: Arc<ToolBox>, replies: Arc<Notify>) -> Arc<App> {
-        Arc::new(App { cfg, store, queue, router, tools, replies, started_ms: now_ms(), output_lock: Mutex::new(()) })
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(cfg: Config, store: Arc<Store>, queue: Arc<Queue>, router: Arc<Router>, tools: Arc<ToolBox>, replies: Arc<Notify>, engine: Arc<Engine>, experts: Arc<Experts>) -> Arc<App> {
+        Arc::new(App { cfg, store, queue, router, tools, replies, engine, experts, started_ms: now_ms(), output_lock: Mutex::new(()) })
     }
 }
 
@@ -59,6 +64,11 @@ pub fn routes(app: Arc<App>) -> AxumRouter {
         .route("/threads", get(threads))
         .route("/threads/{id}", get(thread).delete(delete_thread))
         .route("/threads/{id}/messages", get(messages))
+        .route("/threads/{id}/compact", post(compact))
+        .route("/experts", get(experts_list))
+        .route("/experts/reload", post(experts_reload))
+        .route("/experts/{name}/warm", post(experts_warm))
+        .route("/experts/from-thread/{id}", post(experts_from_thread))
         .route("/dlq", get(dlq))
         .route("/dlq/redrive", post(redrive))
         .route("/dlq/drop", post(drop_dlq))
@@ -112,6 +122,9 @@ struct Say {
     thread: Option<String>,
     #[serde(default)]
     metadata: Option<Value>,
+    /// Start the thread from this expert's prefix (new threads only).
+    #[serde(default)]
+    expert: Option<String>,
 }
 
 async fn say(State(app): Shared, headers: HeaderMap, body: Bytes) -> Response {
@@ -125,8 +138,21 @@ async fn say(State(app): Shared, headers: HeaderMap, body: Bytes) -> Response {
     if !metadata.is_null() && (!metadata.is_object() || metadata.to_string().len() > 4096) {
         return err(StatusCode::BAD_REQUEST, "metadata must be a JSON object under 4 KiB");
     }
+    let existing = match app.store.thread(&thread) { Ok(t) => t, Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()) };
+    let mut expert_key = None;
+    if let Some(name) = &req.expert {
+        let Some(key) = app.experts.key(name).await else { return err(StatusCode::NOT_FOUND, "no such expert") };
+        match &existing {
+            Some(t) if t.expert.as_deref().is_some_and(|k| k.starts_with(&format!("{name}@"))) => {}
+            Some(_) => return err(StatusCode::CONFLICT, "the thread exists and was not started from that expert"),
+            None => expert_key = Some(key),
+        }
+    }
     let id = config::id();
     let ev = Event { id: id.clone(), thread: thread.clone(), due_ms: 0, created_ms: 0, attempts: 0, kind: EventKind::User { text: req.text, metadata } };
+    if let Some(key) = expert_key {
+        if let Err(e) = app.store.new_thread_with_expert(&thread, &key, &ev) { return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()); }
+    }
     match app.queue.push(ev) {
         Ok(_) => Json(json!({"thread": thread, "id": id})).into_response(),
         Err(e) => {
@@ -185,16 +211,109 @@ async fn threads(State(app): Shared, headers: HeaderMap) -> Response {
 async fn thread(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
     if let Err(r) = operator(&app, &headers) { return *r; }
     match app.store.thread(&id) {
-        Ok(Some(m)) => Json(json!({"thread": id, "created_ms": m.created_ms, "updated_ms": m.updated_ms, "node": m.node, "messages": m.messages, "bytes": m.bytes, "pending": m.pending, "last": m.last, "closed": m.closed, "metadata": m.metadata})).into_response(),
+        Ok(Some(m)) => {
+            let live_tokens = app.engine.view(&id).map(|v| engine::tokens(&v)).unwrap_or(0);
+            let compaction = m.compactions.last().map(|c| json!({"from": c.from, "at_ms": c.at_ms, "summarized": c.summarized, "focus": c.focus, "truncated": c.truncated, "tokens_before": c.tokens_before, "count": m.compactions.len()}));
+            Json(json!({"thread": id, "created_ms": m.created_ms, "updated_ms": m.updated_ms, "node": m.node, "messages": m.messages, "bytes": m.bytes, "live_tokens": live_tokens, "pending": m.pending, "last": m.last, "closed": m.closed, "expert": m.expert, "compaction": compaction, "metadata": m.metadata})).into_response()
+        }
         Ok(None) => err(StatusCode::NOT_FOUND, "no such thread"),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
-async fn messages(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+#[derive(Deserialize, Default)]
+struct ViewQuery {
+    #[serde(default)]
+    view: Option<String>,
+}
+
+/// The stored history, or with `?view=live` what the model sees (prefix, refocus bridge, kept history).
+async fn messages(State(app): Shared, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<ViewQuery>) -> Response {
     if let Err(r) = operator(&app, &headers) { return *r; }
-    match app.store.messages(&id) {
+    let r = if q.view.as_deref() == Some("live") { app.engine.view(&id) } else { app.store.messages(&id) };
+    match r {
         Ok(ms) => Json(ms).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct CompactArg {
+    #[serde(default)]
+    focus: Option<String>,
+}
+
+/// Queue a refocus for the thread: it runs before the thread's next turn, now if nothing else is queued.
+async fn compact(State(app): Shared, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    if !app.cfg.compaction { return err(StatusCode::CONFLICT, "compaction is off in the config"); }
+    let a: CompactArg = if body.is_empty() { CompactArg::default() } else { match serde_json::from_slice(&body) { Ok(a) => a, Err(_) => return err(StatusCode::BAD_REQUEST, "body must be JSON") } };
+    if !thread_id_ok(&id) { return err(StatusCode::BAD_REQUEST, "bad thread id"); }
+    match app.store.thread(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return err(StatusCode::NOT_FOUND, "no such thread"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+    let focus = a.focus.filter(|f| !f.trim().is_empty()).map(|f| f.chars().take(2000).collect::<String>());
+    let ev = Event { id: format!("compact-{}", config::id()), thread: id.clone(), due_ms: 0, created_ms: 0, attempts: 0, kind: EventKind::Compact { focus } };
+    match app.queue.push(ev) {
+        Ok(_) => Json(json!({"thread": id, "queued": true})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn experts_list(State(app): Shared, headers: HeaderMap) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    let current = app.experts.current.read().await.clone();
+    let threads = app.store.threads().unwrap_or_default();
+    let all = app.store.experts().unwrap_or_default();
+    let out: Vec<Value> = current.iter().map(|(name, key)| {
+        let e = all.iter().find(|e| format!("{}@{}", e.name, e.hash) == *key);
+        let on_current = threads.iter().filter(|(_, m)| m.expert.as_deref() == Some(key)).count();
+        let on_older = threads.iter().filter(|(_, m)| m.expert.as_deref().is_some_and(|k| k.starts_with(&format!("{name}@")) && k != key)).count();
+        json!({"name": name, "key": key, "description": e.map(|e| e.description.clone()), "bytes": e.map(|e| e.bytes), "est_tokens": e.map(|e| e.bytes / 4), "threads": on_current, "threads_on_older_versions": on_older})
+    }).collect();
+    Json(out).into_response()
+}
+
+async fn experts_reload(State(app): Shared, headers: HeaderMap) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    match app.experts.load(&app.cfg, &app.store).await {
+        Ok(names) => Json(json!({"loaded": names})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn experts_warm(State(app): Shared, headers: HeaderMap, Path(name): Path<String>) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    let mut defs = rap::builtin_defs(app.cfg.compaction);
+    defs.extend(app.tools.current().await.defs.iter().cloned());
+    match app.experts.warm(&name, &app.store, &app.router, &app.engine.system, &defs).await {
+        Ok(nodes) => Json(json!({"expert": name, "nodes": nodes})).into_response(),
+        Err(e) => err(StatusCode::NOT_FOUND, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct Freeze {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// Freeze a thread's focal point as an expert: its latest refocus notes become what the expert has read.
+async fn experts_from_thread(State(app): Shared, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    let f: Freeze = match serde_json::from_slice(&body) { Ok(f) => f, Err(_) => return err(StatusCode::BAD_REQUEST, "body must be JSON with name") };
+    if !experts::name_ok(&f.name) { return err(StatusCode::BAD_REQUEST, "expert names are 1-64 of [A-Za-z0-9._-]"); }
+    let notes = match app.store.thread(&id) {
+        Ok(Some(m)) => match m.compactions.last() { Some(c) => c.summary.clone(), None => return err(StatusCode::CONFLICT, "the thread has no refocus notes yet; POST /threads/{id}/compact first") },
+        Ok(None) => return err(StatusCode::NOT_FOUND, "no such thread"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let e = experts::from_notes(&f.name, &f.description, &id, &notes);
+    match app.experts.add(&app.store, &e).await {
+        Ok(key) => Json(json!({"expert": f.name, "key": key, "bytes": e.bytes})).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }

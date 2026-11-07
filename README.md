@@ -103,6 +103,59 @@ A reply carries `metadata.thread`, `metadata.reply_to` (the id `/say` returned f
 `metadata.kind` (`text` or `error`) and the thread's own metadata. A message is at most 256 KiB, a body 1 MiB.
 Nothing user-supplied is logged.
 
+## Refocusing (compaction), off by default
+
+On strixite the context is rarely the limit; the coherence of what is in it is. A long thread fills with
+superseded ideas, finished branches and stale tool output, and the current understanding gets lost among
+them. With `compaction = true` a thread can refocus: the model writes notes around a focal point, and from
+then on those notes stand in for the conversation before them. The history itself is never changed; what
+changes is the *live view*, the messages the model sees: the shared prefix, a framing line and the notes
+(as the model's own assistant turn, carrying any tool calls still awaited so their results still resolve),
+then the newest `compact_keep_messages` history messages verbatim, then what arrives next.
+
+Three ways in: the model calls its `refocus` tool with a focal point when it notices the muddle; the operator
+asks with `freefitty compact THREAD --focus "..."` (`POST /threads/{id}/compact`); or, with
+`compact_at_tokens` set, a thread past that many live-view tokens refocuses on its own. A request is an event
+in the thread's queue, so it runs before the thread's next turn, on its own if nothing else is queued, and
+survives a restart. The notes are asked for with the same tools as every turn, so the node's cache serves the
+view, and the instruction (`src/compact.md`, or `compact_prompt_file`) puts first what is needed next: open
+work, awaited calls, exact strings; then what was decided and why; superseded ideas dropped. Notes that hit
+`compact_summary_tokens` are asked for again at half the length, and marked `truncated` if still cut. The
+refocus is its own transaction before the turn's commit, so a crash between them leaves a thread that simply
+continues on its refocused view. A refocus that would fold nothing (only the kept tail is left) does nothing,
+and the kept tail is held under half of `compact_at_tokens` when that is set. After a refocus the thread's
+node is forgotten: its cached state covers only the prefix now, so the router places it fresh.
+
+`freefitty show THREAD` marks where the live view starts and `show --live` prints what the model sees;
+`GET /threads/{id}` reports `compaction` (from, focus, count, truncated) and `live_tokens`.
+
+## Preloaded experts, off by default
+
+An expert is a named prefix a thread can be born with: documents it has read and its acknowledgement, after
+the shared system prompt. Every thread started from it sends those exact bytes first, so a node's prompt
+cache serves the first turn of each such thread however much the expert has read (a 100k-token reading is
+one prefill, then seconds per thread). Define them as `<experts_dir>/<name>.toml`:
+
+```toml
+description = "Has read the pod runbook"
+ack = "I have read the runbook and will work within it."
+[[reads]]
+path = "/data/pod/objective/RUNBOOK.md"
+[[reads]]
+text = "The board is /data/pod/kanban.db."
+```
+
+`freefitty say "..." --expert NAME` (`POST /say {expert}`) starts a thread from the current version. Versions
+are stored by content hash and never pruned: a thread keeps the bytes it was born with when a file changes
+(`freefitty experts` shows who is on older versions; `experts reload` reads the directory again). The system
+prompt is not part of a stored expert, so a prompt edit changes every thread alike and the system block stays
+shared. `experts warm NAME` reads the prefix once on every up node so each cache holds it before any thread
+starts; `warm_on_start` does that at boot. An expert's bytes count in every context estimate.
+
+The two features compose: `freefitty experts freeze THREAD NAME` turns a thread's latest refocus notes into
+an expert, a persona whose reading is a coherent focal point rather than raw documents, and two threads born
+from it share the node's cache for it.
+
 ## Lessons carried over from running freefinity
 
 These came from the pod's weeks on freefinity; each one is a design point here rather than a patch.
@@ -138,7 +191,10 @@ freefinity's: point them at the new port and token.
 `cargo test` runs the unit tests and `tests/e2e.rs`: the daemon against a scripted model node and a RAP tool
 server, in process. It covers a plain turn, a sleep through the queue, a RAP tool whose result is posted twice,
 double-encoded arguments, an unknown tool, a turn with nothing in it, three failures to the dead-letter queue and
-a redrive that keeps the input's id, two threads at once, a restart with a wake-up pending, and the token checks.
+a redrive that keeps the input's id, two threads at once, a restart with a wake-up pending, the token checks;
+a refocus from the tool and from the operator with the pending call bridged and its late result answered, notes
+cut off and asked again, nothing-to-fold, the token trigger, failed notes; experts sharing their prefix bytes,
+version pinning across a file change, warm on start, and an expert frozen from a thread's notes.
 `FREEFITTY_NODES=http://a:5300,http://b:5300 cargo test --test real_nodes -- --ignored` proves the cache move on
 two real strixite nodes.
 

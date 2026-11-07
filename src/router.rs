@@ -72,6 +72,7 @@ pub struct Turn {
     pub node: String,
     pub prompt_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug)]
@@ -310,18 +311,40 @@ impl Router {
                 return Err(if status.as_u16() == 400 { ChatError::Rejected(msg) } else { ChatError::Transient(msg) });
             }
             let v: Value = serde_json::from_slice(&text).map_err(|e| ChatError::Transient(format!("{url}: not JSON: {e}")))?;
-            let message = v.pointer("/choices/0/message").cloned().ok_or_else(|| ChatError::Transient(format!("{url}: no choices[0].message")))?;
-            let usage = v.get("usage");
-            return Ok(Turn {
-                message,
-                node: url,
-                prompt_tokens: usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()),
-                cached_tokens: usage.and_then(|u| u.pointer("/prompt_tokens_details/cached_tokens")).and_then(|v| v.as_u64()),
-            });
+            return parse_turn(&v, url).map_err(ChatError::Transient);
         }
+    }
+
+    /// The up nodes' URLs.
+    pub async fn up_nodes(&self) -> Vec<String> {
+        self.nodes.lock().await.iter().filter(|n| n.up).map(|n| n.url.clone()).collect()
+    }
+
+    /// One completion on one named node, outside placement (warming an expert's prefix into its cache).
+    pub async fn chat_on(&self, url: &str, body: &Value) -> Result<Turn> {
+        let r = self.client.post(format!("{url}/v1/chat/completions")).json(body).send().await?;
+        let status = r.status();
+        let text = r.bytes().await?;
+        if !status.is_success() {
+            bail!("{url} answered {status}: {}", String::from_utf8_lossy(&text).chars().take(300).collect::<String>());
+        }
+        let v: Value = serde_json::from_slice(&text)?;
+        parse_turn(&v, url.to_owned()).map_err(|e| anyhow::anyhow!(e))
     }
 
     pub fn model(&self) -> &str {
         &self.cfg.model
     }
+}
+
+fn parse_turn(v: &Value, url: String) -> Result<Turn, String> {
+    let message = v.pointer("/choices/0/message").cloned().ok_or_else(|| format!("{url}: no choices[0].message"))?;
+    let usage = v.get("usage");
+    Ok(Turn {
+        message,
+        finish_reason: v.pointer("/choices/0/finish_reason").and_then(|f| f.as_str()).map(str::to_owned),
+        node: url,
+        prompt_tokens: usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()),
+        cached_tokens: usage.and_then(|u| u.pointer("/prompt_tokens_details/cached_tokens")).and_then(|v| v.as_u64()),
+    })
 }
