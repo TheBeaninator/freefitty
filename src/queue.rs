@@ -86,20 +86,31 @@ impl Queue {
 
     pub fn stats(&self) -> serde_json::Value {
         let ev = self.events.lock().unwrap();
+        let inflight = self.inflight.lock().unwrap();
         let now = now_ms();
+        let age = |e: &Event| now.saturating_sub(e.due_ms.max(e.created_ms)) / 1000;
+        let due = || ev.values().filter(|e| e.due_ms <= now);
+        // a due event of a thread whose slice is running waits for that slice, as it must; one of an idle
+        // thread waits for nothing but a start: starvation shows in oldest_runnable_s, not in a green status
+        let runnable = || due().filter(|e| !inflight.contains(&e.thread));
         serde_json::json!({
             "queued": ev.len(),
-            "due": ev.values().filter(|e| e.due_ms <= now).count(),
-            // how long the oldest runnable event has waited: starvation shows here, not in a green status
-            "oldest_due_s": ev.values().filter(|e| e.due_ms <= now).map(|e| now.saturating_sub(e.due_ms.max(e.created_ms)) / 1000).max().unwrap_or(0),
+            "due": due().count(),
+            "oldest_due_s": due().map(age).max().unwrap_or(0),
+            "runnable": runnable().count(),
+            "oldest_runnable_s": runnable().map(age).max().unwrap_or(0),
             "running": self.running.load(Ordering::Relaxed),
-            "inflight": self.inflight.lock().unwrap().len(),
+            "inflight": inflight.len(),
         })
     }
 
     pub fn stop(&self) {
         self.stopping.store(true, Ordering::Relaxed);
         self.notify.notify_one();
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Relaxed)
     }
 
     pub fn running(&self) -> usize {

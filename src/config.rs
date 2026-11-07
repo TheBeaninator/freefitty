@@ -60,7 +60,7 @@ pub struct Config {
     #[serde(default)]
     pub max_context_tokens: u64,
     /// Seconds one request to a node may take. The wait for a free slot is not counted: a turn queued behind
-    /// other threads waits as long as it must (the queue's `oldest_due_s` shows it).
+    /// other threads waits as long as it must (the queue's `oldest_runnable_s` shows it).
     #[serde(default = "d_slice_timeout")]
     pub slice_timeout_s: u64,
     /// Delivery attempts before a thread's events dead-letter.

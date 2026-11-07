@@ -273,6 +273,9 @@ async fn turns_sleeps_tools_and_dead_letters() {
     assert_eq!(hv["nodes"][0]["up"], true);
     assert_eq!(hv["tools"], 1);
     assert!(hv["router"]["kept"].as_u64().unwrap() >= 5, "{}", hv["router"]);
+    // idle: nothing waits to start, and the starvation gauge says so
+    assert_eq!(hv["queue"]["runnable"], 0, "{}", hv["queue"]);
+    assert_eq!(hv["queue"]["oldest_runnable_s"], 0, "{}", hv["queue"]);
 
     r.shutdown().await;
 }

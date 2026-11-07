@@ -108,8 +108,8 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
     let f = fault.clone();
     let q = queue.clone();
     tasks.push(tokio::spawn(async move {
-        q.run().await;
-        tracing::error!("the scheduler ended");
+        q.clone().run().await;
+        if q.is_stopping() { tracing::info!("the scheduler stopped"); } else { tracing::error!("the scheduler ended"); }
         f.notify_one();
     }));
 

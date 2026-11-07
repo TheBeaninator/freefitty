@@ -59,7 +59,8 @@ after `retry_after_s` and dead-letters after `max_attempts`, with an error reply
 redrive` puts the events back with their ids kept, so a turn that had committed is not run again, and reopens a
 closed thread. While no node is up nothing starts, so an outage costs no attempts. `slice_timeout_s` bounds one
 request to a node; a turn queued behind other threads waits for its slot as long as it must, and that wait shows in
-`/health` as `oldest_due_s` and on the turn's log line. On SIGTERM nothing new starts and running slices finish;
+`/health` as `oldest_runnable_s` (events of idle threads; `oldest_due_s` also counts those waiting behind
+their own thread's running slice) and on the turn's log line. On SIGTERM nothing new starts and running slices finish;
 give the unit `TimeoutStopSec` at least `slice_timeout_s`. If the scheduler or the server ever ends on its own the
 process exits with status 3, so systemd restarts a whole daemon rather than leaving one that answers `/health` and
 takes no work. A slice that panics releases its thread.
@@ -116,7 +117,7 @@ POST /threads/{id}/compact {focus?}      DELETE /threads/{id} (409 while a slice
 GET  /dlq                 POST /dlq/redrive, /dlq/drop with {thread?}                  operator token
 GET  /experts             POST /experts/reload, /experts/{name}/warm, /experts/from-thread/{id}
 POST /rap/callback        or /rap/callback/{token}: a tool's result                    callback token
-GET  /health              nodes (context_length, load, waiting), router counts, queue (oldest_due_s), store
+GET  /health              nodes (context_length, load, waiting), router counts, queue (oldest_runnable_s, oldest_due_s), store
 ```
 
 A reply carries `metadata.thread`, `metadata.reply_to` (the id `/say` returned for the message it answers),
