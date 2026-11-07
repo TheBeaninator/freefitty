@@ -1,0 +1,19 @@
+# FreeFitty on pod-control, as the pod user (djinn): ~/.config/systemd/user/freefitty.service
+#   install -m 0755 freefitty ~/.local/bin/freefitty
+#   mkdir -p /data/pod/freefitty && cd /data/pod/freefitty && freefitty init --nodes ... --tool-servers ... --listen 127.0.0.1:8191
+#   systemctl --user daemon-reload && systemctl --user enable --now freefitty
+[Unit]
+Description=FreeFitty: durable agents on the strixite cluster
+After=network-online.target
+
+[Service]
+WorkingDirectory=/data/pod/freefitty
+ExecStart=%h/.local/bin/freefitty serve --config /data/pod/freefitty/freefitty.toml
+Restart=always
+RestartSec=5
+# running slices finish before the daemon stops; a slice is at most slice_timeout_s
+TimeoutStopSec=960
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

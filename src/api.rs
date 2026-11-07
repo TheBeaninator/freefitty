@@ -1,0 +1,270 @@
+//! The HTTP surface, the same one pod-ff and pod-hands speak to freefinity:
+//!
+//!   POST /say                 {text, thread?, metadata?} -> {thread, id}       operator
+//!   GET  /output?wait&thread  the oldest uncollected reply, removed once sent   operator
+//!   GET  /threads, /threads/{id}, /threads/{id}/messages; DELETE /threads/{id} operator
+//!   GET  /dlq; POST /dlq/redrive, /dlq/drop  {thread?}                         operator
+//!   POST /rap/callback, /rap/callback/{token}  a tool's result                 callback token
+//!   GET  /health                                                                open
+//!
+//! Two tokens, least privilege each: the operator drives the model and reads every reply; a tool server's
+//! token can only deliver results. Bodies are capped; nothing user-supplied is logged.
+
+use crate::config::{self, Config};
+use crate::queue::Queue;
+use crate::rap::{self, ToolBox};
+use crate::router::Router;
+use crate::store::{now_ms, Event, EventKind, Store};
+use axum::{
+    body::Bytes,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router as AxumRouter,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Mutex, Notify};
+
+pub struct App {
+    pub cfg: Config,
+    pub store: Arc<Store>,
+    pub queue: Arc<Queue>,
+    pub router: Arc<Router>,
+    pub tools: Arc<ToolBox>,
+    pub replies: Arc<Notify>,
+    pub started_ms: u64,
+    output_lock: Mutex<()>,
+}
+
+impl App {
+    pub fn new(cfg: Config, store: Arc<Store>, queue: Arc<Queue>, router: Arc<Router>, tools: Arc<ToolBox>, replies: Arc<Notify>) -> Arc<App> {
+        Arc::new(App { cfg, store, queue, router, tools, replies, started_ms: now_ms(), output_lock: Mutex::new(()) })
+    }
+}
+
+type Shared = State<Arc<App>>;
+
+/// One message's text. Threads read files through tools, but a round brief should fit in one message.
+const MAX_TEXT: usize = 256 << 10;
+
+pub fn routes(app: Arc<App>) -> AxumRouter {
+    AxumRouter::new()
+        .route("/health", get(health))
+        .route("/say", post(say))
+        .route("/output", get(output))
+        .route("/threads", get(threads))
+        .route("/threads/{id}", get(thread).delete(delete_thread))
+        .route("/threads/{id}/messages", get(messages))
+        .route("/dlq", get(dlq))
+        .route("/dlq/redrive", post(redrive))
+        .route("/dlq/drop", post(drop_dlq))
+        .route("/rap/callback", post(callback))
+        .route("/rap/callback/{token}", post(callback_path))
+        .layer(axum::extract::DefaultBodyLimit::max(app.cfg.max_body_bytes))
+        .with_state(app)
+}
+
+fn err(status: StatusCode, msg: &str) -> Response {
+    (status, Json(json!({"error": msg}))).into_response()
+}
+
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ").map(str::trim)
+}
+
+fn same(a: &str, b: &str) -> bool {
+    // constant time over equal lengths: a token is not guessed byte by byte
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn operator(app: &App, headers: &HeaderMap) -> Result<(), Box<Response>> {
+    match bearer(headers) {
+        Some(t) if same(t, &app.cfg.operator_token) => Ok(()),
+        _ => Err(Box::new(err(StatusCode::UNAUTHORIZED, "operator token required"))),
+    }
+}
+
+fn thread_id_ok(t: &str) -> bool {
+    !t.is_empty() && t.len() <= 128 && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+async fn health(State(app): Shared) -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "uptime_s": now_ms().saturating_sub(app.started_ms) / 1000,
+        "model": app.cfg.model,
+        "nodes": app.router.view().await,
+        "router": app.router.counts(),
+        "queue": app.queue.stats(),
+        "store": app.store.counts().unwrap_or(Value::Null),
+        "tools": app.tools.current().await.defs.len(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct Say {
+    text: String,
+    #[serde(default)]
+    thread: Option<String>,
+    #[serde(default)]
+    metadata: Option<Value>,
+}
+
+async fn say(State(app): Shared, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    let req: Say = match serde_json::from_slice(&body) { Ok(r) => r, Err(_) => return err(StatusCode::BAD_REQUEST, "body must be JSON with text") };
+    if req.text.trim().is_empty() { return err(StatusCode::BAD_REQUEST, "text is empty"); }
+    if req.text.len() > MAX_TEXT { return err(StatusCode::BAD_REQUEST, "text is over 256 KiB"); }
+    let thread = req.thread.unwrap_or_else(config::id);
+    if !thread_id_ok(&thread) { return err(StatusCode::BAD_REQUEST, "thread must be 1-128 of [A-Za-z0-9._-]"); }
+    let metadata = req.metadata.unwrap_or(Value::Null);
+    if !metadata.is_null() && (!metadata.is_object() || metadata.to_string().len() > 4096) {
+        return err(StatusCode::BAD_REQUEST, "metadata must be a JSON object under 4 KiB");
+    }
+    let id = config::id();
+    let ev = Event { id: id.clone(), thread: thread.clone(), due_ms: 0, created_ms: 0, attempts: 0, kind: EventKind::User { text: req.text, metadata } };
+    match app.queue.push(ev) {
+        Ok(_) => Json(json!({"thread": thread, "id": id})).into_response(),
+        Err(e) => {
+            tracing::error!("say: {e:#}");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "could not store the message")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct OutputQuery {
+    #[serde(default)]
+    wait: Option<u64>,
+    #[serde(default)]
+    thread: Option<String>,
+}
+
+async fn output(State(app): Shared, headers: HeaderMap, Query(q): Query<OutputQuery>) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(q.wait.unwrap_or(0).min(60));
+    loop {
+        let notified = app.replies.notified();
+        {
+            let _g = app.output_lock.lock().await;
+            match app.store.replies(q.thread.as_deref()) {
+                Ok(mut rs) if !rs.is_empty() => {
+                    let r = rs.remove(0);
+                    if let Err(e) = app.store.remove_reply(r.seq) { tracing::error!("output: {e:#}"); }
+                    let mut meta = match r.metadata { Value::Object(m) => m, _ => Default::default() };
+                    meta.insert("thread".into(), json!(r.thread));
+                    meta.insert("reply_to".into(), json!(r.reply_to));
+                    meta.insert("kind".into(), json!(r.kind));
+                    return Json(json!({"text": r.text, "metadata": meta, "created_ms": r.created_ms})).into_response();
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("output: {e:#}");
+                    return err(StatusCode::INTERNAL_SERVER_ERROR, "could not read replies");
+                }
+            }
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline { return StatusCode::NO_CONTENT.into_response(); }
+        let _ = tokio::time::timeout(deadline - now, notified).await;
+    }
+}
+
+async fn threads(State(app): Shared, headers: HeaderMap) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    match app.store.threads() {
+        Ok(ts) => Json(ts.into_iter().map(|(id, m)| json!({"thread": id, "created_ms": m.created_ms, "updated_ms": m.updated_ms, "node": m.node, "messages": m.messages, "bytes": m.bytes, "pending": m.pending.len(), "last": m.last, "closed": m.closed})).collect::<Vec<_>>()).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn thread(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    match app.store.thread(&id) {
+        Ok(Some(m)) => Json(json!({"thread": id, "created_ms": m.created_ms, "updated_ms": m.updated_ms, "node": m.node, "messages": m.messages, "bytes": m.bytes, "pending": m.pending, "last": m.last, "closed": m.closed, "metadata": m.metadata})).into_response(),
+        Ok(None) => err(StatusCode::NOT_FOUND, "no such thread"),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn messages(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    match app.store.messages(&id) {
+        Ok(ms) => Json(ms).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn delete_thread(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    app.queue.forget_thread(&id);
+    match app.store.delete_thread(&id) {
+        Ok(()) => Json(json!({"deleted": id})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn dlq(State(app): Shared, headers: HeaderMap) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    match app.store.dlq() {
+        Ok(d) => Json(d.into_iter().map(|(seq, e)| json!({"seq": seq, "id": e.id, "thread": e.thread, "attempts": e.attempts, "created_ms": e.created_ms, "kind": e.kind})).collect::<Vec<_>>()).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct ThreadArg {
+    #[serde(default)]
+    thread: Option<String>,
+}
+
+async fn redrive(State(app): Shared, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    let a: ThreadArg = if body.is_empty() { ThreadArg::default() } else { match serde_json::from_slice(&body) { Ok(a) => a, Err(_) => return err(StatusCode::BAD_REQUEST, "body must be JSON") } };
+    match app.store.redrive(a.thread.as_deref()) {
+        Ok(items) => {
+            let n = items.len();
+            app.queue.requeue(items);
+            Json(json!({"redriven": n})).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn drop_dlq(State(app): Shared, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    let a: ThreadArg = if body.is_empty() { ThreadArg::default() } else { match serde_json::from_slice(&body) { Ok(a) => a, Err(_) => return err(StatusCode::BAD_REQUEST, "body must be JSON") } };
+    match app.store.drop_dlq(a.thread.as_deref()) {
+        Ok(n) => Json(json!({"dropped": n})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn callback_path(State(app): Shared, headers: HeaderMap, Path(token): Path<String>, body: Bytes) -> Response {
+    deliver(&app, bearer(&headers).unwrap_or(&token), &body)
+}
+
+async fn callback(State(app): Shared, headers: HeaderMap, body: Bytes) -> Response {
+    deliver(&app, bearer(&headers).unwrap_or(""), &body)
+}
+
+fn deliver(app: &App, token: &str, body: &[u8]) -> Response {
+    if !same(token, &app.cfg.callback_token) { return err(StatusCode::UNAUTHORIZED, "callback token required"); }
+    let v: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(_) => return err(StatusCode::BAD_REQUEST, "body must be JSON") };
+    match rap::callback_event(&v) {
+        Ok(Some(ev)) => match app.queue.push(ev) {
+            Ok(Some(_)) => Json(json!({"ok": true})).into_response(),
+            Ok(None) => Json(json!({"ok": true, "duplicate": true})).into_response(),
+            Err(e) => {
+                tracing::error!("callback: {e:#}");
+                err(StatusCode::INTERNAL_SERVER_ERROR, "could not store the result")
+            }
+        },
+        Ok(None) => Json(json!({"ok": true, "ignored": true})).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}

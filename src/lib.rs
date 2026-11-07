@@ -1,0 +1,109 @@
+//! FreeFitty: durable agents on a cluster of Strix Halos. One binary, one data file.
+//!
+//! A thread is its stored conversation. Events for it (a message, a tool's result, a wake-up) queue in the
+//! store; a slice runs the model once over them and commits the turn. Between slices a thread holds no
+//! process. The router keeps each thread on the node whose prompt cache has it, and moves the cache over the
+//! rail when a node is full. Tools are RAP servers; their results come back as events.
+
+pub mod api;
+pub mod config;
+pub mod engine;
+pub mod queue;
+pub mod rap;
+pub mod router;
+pub mod store;
+
+use anyhow::{Context, Result};
+use std::sync::Arc;
+use tokio::sync::Notify;
+
+pub struct Running {
+    pub app: Arc<api::App>,
+    pub addr: std::net::SocketAddr,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    server: tokio::task::JoinHandle<()>,
+    stop: Arc<Notify>,
+    /// Fires when the scheduler or the server ends on its own: the process must exit so the service manager
+    /// brings back a whole daemon, never one that answers /health and takes no work.
+    pub fault: Arc<Notify>,
+}
+
+impl Running {
+    /// Stop taking work, let running slices finish (they commit atomically), then stop serving.
+    pub async fn shutdown(self) {
+        self.app.queue.stop();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(self.app.cfg.slice_timeout_s + 5);
+        while self.app.queue.running() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        for t in &self.tasks { t.abort(); }
+        for t in self.tasks { let _ = t.await; }
+        // the server closes idle connections and finishes the requests in flight
+        self.stop.notify_one();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.server).await;
+    }
+}
+
+/// Open the store, read the tools, start the router's polls, the dispatcher, the scheduler and the API.
+pub async fn start(cfg: config::Config) -> Result<Running> {
+    cfg.check()?;
+    let mut tasks = Vec::new();
+    let store = Arc::new(store::Store::open(&cfg.data_dir)?);
+    // bound first: with no callback_base the tool servers call back to the port actually taken
+    let listener = tokio::net::TcpListener::bind(&cfg.listen).await.with_context(|| format!("binding {}", cfg.listen))?;
+    let addr = listener.local_addr()?;
+    let mut cfg = cfg;
+    if cfg.listen.ends_with(":0") { cfg.listen = addr.to_string(); }
+    let router = router::Router::new(&cfg, &mut tasks);
+    let tools = rap::ToolBox::start(cfg.clone(), store.clone(), &mut tasks).await?;
+    let system = cfg.system_prompt()?;
+    let engine = Arc::new(engine::Engine { cfg: cfg.clone(), store: store.clone(), router: router.clone(), tools: tools.clone(), system, callback_url: cfg.callback_url() });
+    let replies = Arc::new(Notify::new());
+
+    // the dispatcher's failures become events; the queue is built after it, so it reaches the queue through a slot
+    let queue_slot: Arc<std::sync::OnceLock<std::sync::Weak<queue::Queue>>> = Arc::new(std::sync::OnceLock::new());
+    let slot = queue_slot.clone();
+    let dispatcher = rap::Dispatcher::start(store.clone(), Box::new(move |ev| {
+        if let Some(q) = slot.get().and_then(|w| w.upgrade()) {
+            if let Err(e) = q.push(ev) { tracing::error!("dispatcher: could not queue a failure: {e:#}"); }
+        }
+    }), &mut tasks);
+    let d = dispatcher.clone();
+    let queue = queue::Queue::new(store.clone(), engine, replies.clone(), Box::new(move || d.kick()))?;
+    let _ = queue_slot.set(Arc::downgrade(&queue));
+
+    let app = api::App::new(cfg.clone(), store.clone(), queue.clone(), router, tools, replies);
+    let routes = api::routes(app.clone());
+    let fault = Arc::new(Notify::new());
+    let stop = Arc::new(Notify::new());
+    let stop_rx = stop.clone();
+    let f = fault.clone();
+    let server = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, routes).with_graceful_shutdown(async move { stop_rx.notified().await }).await { tracing::error!("server: {e}"); }
+        f.notify_one();
+    });
+    let f = fault.clone();
+    let q = queue.clone();
+    tasks.push(tokio::spawn(async move {
+        q.run().await;
+        tracing::error!("the scheduler ended");
+        f.notify_one();
+    }));
+
+    // replies nobody collected expire
+    let s = store.clone();
+    let days = cfg.reply_retention_days;
+    tasks.push(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            match s.expire_replies(store::now_ms().saturating_sub(days * 86_400_000)) {
+                Ok(n) if n > 0 => tracing::info!("{n} uncollected repl{} expired", if n == 1 { "y" } else { "ies" }),
+                Err(e) => tracing::warn!("expiring replies: {e:#}"),
+                _ => {}
+            }
+        }
+    }));
+
+    tracing::info!("freefitty serving on {addr}; {} node(s), data in {}", cfg.nodes.len(), cfg.data_dir.display());
+    Ok(Running { app, addr, tasks, server, stop, fault })
+}
