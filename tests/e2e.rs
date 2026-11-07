@@ -627,7 +627,7 @@ async fn the_window_pages_old_turns_out_and_recall_brings_them_back() {
     assert_eq!(stored[1]["role"], "tool", "the recall result is stored as a tool message: {stored}");
     // replay over the same history agrees that cuts happened and nothing faulted
     let hist = api.get(&format!("/threads/{t}/messages")).await;
-    let rp = freefitty::window::replay(hist.as_array().unwrap(), 1500, 900, 1.0, 200, 0, 0);
+    let rp = freefitty::window::replay(hist.as_array().unwrap(), 1500, 900, 1.0, 200, 0, 0, 1);
     assert!(rp.cuts >= 1 && rp.peak_windowed < rp.peak_unwindowed, "{rp:?}");
     r.shutdown().await;
 }
@@ -673,5 +673,56 @@ async fn a_tools_image_reaches_the_model() {
     assert!(text.starts_with("saw 1 image(s) data:image/png;base64,iVBORw0KGgo= after tool: echo: picture"), "{text}");
     assert!(text.contains("[1 image(s) follow]"), "the tool message says images follow: {text}");
     assert!(text.contains("not inline data was left out"), "the remote URL is named, not fetched: {text}");
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn old_results_page_out_in_batches_and_recall_pins_them() {
+    let mut h = harness().await;
+    h.cfg.page_results_after_turns = 1;
+    h.cfg.page_results_min_bytes = 100;
+    h.cfg.page_results_batch = 2;
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let t = "thread-page";
+    let big = "x".repeat(300);
+    for i in 0..3 {
+        api.say(&format!("echo {i}-{big}"), Some(t)).await;
+        api.output(t, 10).await.expect("the call line");
+        let out = api.output(t, 10).await.expect("the reply after the tool");
+        assert!(out["text"].as_str().unwrap().starts_with("done: echo: "), "{out}");
+    }
+    // an error result, which must never page
+    api.say("bogus", Some(t)).await;
+    api.output(t, 10).await.expect("the unknown-tool reply");
+    // the paging mark moves at the start of a slice, in batches of 2: this plain turn shows the handles
+    api.say("hello", Some(t)).await;
+    assert_eq!(api.output(t, 10).await.unwrap()["text"], "hi: hello");
+    let th = api.get(&format!("/threads/{t}")).await;
+    assert!(th["paging"]["before"].as_u64().unwrap() > 0, "{th}");
+    let live = api.get(&format!("/threads/{t}/messages?view=live")).await;
+    let live = live.as_array().unwrap();
+    let handles: Vec<&Value> = live.iter().filter(|m| m["content"].as_str().is_some_and(|c| c.starts_with("[Paged out: echo("))).collect();
+    assert!(handles.len() >= 2, "{} handles in {}", handles.len(), serde_json::to_string_pretty(live).unwrap());
+    assert!(handles[0]["content"].as_str().unwrap().contains("answered with 3"), "{}", handles[0]);
+    let errors: Vec<&Value> = live.iter().filter(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.starts_with("Error: there is no tool"))).collect();
+    assert_eq!(errors.len(), 1, "the error result stays in full");
+    // the full texts are still stored
+    let stored = api.get(&format!("/threads/{t}/messages")).await;
+    assert!(stored.as_array().unwrap().iter().filter(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.starts_with("echo: 0-"))).count() == 1);
+    // recall the first result: it comes back exactly and is pinned, so the live view shows it in full again
+    let idx = stored.as_array().unwrap().iter().position(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.starts_with("echo: 0-"))).unwrap();
+    api.say(&format!("recall {idx}"), Some(t)).await;
+    let out = api.output(t, 10).await.expect("the recall reply");
+    assert!(out["text"].as_str().unwrap().contains(&format!("#{idx} tool (result of ")), "{out}");
+    assert!(out["text"].as_str().unwrap().contains("echo: 0-xxxx"), "{out}");
+    let th = api.get(&format!("/threads/{t}")).await;
+    assert_eq!(th["paging"]["pinned"], json!(1), "{th}");
+    let live = api.get(&format!("/threads/{t}/messages?view=live")).await;
+    assert!(live.as_array().unwrap().iter().any(|m| m["content"].as_str().is_some_and(|c| c.starts_with("echo: 0-"))), "the pinned result is back in full");
+    // the model saw handles on the last request
+    let bodies = h.model.bodies.lock().unwrap().clone();
+    let last = bodies.last().unwrap()["messages"].as_array().unwrap().clone();
+    assert!(last.iter().any(|m| m["content"].as_str().is_some_and(|c| c.starts_with("[Paged out:"))));
     r.shutdown().await;
 }

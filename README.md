@@ -187,14 +187,28 @@ boot; `experts freeze THREAD NAME` turns a thread's refocus notes into an expert
 mechanism is cheap, the practice is the work, and it is a board card (FF-EXPERTS) to grow a small set from the
 kinds of work the pod repeats, measure their cache reuse, and retire what nothing uses.
 
-**Measuring before deciding.** `freefitty replay` runs the window's cut over the stored histories as if it had been
-live and prints, per thread and in total: the largest view a slice saw with and without the window, cuts, messages
-gone, the share of token-slices the node would not have re-read, and faults (a later tool call identical to one
-whose text had left the view). `--tau N --min-bytes B` adds the simulation of paging out tool results older than N
-user turns and over B bytes (after arXiv 2603.09023), with its own evictions, faults and savings, so a policy is
-measured on this pod's threads before it exists. On 2026-11-07 that replay over 28 live threads said tool results
-older than four user turns were 15.7 % of everything the nodes re-read, with no identical re-call among 8,263
-messages; that is the next card (FF-PAGE-RESULTS), not yet a feature here.
+**Paging old tool results, on.** Most of a pod thread is tool output, and most of it is read once. A result the
+model has answered `page_results_after_turns` (4) model turns ago and that is over `page_results_min_bytes` (500)
+is shown as a handle in its place, `[Paged out: name(args...) answered with N bytes; recall(#i) returns it]`, under
+the same call id so the template still pairs them; the text stays stored and `recall` brings it back, after which
+that index is pinned and shown in full however old. An error result is never paged: the model needs it while it
+debugs. Paging advances in batches of `page_results_batch` (32) results, or all at once when the window cuts,
+because every advance changes the view at an old position and costs the node a recompute of everything after it,
+about as much work as a dozen turns' worth of the attention it saves; between advances the view is stable and the
+cache serves it, and a cut, which pays that recompute anyway, pages everything it can. On because the replay below measured it on the pod's
+own threads first; `page_results_after_turns = 0` turns it off. `GET /threads/{id}` reports `paging.before` (the
+index below which results are handles) and `paging.pinned`.
+
+**Measuring before deciding.** `freefitty replay` runs the window's cut and the paging rule over the stored
+histories as if they had been live and prints, per thread and in total: the largest view a slice saw with and
+without the window, cuts, messages gone, the share of token-slices the node would not have re-read, faults (a
+later tool call identical to one whose text had left the view), and for paging (`--tau N --min-bytes B --batch K`)
+the results paged, their faults and their share of token-slices. On 2026-11-07 that replay over 28 live threads
+and 8,448 messages chose the defaults above: results the model had answered four turns ago were half of everything
+the nodes re-read (51 % of token-slices at tau 4 paged one by one, 49 % at tau 8, 52 % at tau 2), with one
+identical re-call among 1,851 paged results. The batch trades that saving against recomputes: 45 % at 32, 31 % at
+64, 6 % at 128, because a thread has to live long enough to fill a batch; 32 keeps most of the saving and pays the
+recompute once in some thirty turns.
 
 ## Operating it on the pod
 
@@ -242,7 +256,7 @@ These came from the pod's weeks on freefinity; each one is a design point here r
 
 ## Tests
 
-`cargo test` runs the unit tests (the window's cut, stubs, notice and replay; the estimate's scaling; argument
+`cargo test` runs the unit tests (the window's cut, stubs, notice, paging boundary, batch and handle, and replay; the estimate's scaling; argument
 repair; the router's placement with held nodes) and `tests/e2e.rs`: the daemon against a scripted model node and a
 RAP tool server, in process. It covers a plain turn, a sleep through the queue, a RAP tool whose result is posted
 twice, double-encoded arguments, an unknown tool, a turn with nothing in it, three failures to the dead-letter queue
@@ -251,7 +265,8 @@ tool and from the operator with the pending call bridged and its late result ans
 again, nothing-to-fold, the token trigger, failed notes; experts sharing their prefix bytes, version pinning across
 a file change, warm on start, and an expert frozen from a thread's notes; the window cutting whole units at the
 budget, the notice carrying the first message, the cut point holding across turns, `recall` returning the exact
-text within the slice, and the replay agreeing with the live run; a node's count correcting a wrong estimate so
+text within the slice, and the replay agreeing with the live run; old results paging out in a batch as handles, an
+error result staying, and a recalled result pinned back in full; a node's count correcting a wrong estimate so
 the turn runs; a full context closing a thread that has nothing to cut; a wait for a node slot longer than the
 slice timeout that is not a failure; and a tool's images reaching the model. `FREEFITTY_NODES=http://a:5300,http://b:5300
 cargo test --test real_nodes -- --ignored` proves the cache move on two real strixite nodes.

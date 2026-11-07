@@ -84,7 +84,7 @@ pub fn prefix(system: &str, store: &Store, meta: &ThreadMeta) -> anyhow::Result<
 /// `[Paged.]` notice, then history from the window's start. A result whose call is not in the shown tail gets a
 /// stub call on the notes or notice side so the template sees a call before every result. `pending` is the
 /// thread's pending list as read at slice start.
-pub fn live_view(prefix: &[Value], meta: &ThreadMeta, history: &[Value], pending: &[PendingCall]) -> Vec<Value> {
+pub fn live_view(prefix: &[Value], meta: &ThreadMeta, history: &[Value], pending: &[PendingCall], page_min_bytes: u64) -> Vec<Value> {
     let mut v: Vec<Value> = prefix.to_vec();
     let low = meta.compactions.last().map(|c| c.from as usize).unwrap_or(0).min(history.len());
     let from = (meta.window_from as usize).max(low).min(history.len());
@@ -107,7 +107,16 @@ pub fn live_view(prefix: &[Value], meta: &ThreadMeta, history: &[Value], pending
         v.push(json!({"role": "user", "content": "[The calls these results answer were made before this view begins.]"}));
         v.push(json!({"role": "assistant", "content": "", "tool_calls": stubs}));
     }
-    v.extend(history[from..].iter().cloned());
+    // old tool results below the paging mark are handles; the text stays stored and `recall` returns it
+    let paged_before = (meta.paged_before as usize).min(history.len());
+    let calls = if page_min_bytes > 0 && paged_before > from { window::calls_by_id(history) } else { Default::default() };
+    for i in from..history.len() {
+        if page_min_bytes > 0 && i < paged_before && window::pageable(history, i, page_min_bytes, &meta.pinned) {
+            v.push(window::handle(i, &history[i], &calls));
+        } else {
+            v.push(history[i].clone());
+        }
+    }
     v
 }
 
@@ -124,7 +133,7 @@ impl Engine {
         let meta = self.store.thread(thread)?.unwrap_or_default();
         let history = self.store.messages(thread)?;
         let p = prefix(&self.system, &self.store, &meta)?;
-        Ok(live_view(&p, &meta, &history, &meta.pending))
+        Ok(live_view(&p, &meta, &history, &meta.pending, self.page_min()))
     }
 
     async fn run(&self, thread: &str, batch: &[(u64, Event)]) -> anyhow::Result<Outcome> {
@@ -198,7 +207,7 @@ impl Engine {
         defs.extend(tools.defs.iter().cloned());
 
         // ---- refocus -----------------------------------------------------------------------------
-        let mut view = live_view(&prefix, &meta, &history, &pending_at_start);
+        let mut view = live_view(&prefix, &meta, &history, &pending_at_start, self.page_min());
         let mut est = calibrated(tokens(&view) + tokens(&new_messages), self.scale(&meta));
         if self.cfg.compaction && (refocus.is_some() || (self.cfg.compact_at_tokens > 0 && est > self.cfg.compact_at_tokens)) {
             let focus = refocus.clone().flatten();
@@ -207,7 +216,7 @@ impl Engine {
                     meta.window_from = c.from;
                     meta.compactions.push(c);
                     meta.node = None;
-                    view = live_view(&prefix, &meta, &history, &pending_at_start);
+                    view = live_view(&prefix, &meta, &history, &pending_at_start, self.page_min());
                     est = calibrated(tokens(&view) + tokens(&new_messages), self.scale(&meta));
                     if self.cfg.compact_at_tokens > 0 && est > self.cfg.compact_at_tokens {
                         tracing::warn!("{thread}: still ~{est} tokens after refocusing (the kept tail or the new messages are large)");
@@ -223,6 +232,21 @@ impl Engine {
             // only a refocus was asked for: no turn
             self.store.commit(Commit { thread, meta, messages: vec![], done, done_ids, replies: vec![], events: vec![], invocations: vec![] })?;
             return Ok(Outcome::Done);
+        }
+
+        // ---- paging of old tool results ------------------------------------------------------------
+        if self.cfg.page_results_after_turns > 0 {
+            let low = meta.compactions.last().map(|c| c.from as usize).unwrap_or(0);
+            let from = (meta.window_from as usize).max(low).min(history.len());
+            let boundary = window::page_boundary(&history, from, self.cfg.page_results_after_turns);
+            if let Some(to) = window::page_advance(&history, from, meta.paged_before as usize, boundary, self.cfg.page_results_min_bytes, self.cfg.page_results_batch, &meta.pinned) {
+                let n = (from.max(meta.paged_before as usize)..to).filter(|&i| window::pageable(&history, i, self.cfg.page_results_min_bytes, &meta.pinned)).count();
+                meta.paged_before = to as u64;
+                view = live_view(&prefix, &meta, &history, &pending_at_start, self.page_min());
+                let before = est;
+                est = calibrated(tokens(&view) + tokens(&new_messages), self.scale(&meta));
+                tracing::info!("{thread}: paged {n} tool results below #{to} (view ~{before} -> ~{est} tokens)");
+            }
         }
 
         // ---- the window --------------------------------------------------------------------------
@@ -305,7 +329,11 @@ impl Engine {
                     rap::RECALL if self.cfg.window => {
                         // answered from the store within the slice: a fault costs one more model pass, no tool round trip
                         let text = match window::recall_indices(&call.args, history.len()) {
-                            Ok(idx) => window::recall_text(&history, &idx),
+                            Ok(idx) => {
+                                // what the model asked for again stays in full from now on
+                                for &i in &idx { if !meta.pinned.contains(&(i as u64)) { meta.pinned.push(i as u64); } }
+                                window::recall_text(&history, &idx)
+                            }
                             Err(e) => format!("Error: {e}"),
                         };
                         recalled.push((call.clone(), text));
@@ -390,6 +418,11 @@ impl Engine {
         Ok(Outcome::Done)
     }
 
+    /// The paging size threshold, or 0 while paging is off.
+    fn page_min(&self) -> u64 {
+        if self.cfg.page_results_after_turns > 0 { self.cfg.page_results_min_bytes.max(1) } else { 0 }
+    }
+
     /// How far over bytes / 4 to count this thread: its own last ratio, else the latest any thread saw, else the
     /// config's default.
     fn scale(&self, meta: &ThreadMeta) -> f64 {
@@ -416,7 +449,12 @@ impl Engine {
         if new_from <= from { return None; }
         meta.window_from = new_from as u64;
         meta.window_cuts += 1;
-        let view = live_view(prefix, meta, history, pending);
+        // the cut costs the cache anyway: page every result the rule allows at the same time
+        if self.cfg.page_results_after_turns > 0 {
+            let b = window::page_boundary(history, new_from, self.cfg.page_results_after_turns) as u64;
+            meta.paged_before = meta.paged_before.max(b);
+        }
+        let view = live_view(prefix, meta, history, pending, self.page_min());
         let after = calibrated(tokens(&view) + tokens(new_messages), scale);
         tracing::info!("{thread}: paged out messages #{from} to #{} (view ~{est} -> ~{after} tokens, budget {budget}, cut {})", new_from - 1, meta.window_cuts);
         Some((view, after))
@@ -643,9 +681,9 @@ mod tests {
             PendingCall { id: "y-0".into(), name: "echo".into(), provider_call_id: None, arguments: "{\"t\":1}".into() },
         ];
         let mut meta = ThreadMeta::default();
-        assert_eq!(live_view(&prefix, &meta, &history, &pending).len(), 4);
+        assert_eq!(live_view(&prefix, &meta, &history, &pending, 0).len(), 4);
         meta.compactions.push(Compaction { from: 1, summary: "notes".into(), focus: Some("f".into()), at_ms: 0, summarized: 1, tokens_before: 0, truncated: false });
-        let v = live_view(&prefix, &meta, &history, &pending);
+        let v = live_view(&prefix, &meta, &history, &pending, 0);
         assert_eq!(v.len(), 1 + 2 + 2);
         assert_eq!(v[2]["content"], "notes");
         let calls = v[2]["tool_calls"].as_array().unwrap();

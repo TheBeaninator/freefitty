@@ -128,6 +128,66 @@ pub fn orphan_calls(history: &[Value], from: usize, pending: &[PendingCall]) -> 
     out
 }
 
+/// Every tool call in the history by its id: (name, arguments).
+pub fn calls_by_id(history: &[Value]) -> HashMap<String, (String, String)> {
+    let mut m = HashMap::new();
+    for msg in history {
+        for tc in msg.get("tool_calls").and_then(|t| t.as_array()).into_iter().flatten() {
+            if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                m.insert(id.to_owned(), (tc.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
+                                         tc.pointer("/function/arguments").and_then(|v| v.as_str()).unwrap_or("").to_owned()));
+            }
+        }
+    }
+    m
+}
+
+/// A tool result that reports a failure: the model needs those for as long as it debugs, so they are never paged.
+pub fn is_error_result(m: &Value) -> bool {
+    role(m) == "tool" && text_of(m).trim_start().to_ascii_lowercase().starts_with("error")
+}
+
+/// A tool result that may be shown as a handle: big enough, not an error, not pinned.
+pub fn pageable(history: &[Value], i: usize, min_bytes: u64, pinned: &[u64]) -> bool {
+    let m = &history[i];
+    role(m) == "tool" && text_of(m).len() as u64 >= min_bytes && !is_error_result(m) && !pinned.contains(&(i as u64))
+}
+
+/// The history index below which every result has been answered at least `tau` assistant turns ago (and is in
+/// the view, so at or past `from`). `from` when the view holds fewer than `tau` answers.
+pub fn page_boundary(history: &[Value], from: usize, tau: u64) -> usize {
+    if tau == 0 { return from; }
+    let mut seen = 0u64;
+    for i in (from..history.len()).rev() {
+        if role(&history[i]) == "assistant" {
+            seen += 1;
+            if seen == tau { return i.max(from); }
+        }
+    }
+    from
+}
+
+/// Where paging should move to: `Some(boundary)` when at least `batch` pageable results lie between the current
+/// `paged_before` and the boundary, else None. Batched because every advance changes the view at an old position
+/// and costs the node a prefix recompute from there.
+pub fn page_advance(history: &[Value], from: usize, paged_before: usize, boundary: usize, min_bytes: u64, batch: u64, pinned: &[u64]) -> Option<usize> {
+    let start = from.max(paged_before);
+    if boundary <= start { return None; }
+    let n = (start..boundary).filter(|&i| pageable(history, i, min_bytes, pinned)).count() as u64;
+    (n >= batch.max(1)).then_some(boundary)
+}
+
+const HANDLE_ARGS_CHARS: usize = 80;
+
+/// The handle shown in place of a paged result: the call it answered, its size, and how to get it back.
+pub fn handle(i: usize, m: &Value, calls: &HashMap<String, (String, String)>) -> Value {
+    let id = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+    let (name, args) = calls.get(id).cloned().unwrap_or_else(|| ("tool".to_owned(), String::new()));
+    let head: String = args.chars().take(HANDLE_ARGS_CHARS).collect();
+    let bytes = text_of(m).len();
+    json!({"role": "tool", "tool_call_id": id, "content": format!("[Paged out: {name}({head}{}) answered with {bytes} bytes; recall(#{i}) returns it]", if args.chars().count() > HANDLE_ARGS_CHARS { "..." } else { "" })})
+}
+
 const NOTICE_MSG_CHARS: usize = 300;
 const NOTICE_CHARS: usize = 6000;
 
@@ -233,7 +293,8 @@ fn call_keys(m: &Value) -> Vec<String> {
         .collect()
 }
 
-pub fn replay(history: &[Value], budget: u64, target: u64, scale: f64, fixed: u64, tau: usize, min_bytes: u64) -> Replay {
+#[allow(clippy::too_many_arguments)]
+pub fn replay(history: &[Value], budget: u64, target: u64, scale: f64, fixed: u64, tau: usize, min_bytes: u64, batch: u64) -> Replay {
     let mut r = Replay { messages: history.len(), ..Default::default() };
     let w: Vec<u64> = history.iter().map(|m| (weigh(m) as f64 * scale) as u64).collect();
     r.tokens = w.iter().sum();
@@ -249,14 +310,15 @@ pub fn replay(history: &[Value], budget: u64, target: u64, scale: f64, fixed: u6
     let mut from = 0usize;
     let mut gone_calls: HashSet<String> = HashSet::new();
     let mut gc_gone: HashSet<String> = HashSet::new();
-    let mut user_turns_at: Vec<usize> = Vec::new(); // index of each user message, for tau
+    let mut paged_before = 0usize;
+    let no_pins: Vec<u64> = Vec::new();
     for s in 0..history.len() {
         if !is_boundary(&history[s]) { continue; }
         r.slices += 1;
-        if role(&history[s]) == "user" { user_turns_at.push(s); }
         // the view this slice would see: history[from..=s] plus the fixed prefix
         let unwindowed: u64 = fixed + w[..=s].iter().sum::<u64>();
         r.peak_unwindowed = r.peak_unwindowed.max(unwindowed);
+        let cuts_before = r.cuts;
         let mut est: u64 = fixed + w[from..=s].iter().sum::<u64>();
         if budget > 0 && est > budget {
             let new_from = cut(&history[..=s], from, target.saturating_sub(fixed), scale);
@@ -279,13 +341,16 @@ pub fn replay(history: &[Value], budget: u64, target: u64, scale: f64, fixed: u6
                 if gc_gone.contains(&k) { r.gc_faults += 1; }
             }
         }
-        // tool-result paging: results older than tau user turns and over min_bytes are out of the view
-        let cutoff = if tau > 0 && user_turns_at.len() > tau { Some(user_turns_at[user_turns_at.len() - 1 - tau]) } else { None };
-        if let Some(cutoff) = cutoff.filter(|&c| c >= from) {
-            for (i, m) in history[from..=s.min(cutoff)].iter().enumerate() {
-                let i = i + from;
-                if role(m) != "tool" || (weigh(m) * 4) < min_bytes { continue; }
-                let id = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+        // tool-result paging as the daemon does it: results answered tau assistant turns ago, over min_bytes, not
+        // errors, advanced in batches (and at a window cut) so the view changes at an old position rarely
+        if tau > 0 {
+            let view_so_far = &history[..=s];
+            let boundary = page_boundary(view_so_far, from, tau as u64);
+            let advanced = if r.cuts > cuts_before { boundary > paged_before.max(from) } else { page_advance(view_so_far, from, paged_before, boundary, min_bytes, batch, &no_pins).is_some() };
+            if advanced { paged_before = boundary.max(paged_before); }
+            for i in from..paged_before.min(s + 1) {
+                if !pageable(view_so_far, i, min_bytes, &no_pins) { continue; }
+                let id = history[i].get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
                 let key = call_of.get(id).cloned().unwrap_or_else(|| format!("#{i}"));
                 if gc_gone.insert(key) { r.gc_evicted += 1; }
                 r.gc_token_slices_saved += w[i];
@@ -368,6 +433,32 @@ mod tests {
     }
 
     #[test]
+    fn results_page_in_batches_behind_the_answers_and_errors_never() {
+        let big = "r".repeat(600);
+        let h = vec![
+            user("go"), call("c1", "echo"), result("c1", &big), asst("a1"),
+            call("c2", "echo"), result("c2", "Error: boom"), asst("a2"),
+            call("c3", "echo"), result("c3", &big), asst("a3"),
+            call("c4", "echo"), result("c4", &big), asst("a4"),
+            user("more"),
+        ];
+        // tau 1: everything answered at least once is behind the boundary, which is the last assistant message;
+        // a tool-call message is a model turn too, so tau 3 lands on a3 (12, 10, 9)
+        assert_eq!(page_boundary(&h, 0, 1), 12);
+        assert_eq!(page_boundary(&h, 0, 3), 9);
+        assert_eq!(page_boundary(&h, 0, 9), 0, "fewer answers than tau: nothing");
+        assert!(pageable(&h, 2, 500, &[]) && !pageable(&h, 5, 1, &[]) && !pageable(&h, 2, 500, &[2]));
+        // batch 3 needs three pageable results before the boundary: c1, c3, c4 qualify, the error does not
+        assert_eq!(page_advance(&h, 0, 0, 12, 500, 3, &[]), Some(12));
+        assert_eq!(page_advance(&h, 0, 0, 12, 500, 4, &[]), None);
+        assert_eq!(page_advance(&h, 0, 12, 12, 500, 1, &[]), None, "nothing new past the last advance");
+        let calls = calls_by_id(&h);
+        let hd = handle(2, &h[2], &calls);
+        assert_eq!(hd["tool_call_id"], "c1");
+        assert_eq!(hd["content"], "[Paged out: echo({\"a\":1}) answered with 600 bytes; recall(#2) returns it]");
+    }
+
+    #[test]
     fn replay_counts_cuts_and_faults() {
         let mut h = Vec::new();
         for i in 0..20 {
@@ -376,14 +467,13 @@ mod tests {
             h.push(result(&format!("c{i}"), &"r".repeat(200)));
             h.push(asst("done"));
         }
-        let r = replay(&h, 300, 150, 1.0, 0, 2, 100);
+        let r = replay(&h, 300, 150, 1.0, 0, 2, 100, 1);
         assert!(r.cuts >= 2, "{r:?}");
         assert!(r.peak_windowed <= 300 + 60 && r.peak_unwindowed > 1000, "{r:?}");
         assert!(r.window_faults >= 2, "the repeated identical call after its first copy left: {r:?}");
-        assert_eq!(r.gc_evicted, 0, "the window took every old result before tau could: {r:?}");
-        let gc = replay(&h, 0, 0, 1.0, 0, 2, 100);
+        let gc = replay(&h, 0, 0, 1.0, 0, 2, 100, 1);
         assert!(gc.gc_evicted > 0 && gc.gc_faults >= 1 && gc.cuts == 0, "{gc:?}");
-        let none = replay(&h, 0, 0, 1.0, 0, 0, 0);
+        let none = replay(&h, 0, 0, 1.0, 0, 0, 0, 1);
         assert_eq!(none.cuts, 0);
         assert_eq!(none.peak_windowed, none.peak_unwindowed);
     }

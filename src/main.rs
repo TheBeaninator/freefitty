@@ -103,11 +103,15 @@ enum Cmd {
         budget: Option<u64>,
         #[arg(long)]
         trim: Option<u64>,
-        /// Tool results older than this many user turns are paged out in the simulation; 0 = off.
+        /// Tool results answered this many assistant turns ago are paged out in the simulation (the daemon's
+        /// page_results_after_turns); 0 = off.
         #[arg(long, default_value_t = 0)]
         tau: usize,
         #[arg(long, default_value_t = 500)]
         min_bytes: u64,
+        /// Results paged per advance (the daemon's page_results_batch).
+        #[arg(long, default_value_t = 32)]
+        batch: u64,
         /// Tokens the system prompt and tool definitions add to every view.
         #[arg(long, default_value_t = 3000)]
         fixed: u64,
@@ -239,7 +243,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Replay { thread, budget, trim, tau, min_bytes, fixed, json: as_json } => {
+        Cmd::Replay { thread, budget, trim, tau, min_bytes, batch, fixed, json: as_json } => {
             let c = Client::new(&cli.config)?;
             let cfg = Config::load(&cli.config)?;
             let health = c.get("/health").await?;
@@ -250,7 +254,7 @@ async fn main() -> Result<()> {
                 Some(t) => vec![t],
                 None => c.get("/threads").await?.as_array().into_iter().flatten().filter(|t| t["messages"].as_u64().unwrap_or(0) > 0).filter_map(|t| t["thread"].as_str().map(str::to_owned)).collect(),
             };
-            eprintln!("replay: budget {budget}, trim to {trim}, tau {tau}, min_bytes {min_bytes}, fixed {fixed}; {} thread(s)", threads.len());
+            eprintln!("replay: budget {budget}, trim to {trim}, tau {tau} assistant turns, min_bytes {min_bytes}, batch {batch}, fixed {fixed}; {} thread(s)", threads.len());
             if !as_json {
                 println!("{:<18} {:>5} {:>7} {:>5} {:>8} {:>8} {:>4} {:>6} {:>6} {:>6} {:>5} {:>6} {:>6}", "thread", "msgs", "tokens", "scale", "peak", "peak-w", "cuts", "gone", "saved%", "wfault", "gc", "gcflt", "gcsv%");
             }
@@ -261,7 +265,7 @@ async fn main() -> Result<()> {
                 let scale = match (meta["prompt_tokens"].as_u64(), meta["prompt_est"].as_u64()) { (Some(p), Some(e)) if e > 0 && p > e => p as f64 / e as f64, _ => 1.0 };
                 let history = c.get(&format!("/threads/{t}/messages")).await?;
                 let history = history.as_array().cloned().unwrap_or_default();
-                let r = freefitty::window::replay(&history, budget, trim, scale, fixed, tau, min_bytes);
+                let r = freefitty::window::replay(&history, budget, trim, scale, fixed, tau, min_bytes, batch);
                 let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
                 if as_json {
                     all.push(json!({"thread": t, "scale": scale, "replay": r}));
@@ -274,7 +278,7 @@ async fn main() -> Result<()> {
                 tot.token_slices_saved += r.token_slices_saved; tot.window_faults += r.window_faults; tot.gc_evicted += r.gc_evicted; tot.gc_faults += r.gc_faults; tot.gc_token_slices_saved += r.gc_token_slices_saved;
             }
             if as_json {
-                println!("{}", serde_json::to_string_pretty(&json!({"budget": budget, "trim": trim, "tau": tau, "min_bytes": min_bytes, "fixed": fixed, "threads": all, "total": tot}))?);
+                println!("{}", serde_json::to_string_pretty(&json!({"budget": budget, "trim": trim, "tau": tau, "min_bytes": min_bytes, "batch": batch, "fixed": fixed, "threads": all, "total": tot}))?);
             } else {
                 let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
                 println!("{:<18} {:>5} {:>7} {:>5} {:>8} {:>8} {:>4} {:>6} {:>5.1}% {:>6} {:>5} {:>6} {:>5.1}%", "total", tot.messages, tot.tokens, "", tot.peak_unwindowed, tot.peak_windowed, tot.cuts, tot.removed,

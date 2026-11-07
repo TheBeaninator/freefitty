@@ -138,6 +138,12 @@ pub struct ThreadMeta {
     pub window_from: u64,
     #[serde(default)]
     pub window_cuts: u64,
+    /// Tool results below this history index that qualify are shown as handles (monotone; moves in batches).
+    #[serde(default)]
+    pub paged_before: u64,
+    /// History indices the model recalled: shown in full however old.
+    #[serde(default)]
+    pub pinned: Vec<u64>,
     /// What the newest stored message is: user, tool_result, assistant_text, tool_call or assistant_empty.
     /// A watcher reads "stopped talking" here: assistant_empty, or tool_call with nothing pending.
     #[serde(default)]

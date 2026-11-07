@@ -214,7 +214,7 @@ async fn thread(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) 
         Ok(Some(m)) => {
             let live_tokens = app.engine.view(&id).map(|v| engine::tokens(&v)).unwrap_or(0);
             let compaction = m.compactions.last().map(|c| json!({"from": c.from, "at_ms": c.at_ms, "summarized": c.summarized, "focus": c.focus, "truncated": c.truncated, "tokens_before": c.tokens_before, "count": m.compactions.len()}));
-            Json(json!({"thread": id, "created_ms": m.created_ms, "updated_ms": m.updated_ms, "node": m.node, "messages": m.messages, "bytes": m.bytes, "live_tokens": live_tokens, "prompt_tokens": m.prompt_tokens, "prompt_est": m.prompt_est, "window": json!({"from": m.window_from, "cuts": m.window_cuts}), "pending": m.pending, "last": m.last, "closed": m.closed, "expert": m.expert, "compaction": compaction, "metadata": m.metadata})).into_response()
+            Json(json!({"thread": id, "created_ms": m.created_ms, "updated_ms": m.updated_ms, "node": m.node, "messages": m.messages, "bytes": m.bytes, "live_tokens": live_tokens, "prompt_tokens": m.prompt_tokens, "prompt_est": m.prompt_est, "window": json!({"from": m.window_from, "cuts": m.window_cuts}), "paging": json!({"before": m.paged_before, "pinned": m.pinned.len()}), "pending": m.pending, "last": m.last, "closed": m.closed, "expert": m.expert, "compaction": compaction, "metadata": m.metadata})).into_response()
         }
         Ok(None) => err(StatusCode::NOT_FOUND, "no such thread"),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),

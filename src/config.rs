@@ -119,6 +119,16 @@ pub struct Config {
     /// Tokens a cut trims the view to; 0 = five eighths of the budget.
     #[serde(default)]
     pub window_trim_tokens: u64,
+    /// Paging of old tool results (FF-PAGE-RESULTS, on): a result the model has answered this many turns ago and
+    /// that is over `page_results_min_bytes` is shown as a handle naming the call and `recall(#i)`; the text stays
+    /// stored. 0 = off. Paging advances in batches of `page_results_batch` results (or at a window cut), because
+    /// each advance changes the view at an old position and costs the node one prefix recompute.
+    #[serde(default = "d_page_turns")]
+    pub page_results_after_turns: u64,
+    #[serde(default = "d_page_min")]
+    pub page_results_min_bytes: u64,
+    #[serde(default = "d_page_batch")]
+    pub page_results_batch: u64,
     /// Tokens per 4 bytes of a message before any node has counted: Qwen tokenizers run about a third over
     /// bytes / 4 on pod traffic. A thread's own ratio (the node's count over the estimate) replaces it after its
     /// first turn, and the latest ratio any thread saw stands in before that.
@@ -151,6 +161,9 @@ fn d_reply_days() -> u64 { 4 }
 fn d_keep() -> u64 { 2 }
 fn d_summary_tokens() -> u64 { 2048 }
 fn d_scale() -> f64 { 1.3 }
+fn d_page_turns() -> u64 { 4 }
+fn d_page_min() -> u64 { 500 }
+fn d_page_batch() -> u64 { 32 }
 
 impl Default for Config {
     fn default() -> Self {
