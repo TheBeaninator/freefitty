@@ -115,6 +115,11 @@ pub struct Config {
     /// Tokens a cut trims the view to; 0 = five eighths of the budget.
     #[serde(default)]
     pub window_trim_tokens: u64,
+    /// Tokens per 4 bytes of a message before any node has counted: Qwen tokenizers run about a third over
+    /// bytes / 4 on pod traffic. A thread's own ratio (the node's count over the estimate) replaces it after its
+    /// first turn, and the latest ratio any thread saw stands in before that.
+    #[serde(default = "d_scale")]
+    pub est_scale_default: f64,
     /// Directory of `<name>.toml` expert definitions, read at start and on `POST /experts/reload`; empty = none.
     #[serde(default)]
     pub experts_dir: Option<PathBuf>,
@@ -140,6 +145,7 @@ fn d_max_body() -> usize { 1 << 20 }
 fn d_reply_days() -> u64 { 4 }
 fn d_keep() -> u64 { 2 }
 fn d_summary_tokens() -> u64 { 2048 }
+fn d_scale() -> f64 { 1.3 }
 
 impl Default for Config {
     fn default() -> Self {
@@ -187,6 +193,7 @@ impl Config {
         if self.max_context_tokens > 0 && self.window_tokens > self.max_context_tokens {
             bail!("window_tokens must not exceed max_context_tokens");
         }
+        if !(1.0..=4.0).contains(&self.est_scale_default) { bail!("est_scale_default must be between 1 and 4"); }
         if !self.warm_on_start.is_empty() && self.experts_dir.is_none() {
             bail!("warm_on_start needs experts_dir");
         }

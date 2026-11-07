@@ -63,7 +63,7 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
     let experts = experts::Experts::new();
     let loaded = experts.load(&cfg, &store).await?;
     if !loaded.is_empty() { tracing::info!("experts: {}", loaded.join(", ")); }
-    let engine = Arc::new(engine::Engine { cfg: cfg.clone(), store: store.clone(), router: router.clone(), tools: tools.clone(), system, compact_prompt, callback_url: cfg.callback_url() });
+    let engine = Arc::new(engine::Engine { cfg: cfg.clone(), store: store.clone(), router: router.clone(), tools: tools.clone(), system, compact_prompt, callback_url: cfg.callback_url(), scale_hint: std::sync::atomic::AtomicU64::new(0) });
     let replies = Arc::new(Notify::new());
 
     // the dispatcher's failures become events; the queue is built after it, so it reaches the queue through a slot

@@ -27,6 +27,8 @@ pub struct Engine {
     pub system: String,
     pub compact_prompt: String,
     pub callback_url: String,
+    /// The latest node-count-over-estimate ratio any thread saw, times 1000; 0 until a turn has run.
+    pub scale_hint: std::sync::atomic::AtomicU64,
 }
 
 pub enum Outcome {
@@ -43,12 +45,22 @@ pub fn tokens(v: &[Value]) -> u64 {
     (serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0) / 4) as u64
 }
 
-/// The bytes / 4 estimate scaled up by how densely the node tokenized this thread's last turn. Only up: a
-/// node that reports fewer tokens than the estimate (a fake, a different accounting) never makes the guard
-/// looser than bytes / 4.
-pub fn calibrated(est: u64, meta: &ThreadMeta) -> u64 {
-    if meta.prompt_est == 0 || meta.prompt_tokens <= meta.prompt_est { return est; }
-    (est as f64 * meta.prompt_tokens as f64 / meta.prompt_est as f64) as u64
+/// The bytes / 4 estimate scaled up by `scale` (never down: a node that reports fewer tokens than the estimate,
+/// a fake, a different accounting, never makes the guard looser than bytes / 4).
+pub fn calibrated(est: u64, scale: f64) -> u64 {
+    if scale <= 1.0 { est } else { (est as f64 * scale) as u64 }
+}
+
+/// A thread's own node-count-over-estimate ratio from its last turn, if it has one and it is over 1.
+pub fn own_scale(meta: &ThreadMeta) -> Option<f64> {
+    (meta.prompt_est > 0 && meta.prompt_tokens > meta.prompt_est).then(|| meta.prompt_tokens as f64 / meta.prompt_est as f64)
+}
+
+/// The node's count in a context-overflow message ("the prompt is N tokens"), if it says.
+pub fn overflow_count(msg: &str) -> Option<u64> {
+    let i = msg.find("prompt is ")? + "prompt is ".len();
+    let digits: String = msg[i..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok().filter(|&n| n > 0)
 }
 
 /// A node's 400 that says the prompt does not fit its context: no retry fixes it.
@@ -179,7 +191,7 @@ impl Engine {
 
         // ---- refocus -----------------------------------------------------------------------------
         let mut view = live_view(&prefix, &meta, &history, &pending_at_start);
-        let mut est = calibrated(tokens(&view) + tokens(&new_messages), &meta);
+        let mut est = calibrated(tokens(&view) + tokens(&new_messages), self.scale(&meta));
         if self.cfg.compaction && (refocus.is_some() || (self.cfg.compact_at_tokens > 0 && est > self.cfg.compact_at_tokens)) {
             let focus = refocus.clone().flatten();
             match self.refocus(thread, &meta, &view, &history, &defs, focus, est).await? {
@@ -188,7 +200,7 @@ impl Engine {
                     meta.compactions.push(c);
                     meta.node = None;
                     view = live_view(&prefix, &meta, &history, &pending_at_start);
-                    est = calibrated(tokens(&view) + tokens(&new_messages), &meta);
+                    est = calibrated(tokens(&view) + tokens(&new_messages), self.scale(&meta));
                     if self.cfg.compact_at_tokens > 0 && est > self.cfg.compact_at_tokens {
                         tracing::warn!("{thread}: still ~{est} tokens after refocusing (the kept tail or the new messages are large)");
                     }
@@ -206,26 +218,9 @@ impl Engine {
         }
 
         // ---- the window --------------------------------------------------------------------------
-        if self.cfg.window {
-            if let Some((budget, target)) = self.window_limits().await {
-                if est > budget {
-                    let low = meta.compactions.last().map(|c| c.from as usize).unwrap_or(0);
-                    let from = (meta.window_from as usize).max(low).min(history.len());
-                    // the tail may use what the budget leaves after the prefix, the bridges and the new messages
-                    let scale = if meta.prompt_est > 0 && meta.prompt_tokens > meta.prompt_est { meta.prompt_tokens as f64 / meta.prompt_est as f64 } else { 1.0 };
-                    let tail_est = (tokens(&history[from..]) as f64 * scale) as u64;
-                    let fixed = est.saturating_sub(tail_est);
-                    let new_from = window::cut(&history, from, target.saturating_sub(fixed), scale);
-                    if new_from > from {
-                        meta.window_from = new_from as u64;
-                        meta.window_cuts += 1;
-                        view = live_view(&prefix, &meta, &history, &pending_at_start);
-                        let before = est;
-                        est = calibrated(tokens(&view) + tokens(&new_messages), &meta);
-                        tracing::info!("{thread}: paged out messages #{from} to #{} (view ~{before} -> ~{est} tokens, budget {budget}, cut {})", new_from - 1, meta.window_cuts);
-                    }
-                }
-            }
+        if let Some((v, e)) = self.window_cut(thread, &mut meta, &prefix, &history, &pending_at_start, &new_messages, est).await {
+            view = v;
+            est = e;
         }
 
         // ---- room in the context -----------------------------------------------------------------
@@ -235,7 +230,7 @@ impl Engine {
         }
 
         // ---- the model's turn --------------------------------------------------------------------
-        let mut messages = view;
+        let mut messages = view.clone();
         messages.extend(new_messages.iter().cloned());
         let sent_est = tokens(&messages);
         let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "max_tokens": self.cfg.max_output_tokens, "stream": false});
@@ -244,12 +239,33 @@ impl Engine {
         let mut events: Vec<Event> = Vec::new();
         let mut invocations: Vec<Invocation> = Vec::new();
         let mut rounds = 0;
+        let mut recut = false;
         loop {
             rounds += 1;
             let turn = match self.router.chat(meta.node.as_deref(), &body).await {
                 Ok(t) => t,
-                // the node says the prompt does not fit: the thread is done, retrying only repeats the refusal
-                Err(ChatError::Rejected(e)) if is_context_overflow(&e) => return Ok(Outcome::Fatal(format!("context full: {e}"))),
+                // the node says the prompt does not fit. With the window on and the node's own count in the message,
+                // the estimate was wrong: learn the ratio, cut, and send once more; otherwise the thread is done
+                Err(ChatError::Rejected(e)) if is_context_overflow(&e) => {
+                    if self.cfg.window && rounds == 1 && !recut {
+                        if let Some(n) = overflow_count(&e) {
+                            meta.prompt_tokens = n;
+                            meta.prompt_est = sent_est.max(1);
+                            self.scale_hint.store((own_scale(&meta).unwrap_or(1.0) * 1000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+                            let est = calibrated(tokens(&view) + tokens(&new_messages), self.scale(&meta));
+                            tracing::warn!("{thread}: the node counted {n} tokens where the estimate said {sent_est}; recounting at that ratio and cutting");
+                            if let Some((v, _)) = self.window_cut(thread, &mut meta, &prefix, &history, &pending_at_start, &new_messages, est).await {
+                                let mut msgs = v;
+                                msgs.extend(new_messages.iter().cloned());
+                                body["messages"] = Value::Array(msgs);
+                                recut = true;
+                                rounds -= 1;
+                                continue;
+                            }
+                        }
+                    }
+                    return Ok(Outcome::Fatal(format!("context full: {e}")));
+                }
                 Err(ChatError::Transient(e)) | Err(ChatError::Rejected(e)) => return Ok(Outcome::Transient(e)),
             };
             meta.node = Some(turn.node.clone());
@@ -261,7 +277,8 @@ impl Engine {
             }
             if let Some(p) = turn.prompt_tokens.filter(|&p| p > 0) {
                 meta.prompt_tokens = p;
-                meta.prompt_est = sent_est.max(1);
+                meta.prompt_est = tokens(body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[])).max(1);
+                if let Some(r) = own_scale(&meta) { self.scale_hint.store((r * 1000.0) as u64, std::sync::atomic::Ordering::Relaxed); }
             }
             let (assistant, calls) = normalize(&turn.message);
             new_messages.push(assistant.clone());
@@ -355,6 +372,38 @@ impl Engine {
         }
         self.store.commit(Commit { thread, meta, messages: new_messages, done, done_ids, replies, events, invocations })?;
         Ok(Outcome::Done)
+    }
+
+    /// How far over bytes / 4 to count this thread: its own last ratio, else the latest any thread saw, else the
+    /// config's default.
+    fn scale(&self, meta: &ThreadMeta) -> f64 {
+        own_scale(meta).unwrap_or_else(|| {
+            let hint = self.scale_hint.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
+            if hint > 1.0 { hint } else { self.cfg.est_scale_default }
+        })
+    }
+
+    /// Move the window if the view (`est`, calibrated) is over the budget. Returns the new view and estimate when
+    /// it moved.
+    #[allow(clippy::too_many_arguments)]
+    async fn window_cut(&self, thread: &str, meta: &mut ThreadMeta, prefix: &[Value], history: &[Value], pending: &[PendingCall], new_messages: &[Value], est: u64) -> Option<(Vec<Value>, u64)> {
+        if !self.cfg.window { return None; }
+        let (budget, target) = self.window_limits().await?;
+        if est <= budget { return None; }
+        let low = meta.compactions.last().map(|c| c.from as usize).unwrap_or(0);
+        let from = (meta.window_from as usize).max(low).min(history.len());
+        let scale = self.scale(meta);
+        // the tail may use what the budget leaves after the prefix, the bridges and the new messages
+        let tail_est = calibrated(tokens(&history[from..]), scale);
+        let fixed = est.saturating_sub(tail_est);
+        let new_from = window::cut(history, from, target.saturating_sub(fixed), scale);
+        if new_from <= from { return None; }
+        meta.window_from = new_from as u64;
+        meta.window_cuts += 1;
+        let view = live_view(prefix, meta, history, pending);
+        let after = calibrated(tokens(&view) + tokens(new_messages), scale);
+        tracing::info!("{thread}: paged out messages #{from} to #{} (view ~{est} -> ~{after} tokens, budget {budget}, cut {})", new_from - 1, meta.window_cuts);
+        Some((view, after))
     }
 
     /// The window's budget and trim target: the config's numbers, or from the nodes' context length (none while
@@ -526,11 +575,14 @@ mod tests {
     #[test]
     fn estimates_scale_up_only() {
         let mut m = ThreadMeta::default();
-        assert_eq!(calibrated(1000, &m), 1000);
+        assert_eq!(own_scale(&m), None);
         m.prompt_est = 1000; m.prompt_tokens = 1300;
-        assert_eq!(calibrated(2000, &m), 2600);
+        assert_eq!(calibrated(2000, own_scale(&m).unwrap()), 2600);
         m.prompt_tokens = 10;
-        assert_eq!(calibrated(2000, &m), 2000, "a node that counts fewer never loosens the guard");
+        assert_eq!(own_scale(&m), None, "a node that counts fewer never loosens the guard");
+        assert_eq!(calibrated(2000, 0.5), 2000);
+        assert_eq!(overflow_count("400 Bad Request: {\"error\":{\"message\":\"the prompt is 265526 tokens; the context holds 262144\"}}"), Some(265526));
+        assert_eq!(overflow_count("maximum context length is 262144 tokens"), None);
     }
 
     #[test]

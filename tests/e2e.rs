@@ -34,6 +34,10 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
     assert_eq!(msgs[0]["role"], "system");
     let last = msgs.last().cloned().unwrap_or(Value::Null);
     let content = last["content"].as_str().unwrap_or("").to_owned();
+    if content.starts_with("wall") && msgs.len() > 6 {
+        // the node's count disagrees with the estimate: too big until the view is cut
+        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": {"message": "the prompt is 300000 tokens; the context holds 262144 (prompt + at least 1 generated token)"}})));
+    }
     if content.starts_with("overflow") {
         // what strixite answers when the prompt does not fit
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": {"message": "the prompt is 267832 tokens; the context holds 262144 (prompt + at least max_tokens)"}})));
@@ -530,12 +534,12 @@ async fn a_full_context_closes_the_thread_at_once() {
     assert_eq!(out["metadata"]["kind"], "error");
     assert_eq!(out["metadata"]["reply_to"], sent["id"]);
     assert!(out["text"].as_str().unwrap().contains("context full"), "{out}");
-    assert_eq!(h.model.calls.load(Ordering::Relaxed), before + 1, "one request, no retries");
+    assert_eq!(h.model.calls.load(Ordering::Relaxed), before + 1, "one request: a two-message thread has nothing the window could cut, so no retry");
     let th = api.get("/threads/thread-full").await;
     assert!(th["closed"].as_str().unwrap().contains("context full"), "{th}");
     assert_eq!(api.get("/dlq").await.as_array().unwrap().len(), 1);
-    // the node's own count scales the estimate for the next turn (the fake reports 100 tokens for a small prompt, so no scaling here)
     assert!(th["prompt_tokens"].as_u64().unwrap() > 0 && th["prompt_est"].as_u64().unwrap() > 0, "{th}");
+    assert_eq!(th["window"]["cuts"], json!(0), "{th}");
     r.shutdown().await;
 }
 
@@ -614,5 +618,29 @@ async fn the_window_pages_old_turns_out_and_recall_brings_them_back() {
     let hist = api.get(&format!("/threads/{t}/messages")).await;
     let rp = freefitty::window::replay(hist.as_array().unwrap(), 1500, 900, 1.0, 200, 0, 0);
     assert!(rp.cuts >= 1 && rp.peak_windowed < rp.peak_unwindowed, "{rp:?}");
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wrong_estimate_is_corrected_by_the_node_and_the_turn_runs() {
+    let h = harness().await;
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let t = "thread-wall";
+    for i in 0..4 {
+        api.say(&format!("hello {i}"), Some(t)).await;
+        api.output(t, 10).await.expect("a reply");
+    }
+    let before = h.model.calls.load(Ordering::Relaxed);
+    let sent = api.say("wall", Some(t)).await;
+    let out = api.output(t, 10).await.expect("the reply after the cut");
+    assert_eq!(out["text"], "hi: wall", "{out}");
+    assert_eq!(out["metadata"]["reply_to"], sent["id"]);
+    assert_eq!(h.model.calls.load(Ordering::Relaxed), before + 2, "the refused request and the one after the cut");
+    let th = api.get(&format!("/threads/{t}")).await;
+    assert!(th["closed"].is_null(), "{th}");
+    assert_eq!(th["window"]["cuts"], json!(1));
+    assert_eq!(th["prompt_tokens"], json!(100), "the node's real count from the successful turn replaces the overflow's");
+    assert!(api.get("/dlq").await.as_array().unwrap().is_empty());
     r.shutdown().await;
 }
