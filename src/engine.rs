@@ -303,11 +303,13 @@ impl Engine {
                 Err(ChatError::Transient(e)) | Err(ChatError::Rejected(e)) => return Ok(Outcome::Transient(e)),
             };
             meta.node = Some(turn.node.clone());
-            let waited = if turn.waited_ms >= 1000 { format!(", waited {} s for a slot", turn.waited_ms / 1000) } else { String::new() };
+            // the parenthesis closes right after the cache count: harvesters match "(N prompt tokens, M from its cache)"
+            let timing = format!(" in {:.0} s{}", turn.ran_ms as f64 / 1000.0,
+                                 if turn.waited_ms >= 1000 { format!(", after {} s waiting for a slot", turn.waited_ms / 1000) } else { String::new() });
             if let (Some(p), Some(c)) = (turn.prompt_tokens, turn.cached_tokens) {
-                tracing::info!("{thread}: turn on {} ({p} prompt tokens, {c} from its cache{waited})", turn.node);
-            } else if !waited.is_empty() {
-                tracing::info!("{thread}: turn on {}{waited}", turn.node);
+                tracing::info!("{thread}: turn on {} ({p} prompt tokens, {c} from its cache){timing}", turn.node);
+            } else {
+                tracing::info!("{thread}: turn on {}{timing}", turn.node);
             }
             if let Some(p) = turn.prompt_tokens.filter(|&p| p > 0) {
                 meta.prompt_tokens = p;

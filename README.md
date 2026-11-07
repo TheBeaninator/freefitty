@@ -223,8 +223,8 @@ nodes.
 
 Upgrading: build on a machine with the pod's glibc or older, copy the binary over, `install` it, and
 `systemctl --user restart freefitty`; running slices finish first, and a turn that was waiting re-queues. Keep the
-old binary as `freefitty.bak-<stamp>`. Reading the daemon: the journal has one line per turn (`N prompt tokens, M
-from its cache, waited S s for a slot`), one per cut, one per failed slice; `freefitty status` shows the nodes and
+old binary as `freefitty.bak-<stamp>`. Reading the daemon: the journal has one line per turn (`(N prompt tokens, M
+from its cache) in R s, after S s waiting for a slot`), one per cut, one per failed slice; `freefitty status` shows the nodes and
 counts; `freefitty threads` the threads with their last message kind, so a watcher sees one that stopped talking
 (`assistant_empty`, or `tool_call` with nothing pending). Dead letters are read with `freefitty dlq` and put back
 with `dlq redrive`, which also reopens a thread the context had closed, now that the window can shorten it.

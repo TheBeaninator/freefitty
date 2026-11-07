@@ -76,6 +76,8 @@ pub struct Turn {
     pub finish_reason: Option<String>,
     /// How long the turn waited for a free slot before its request went out.
     pub waited_ms: u64,
+    /// From the request going out (a cache move included) to the reply.
+    pub ran_ms: u64,
 }
 
 #[derive(Debug)]
@@ -279,6 +281,7 @@ impl Router {
         let placed_at = Instant::now();
         loop {
             let (i, from) = self.place(home, tokens, &avoid).await.map_err(|e| ChatError::Transient(e.to_string()))?;
+            let (waited, sent_at) = (placed_at.elapsed(), Instant::now());
             let (url, from_url) = {
                 let nodes = self.nodes.lock().await;
                 (nodes[i].url.clone(), from.map(|f| nodes[f].url.clone()))
@@ -326,7 +329,10 @@ impl Router {
             }
             let v: Value = serde_json::from_slice(&text).map_err(|e| ChatError::Transient(format!("{url}: not JSON: {e}")))?;
             let mut turn = parse_turn(&v, url).map_err(ChatError::Transient)?;
-            turn.waited_ms = placed_at.elapsed().as_millis() as u64;
+            // until 2026-11-07 waited_ms was placed_at.elapsed() HERE, so the log's "waited N s for a slot" was the
+            // whole turn, generation included (pod: "waited 85 s" on turns that never waited)
+            turn.waited_ms = waited.as_millis() as u64;
+            turn.ran_ms = sent_at.elapsed().as_millis() as u64;
             return Ok(turn);
         }
     }
@@ -371,6 +377,7 @@ fn parse_turn(v: &Value, url: String) -> Result<Turn, String> {
         prompt_tokens: usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()),
         cached_tokens: usage.and_then(|u| u.pointer("/prompt_tokens_details/cached_tokens")).and_then(|v| v.as_u64()),
         waited_ms: 0,
+        ran_ms: 0,
     })
 }
 
