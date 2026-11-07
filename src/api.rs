@@ -63,7 +63,7 @@ pub fn routes(app: Arc<App>) -> AxumRouter {
         .route("/output", get(output))
         .route("/threads", get(threads))
         .route("/threads/{id}", get(thread).delete(delete_thread))
-        .route("/threads/{id}/messages", get(messages))
+        .route("/threads/{id}/messages", get(messages).put(import_messages))
         .route("/threads/{id}/compact", post(compact))
         .route("/experts", get(experts_list))
         .route("/experts/reload", post(experts_reload))
@@ -242,6 +242,28 @@ async fn messages(State(app): Shared, headers: HeaderMap, Path(id): Path<String>
             }
             Json(ms).into_response()
         }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct Import {
+    messages: Vec<Value>,
+}
+
+/// Give a thread with no messages a history: OpenAI chat messages, oldest first (a migration from another
+/// host). The thread id is the path; it may be new. 409 when the thread already has messages.
+async fn import_messages(State(app): Shared, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    if !thread_id_ok(&id) { return err(StatusCode::BAD_REQUEST, "thread must be 1-128 of [A-Za-z0-9._-]"); }
+    let imp: Import = match serde_json::from_slice(&body) { Ok(i) => i, Err(_) => return err(StatusCode::BAD_REQUEST, "body must be JSON with messages") };
+    if imp.messages.is_empty() { return err(StatusCode::BAD_REQUEST, "messages is empty"); }
+    if imp.messages.iter().any(|m| !m.get("role").is_some_and(|r| r.is_string())) {
+        return err(StatusCode::BAD_REQUEST, "every message needs a role");
+    }
+    match app.store.import_messages(&id, &imp.messages) {
+        Ok(()) => Json(json!({"thread": id, "messages": imp.messages.len()})).into_response(),
+        Err(e) if e.to_string().contains("already has") => err(StatusCode::CONFLICT, &e.to_string()),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }

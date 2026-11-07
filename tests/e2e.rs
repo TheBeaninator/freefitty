@@ -473,3 +473,35 @@ async fn experts_share_their_prefix_bytes() {
     assert!(bc["messages"][1]["content"].as_str().unwrap().contains("NOTES over"), "{}", bc["messages"][1]);
     r.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_migrated_history_continues_under_its_thread_id() {
+    let h = harness().await;
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let history = json!([
+        {"role": "user", "content": "first ask"},
+        {"role": "assistant", "content": "calling", "tool_calls": [{"id": "call_old", "type": "function", "function": {"name": "echo", "arguments": "{\"text\":\"x\"}"}}]},
+        {"role": "tool", "tool_call_id": "call_old", "content": "echo: x"},
+    ]);
+    let c = reqwest::Client::new();
+    let put = |body: Value| c.put(format!("{}/threads/moved-1/messages", api.base)).bearer_auth(&api.token).json(&body);
+    let s = put(json!({"messages": history})).send().await.unwrap();
+    assert_eq!(s.status().as_u16(), 200);
+    let meta = api.get("/threads/moved-1").await;
+    assert_eq!(meta["messages"], 3);
+    assert_eq!(meta["last"], "tool_result");
+    assert_eq!(put(json!({"messages": [{"role": "user", "content": "again"}]})).send().await.unwrap().status().as_u16(), 409, "a thread with messages keeps them");
+    assert_eq!(put(json!({"messages": [{"content": "no role"}]})).send().await.unwrap().status().as_u16(), 400);
+    api.say("hello after the move", Some("moved-1")).await;
+    let out = api.output("moved-1", 10).await.unwrap();
+    assert_eq!(out["text"], "hi: hello after the move");
+    let bodies = h.model.bodies.lock().unwrap().clone();
+    let seen = bodies.iter().find(|b| b["messages"].as_array().unwrap().last().unwrap()["content"] == "hello after the move").unwrap();
+    let msgs = seen["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 5, "system + the three imported + the new one");
+    assert_eq!(msgs[1]["content"], "first ask");
+    assert_eq!(msgs[3]["tool_call_id"], "call_old");
+    assert_eq!(api.get("/threads/moved-1/messages?tail=1").await.as_array().unwrap().len(), 1);
+    r.shutdown().await;
+}

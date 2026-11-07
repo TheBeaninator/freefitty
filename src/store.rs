@@ -12,7 +12,7 @@
 //!   toolsets     server url           -> the manifest last read from it
 //!   meta         name                 -> u64 counters (seq)
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -286,6 +286,30 @@ impl Store {
         }
         w.commit()?;
         Ok(seq)
+    }
+
+    /// Give a thread that has no messages yet a history (a migration from another host). Its meta counts
+    /// the messages like a commit would; a trailing assistant tool call is not pending (no result is coming).
+    pub fn import_messages(&self, thread: &str, msgs: &[Value]) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut threads = w.open_table(THREADS)?;
+            let mut m: ThreadMeta = threads.get(thread)?.map(|v| dec(v.value())).transpose()?.unwrap_or_default();
+            if m.messages > 0 { bail!("thread {thread} already has {} messages", m.messages); }
+            if m.created_ms == 0 { m.created_ms = now_ms(); }
+            let mut messages = w.open_table(MESSAGES)?;
+            for msg in msgs {
+                let b = enc(msg);
+                messages.insert((thread, m.messages), b.as_slice())?;
+                m.messages += 1;
+                m.bytes += b.len() as u64;
+                m.last = message_kind(msg).to_owned();
+            }
+            m.updated_ms = now_ms();
+            threads.insert(thread, enc(&m).as_slice())?;
+        }
+        w.commit()?;
+        Ok(())
     }
 
     /// Create a thread pinned to an expert version before its first event is queued.
