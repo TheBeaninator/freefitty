@@ -41,7 +41,7 @@ One data-path rule governs everything that touches weights or state: slow storag
 
 ## 3. strixite: the engine and its cache
 
-strixite is the engine on every worker: a native ROCm server for Qwen3.8-Flash-Next with 262,144 tokens of context per node shared by two request slots (a single thread near full context takes both), and a prompt cache that is the architectural hinge of everything above it. It is third-party code (shawnshekari/strixite) that the pod wires, measures and patches on merit.
+strixite is the engine on every worker: a native ROCm server for Qwen3.8-Flash-Next with a 262,144-token context, two slots per node, and a prompt cache that is the architectural hinge of everything above it. It is third-party code (shawnshekari/strixite) that the pod wires, measures and patches on merit.
 
 The model matters for the thesis. Qwen3.8-Flash-Next is a hybrid: 36 gated-delta-net (GDN) recurrent layers carry most of the sequence in a fixed-size state, and 12 full-attention layers plus a multi-token-prediction draft head keep per-token KV rows. Measured on the pod, a cached segment's size is exactly 115.67 MB plus 27,456 bytes per token: the constant is the recurrent state, the slope is the KV rows. For an 800-token segment the recurrent state alone is 82% of the file. Synthetic needle probes read back with recall 1.00 from 2k to 128k tokens, so the recurrent summary is not lossy at the lengths the pod uses.
 
