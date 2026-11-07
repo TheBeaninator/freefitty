@@ -53,10 +53,11 @@ impl Queue {
 
     /// Queue an event; its seq, or None when an event with that id already ran (a tool server posting a
     /// result twice).
-    pub fn push(&self, ev: Event) -> Result<Option<u64>> {
+    pub fn push(&self, mut ev: Event) -> Result<Option<u64>> {
         if self.store.is_processed(&ev.id)? {
             return Ok(None);
         }
+        if ev.created_ms == 0 { ev.created_ms = now_ms(); }   // the mirror's copy ages from now too
         let seq = self.store.push(ev.clone())?;
         self.events.lock().unwrap().insert(seq, ev);
         self.notify.notify_one();
