@@ -31,6 +31,13 @@ pub struct Config {
     /// Move longer threads between nodes with their cached state (strixite cache-xfer = on).
     #[serde(default = "d_true")]
     pub move_threads: bool,
+    /// A command that says whether a node may take work now, run every `grant_check_s` per node with `{node}`
+    /// replaced by its URL: exit 1 = held (no new, spilled or moved threads; a thread living there leaves at its
+    /// next turn), anything else = free. Empty = every node is free.
+    #[serde(default)]
+    pub grant_cmd: Vec<String>,
+    #[serde(default = "d_grant_check")]
+    pub grant_check_s: u64,
     /// RAP tool servers; each one's /.well-known/rap-toolset is read at start and every `toolset_refresh_s`.
     #[serde(default)]
     pub tool_servers: Vec<String>,
@@ -109,6 +116,7 @@ fn d_model() -> String { "qwen3.8-flash-next".into() }
 fn d_slots() -> u32 { 2 }
 fn d_spill() -> u64 { 16_384 }
 fn d_true() -> bool { true }
+fn d_grant_check() -> u64 { 5 }
 fn d_toolset_refresh() -> u64 { 300 }
 fn d_max_output() -> u64 { 4096 }
 fn d_slice_timeout() -> u64 { 900 }

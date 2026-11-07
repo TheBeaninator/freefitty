@@ -78,6 +78,10 @@ with `move_threads`, by taking its state along: `POST /cache/export` on the old 
 connection is down until its `/health` answers; a turn that never reached it goes to another. While no node is up
 a turn waits `node_down_wait_s`. A reply a node breaks off is an error the slice retries, never a shorter turn.
 A node whose `/health` reports only `busy` counts as full while busy.
+With `grant_cmd` set (for example `["pod-worker", "may", "{node}", "--owner", "freefitty"]`), each node's
+command runs every `grant_check_s` (5) seconds; while it exits 1 the node is held: it gets no new, spilled or moved
+threads, and a thread living there leaves at its next turn, with its state when the node can export it. A command
+that cannot run counts as free.
 
 **Tools.** Each server in `tool_servers` publishes `/.well-known/rap-toolset`; the manifests are read at start
 and every `toolset_refresh_s`, and the last one read is kept for a server that is down. An invocation is posted

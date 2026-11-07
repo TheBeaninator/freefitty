@@ -30,6 +30,7 @@ struct NodeState {
     mine: u32,
     mine_at_poll: u32,
     wanted: u32,
+    held: bool,
     xfer: Option<bool>,
     context_length: u64,
     model: Option<String>,
@@ -93,7 +94,7 @@ impl Router {
         let nodes = cfg
             .nodes
             .iter()
-            .map(|u| NodeState { url: u.clone(), up: false, slots: cfg.node_slots, busy: None, mine: 0, mine_at_poll: 0, wanted: 0, xfer: None, context_length: 0, model: None })
+            .map(|u| NodeState { url: u.clone(), up: false, slots: cfg.node_slots, busy: None, mine: 0, mine_at_poll: 0, wanted: 0, held: false, xfer: None, context_length: 0, model: None })
             .collect();
         let r = Arc::new(Router {
             cfg: cfg.clone(),
@@ -128,14 +129,23 @@ impl Router {
             .lock()
             .await
             .iter()
-            .map(|n| serde_json::json!({"url": n.url, "up": n.up, "slots": n.slots, "load": n.load(), "mine": n.mine, "waiting": n.wanted, "xfer": n.xfer, "model": n.model}))
+            .map(|n| serde_json::json!({"url": n.url, "up": n.up, "slots": n.slots, "load": n.load(), "mine": n.mine, "waiting": n.wanted, "held": n.held, "xfer": n.xfer, "model": n.model}))
             .collect()
     }
 
     async fn poll(&self, i: usize) {
         let probe = reqwest::Client::builder().timeout(Duration::from_secs(2)).connect_timeout(Duration::from_secs(2)).build().expect("client");
         let url = self.cfg.nodes[i].clone();
+        let mut granted_at: Option<Instant> = None;
         loop {
+            if !self.cfg.grant_cmd.is_empty() && granted_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(self.cfg.grant_check_s)) {
+                granted_at = Some(Instant::now());
+                let held = grant_held(&self.cfg.grant_cmd, &url).await;
+                let was = std::mem::replace(&mut self.nodes.lock().await[i].held, held);
+                if held != was {
+                    tracing::info!("node {url}: {}", if held { "held: no new threads, its threads leave at their next turn" } else { "released" });
+                }
+            }
             let health = probe.get(format!("{url}/health")).send().await;
             let was_up;
             let (up, parsed) = match health {
@@ -199,13 +209,14 @@ impl Router {
                     }
                 } else {
                     let h = home.and_then(|h| up.iter().copied().find(|&i| nodes[i].url == h));
-                    let mut free: Vec<usize> = up.iter().copied().filter(|&i| nodes[i].free() - nodes[i].wanted as i64 > 0).collect();
+                    let mut free: Vec<usize> = up.iter().copied().filter(|&i| !nodes[i].held && nodes[i].free() - nodes[i].wanted as i64 > 0).collect();
                     // a node a thread can later leave with its cache first; then the least loaded
                     free.sort_by_key(|&i| (nodes[i].xfer == Some(false), nodes[i].wanted as i64 - nodes[i].free(), nodes[i].load(), i));
                     let choice = match h {
-                        Some(h) if nodes[h].free() > 0 => Some((h, None, "kept")),
+                        Some(h) if !nodes[h].held && nodes[h].free() > 0 => Some((h, None, "kept")),
                         None if !free.is_empty() => Some((free[0], None, "new")),
-                        Some(h) if !free.is_empty() && (tokens <= self.cfg.spill_tokens || (self.cfg.move_threads && nodes[h].xfer == Some(false))) => Some((free[0], None, "spilled")),
+                        // a held home is left like a full one, and spilled when its state cannot move
+                        Some(h) if !free.is_empty() && (tokens <= self.cfg.spill_tokens || (self.cfg.move_threads && nodes[h].xfer == Some(false)) || (nodes[h].held && (!self.cfg.move_threads || nodes[h].xfer == Some(false)))) => Some((free[0], None, "spilled")),
                         Some(h) if !free.is_empty() && self.cfg.move_threads => Some((free[0], Some(h), "moved")),
                         _ => None,
                     };
@@ -219,7 +230,7 @@ impl Router {
                         }
                         return Ok((n, from));
                     }
-                    if let Some(h) = h { nodes[h].wanted += 1; waiting_on = Some(h); }
+                    if let Some(h) = h.filter(|&h| !nodes[h].held) { nodes[h].wanted += 1; waiting_on = Some(h); }
                 }
             }
             waited = true;
@@ -337,6 +348,14 @@ impl Router {
     }
 }
 
+/// Run the grant command for `node`: exit 1 = held. A command that cannot run counts as free, so a missing
+/// grant tool never stops the router.
+async fn grant_held(cmd: &[String], node: &str) -> bool {
+    let argv: Vec<String> = cmd.iter().map(|a| a.replace("{node}", node)).collect();
+    let out = tokio::process::Command::new(&argv[0]).args(&argv[1..]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true).status();
+    matches!(tokio::time::timeout(Duration::from_secs(10), out).await, Ok(Ok(s)) if s.code() == Some(1))
+}
+
 fn parse_turn(v: &Value, url: String) -> Result<Turn, String> {
     let message = v.pointer("/choices/0/message").cloned().ok_or_else(|| format!("{url}: no choices[0].message"))?;
     let usage = v.get("usage");
@@ -347,4 +366,56 @@ fn parse_turn(v: &Value, url: String) -> Result<Turn, String> {
         prompt_tokens: usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()),
         cached_tokens: usage.and_then(|u| u.pointer("/prompt_tokens_details/cached_tokens")).and_then(|v| v.as_u64()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn router(nodes: Vec<NodeState>, move_threads: bool) -> Router {
+        let cfg = Config { move_threads, spill_tokens: 1000, ..Config::default() };
+        Router { cfg, client: reqwest::Client::new(), xfer_client: reqwest::Client::new(), nodes: Mutex::new(nodes), counts: Mutex::new(Counts::default()), notify: Notify::new() }
+    }
+
+    fn node(url: &str, held: bool, xfer: bool) -> NodeState {
+        NodeState { url: url.into(), up: true, slots: 2, busy: Some(0), mine: 0, mine_at_poll: 0, wanted: 0, held, xfer: Some(xfer), context_length: 0, model: None }
+    }
+
+    #[tokio::test]
+    async fn a_held_node_takes_no_new_thread() {
+        let r = router(vec![node("a", true, true), node("b", false, true)], true);
+        assert_eq!(r.place(None, 10, &[]).await.unwrap(), (1, None));
+    }
+
+    #[tokio::test]
+    async fn a_thread_leaves_its_held_home_with_its_cache() {
+        let r = router(vec![node("a", true, true), node("b", false, true)], true);
+        assert_eq!(r.place(Some("a"), 50_000, &[]).await.unwrap(), (1, Some(0)));
+        assert_eq!(r.counts().moved, 1);
+    }
+
+    #[tokio::test]
+    async fn a_thread_spills_from_a_held_home_that_cannot_move_it() {
+        let r = router(vec![node("a", true, false), node("b", false, true)], true);
+        assert_eq!(r.place(Some("a"), 50_000, &[]).await.unwrap(), (1, None));
+        let r = router(vec![node("a", true, true), node("b", false, true)], false);
+        assert_eq!(r.place(Some("a"), 50_000, &[]).await.unwrap(), (1, None));
+        assert_eq!(r.counts().spilled, 1);
+    }
+
+    #[tokio::test]
+    async fn a_free_home_keeps_its_thread() {
+        let r = router(vec![node("a", false, true), node("b", true, true)], true);
+        assert_eq!(r.place(Some("a"), 50_000, &[]).await.unwrap(), (0, None));
+    }
+
+    #[tokio::test]
+    async fn the_grant_command_holds_only_on_exit_1() {
+        let sh = |code: &str| vec!["sh".to_string(), "-c".to_string(), format!("test {{node}} = http://n:1 || exit 0; exit {code}")];
+        assert!(grant_held(&sh("1"), "http://n:1").await);
+        assert!(!grant_held(&sh("0"), "http://n:1").await);
+        assert!(!grant_held(&sh("2"), "http://n:1").await);
+        assert!(!grant_held(&sh("1"), "http://other:1").await, "{{node}} is the node's url");
+        assert!(!grant_held(&["/nonexistent/grant".to_string()], "http://n:1").await, "a missing tool is free");
+    }
 }
