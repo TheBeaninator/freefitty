@@ -291,7 +291,7 @@ async fn callbacks_need_their_token_and_a_thread() {
     assert_eq!(s.as_u16(), 200, "a result for a thread that has no pending call still queues; the model sees it");
     let api = Api::new(&r);
     let out = api.output("nothread", 10).await.unwrap();
-    assert_eq!(out["text"], "done: late");
+    assert_eq!(out["text"], "hi: [late result for tool call x] late", "a result nobody awaits is said in the user role");
     r.shutdown().await;
 }
 

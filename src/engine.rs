@@ -134,8 +134,15 @@ impl Engine {
                     reply_to = Some(ev.id.clone());
                 }
                 EventKind::ToolResult { call, text, .. } => {
+                    // a result for a call nobody is waiting on (a late one, a thread moved here from another
+                    // host) is said in the user role: a tool message with no call before it breaks the template
+                    let awaited = meta.pending.iter().any(|p| &p.id == call);
                     meta.pending.retain(|p| &p.id != call);
-                    new_messages.push(json!({"role": "tool", "tool_call_id": call, "content": text}));
+                    new_messages.push(if awaited {
+                        json!({"role": "tool", "tool_call_id": call, "content": text})
+                    } else {
+                        json!({"role": "user", "content": format!("[late result for tool call {call}] {text}")})
+                    });
                 }
                 EventKind::Subscription { call, text, r#final } => {
                     if *r#final { meta.pending.retain(|p| &p.id != call); }
