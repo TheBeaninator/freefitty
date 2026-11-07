@@ -11,7 +11,7 @@ We describe a small, air-gapped cluster of AMD Strix Halo nodes that runs autono
 - **The Elephant-Goldfish Model (EGM)** is the division of labour: long-lived elephant threads hold context, short cold goldfish threads do work and die.
 - **The Optical Memory Fabric (OMF)** is the research track asking how much memory a cached token can carry, through rendered pages, vision tokens and direct reuse of KV segments.
 
-The paper states the thesis, reports the measurements that support it so far (bit-exact KV restore 2.5 to 17.7x faster than prefill, 6x state compression with facts intact, order-independent splicing of two segments, ~95% cache reuse on live work), and names the three experiments that join the layers: an expert that reads rendered pages, a thread composed from several frozen experts, and goldfish born from experts that elephants can commission.
+The paper states the thesis, reports the measurements that support it so far (bit-exact KV restore 2.5 to 17.7x faster than prefill, 6x state compression with facts intact, order-independent splicing of two segments, ~95% cache reuse on live work), and names the four experiments that join the layers: an expert that reads rendered pages, a thread composed from several frozen experts, goldfish born from experts that elephants can commission, and revert-with-note as an alternative to compaction.
 
 ## 1. Introduction
 
@@ -158,15 +158,16 @@ The table reads as one argument. The engine's state is exact, compact beyond a f
 
 ## 9. Open questions and the next two experiments
 
-Three experiments are queued to join the layers; the second depends on the first.
+Four experiments are queued to join the layers; the second depends on the first.
 
 1. **An expert that reads rendered pages**. Experts gain an image read kind built as image parts. Threads born from an image expert and from a text expert of the same facts are compared at equal prompt tokens on a dedicated worker: exact-fact recall, first-turn cached tokens and time to first token over ten or more threads each. The open question is whether an image prefix is cached byte-identically across threads at all, and whether a page carries more exact facts per cached token than its text.
 2. **A thread composed from several frozen experts**. A thread starts from two experts and reuses the cache of both. The report measures recall against one concatenated expert and time to first token against re-prefill, and states whether the splice runs through strixite's export and import of segments, as the splice measurement did offline, or through prefix ordering alone.
 3. **Goldfish born from experts, elephants that make them.** The goldfish tool gains an expert parameter, so a specialized goldfish is one cached prefix shared by every spawn, and an elephant gains a tool that commissions a named expert from a persona and a reading list; a builder thread does the reading and the freeze off the elephant's context, and the elephant wakes to the expert's name and hash, spawnable in the same round. The report compares expert goldfish against inline-document goldfish on cached tokens, time to first token and verdict agreement, and commissioned experts against hand-built ones on exact-fact recall, with the elephant's context growth per commission and every elephant-made expert listed with its provenance.
+4. **Revert with a note, as an alternative to compaction.** A thread marks checkpoints and can later rewind its view to one, carrying forward a single bridge message written by its reverted self; the store is untouched and recall still reaches everything after the cut. A revert returns to a prefix the node already holds, so the next turn is a cache hit; a refocus writes new head bytes and pays a prefill. The report replays real threads past 150k tokens with revert, refocus and window-only arms, scoring cached tokens after the event, recall of pre-cut facts, task completion, and how much of a note of 256 to 4k tokens the future self carries forward correctly.
 
 Behind them sit the questions the measurements have not answered:
 
-- **When do a model's own notes beat exact history?** Refocusing is off because nothing has measured it against the window plus recall on real threads. The frozen expert depends on the answer.
+- **When do a model's own notes beat exact history?** Refocusing is off because nothing has measured it against the window plus recall on real threads, and the fourth experiment adds revert-with-note as a third arm. The frozen expert depends on the answer.
 - **Who curates?** The curated memory database needs an archivist that rejects entries without provenance and re-verifies old nodes. Its cost per accepted fact and its effect on recall against an uncurated ingest are unmeasured.
 - **Does state on demand scale past one segment?** Load-on-miss matched retrieval with one segment loaded, at a fraction of the wall-clock. The splice result suggests several can be loaded; the resident result warns that loading too many destroys the answer.
 - **Is the fertile framework found?** The standard is not one winning arm but a framework where many variants clear the bar and gains compose, followed by a craft phase. The telescopic reader and the KV store each cleared a bar once. Neither has yet shown a slope.
