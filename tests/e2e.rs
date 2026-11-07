@@ -574,6 +574,26 @@ async fn waiting_for_a_slot_is_not_a_timeout() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_first_message_waits_out_a_dead_node_and_a_full_one() {
+    // FF-LOSTQ 9aff78d02a: one node down, the other full; the round's first message queues, then runs once a slot frees
+    let mut h = harness().await;
+    h.cfg.slice_timeout_s = 1;
+    h.cfg.nodes.insert(0, "http://127.0.0.1:9".into());
+    h.model.busy.store(2, Ordering::Relaxed);
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let sent = api.say("round one", Some("thread-lowcap")).await;
+    assert!(api.output("thread-lowcap", 4).await.is_none(), "no free slot anywhere: nothing runs");
+    assert_eq!(h.model.calls.load(Ordering::Relaxed), 0);
+    h.model.busy.store(0, Ordering::Relaxed);
+    let out = api.output("thread-lowcap", 15).await.expect("the first message runs once capacity returns");
+    assert_eq!(out["text"], "hi: round one");
+    assert_eq!(out["metadata"]["reply_to"], sent["id"]);
+    assert!(api.get("/dlq").await.as_array().unwrap().is_empty(), "the wait is not a lost message");
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_window_pages_old_turns_out_and_recall_brings_them_back() {
     let mut h = harness().await;
     h.cfg.window_tokens = 1500;
