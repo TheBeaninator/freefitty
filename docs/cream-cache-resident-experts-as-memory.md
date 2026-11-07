@@ -4,7 +4,14 @@
 
 ## Abstract
 
-We describe a small, air-gapped cluster of AMD Strix Halo nodes that runs autonomous software agents around one organizing idea: the inference engine's cached state is the system's working memory, and everything else is a view onto it. Four layers carry the idea. strixite is the engine, serving one 262k-context model per node with a token-prefix prompt cache that survives in RAM and on disk and can be exported between nodes over a 100 GbE rail. FreeFitty is a durable actor system whose actor state is a transcript and whose step function is the model; it never edits the transcript and spends all its design on keeping each thread's cache prefix stable. The Elephant-Goldfish Model (EGM) is the division of labour: long-lived elephant threads hold context, short cold goldfish threads do work and die. The Optical Memory Fabric (OMF) is the research track asking how much memory a cached token can carry, through rendered pages, vision tokens and direct reuse of KV segments. The paper states the thesis, reports the measurements that support it so far (bit-exact KV restore 2.5 to 17.7x faster than prefill, 6x state compression with facts intact, order-independent splicing of two segments, ~95% cache reuse on live work), and names the two experiments that join the layers: an expert that reads rendered pages, and a thread composed from several frozen experts.
+We describe a small, air-gapped cluster of AMD Strix Halo nodes that runs autonomous software agents around one organizing idea: the inference engine's cached state is the system's working memory, and everything else is a view onto it. Four layers carry the idea.
+
+- **strixite** is the engine, serving one 262k-context model per node with a token-prefix prompt cache that survives in RAM and on disk and can be exported between nodes over a 100 GbE rail.
+- **FreeFitty** is a durable actor system whose actor state is a transcript and whose step function is the model; it never edits the transcript and spends all its design on keeping each thread's cache prefix stable.
+- **The Elephant-Goldfish Model (EGM)** is the division of labour: long-lived elephant threads hold context, short cold goldfish threads do work and die.
+- **The Optical Memory Fabric (OMF)** is the research track asking how much memory a cached token can carry, through rendered pages, vision tokens and direct reuse of KV segments.
+
+The paper states the thesis, reports the measurements that support it so far (bit-exact KV restore 2.5 to 17.7x faster than prefill, 6x state compression with facts intact, order-independent splicing of two segments, ~95% cache reuse on live work), and names the two experiments that join the layers: an expert that reads rendered pages, and a thread composed from several frozen experts.
 
 ## 1. Introduction
 
