@@ -111,6 +111,31 @@ A reply carries `metadata.thread`, `metadata.reply_to` (the id `/say` returned f
 `metadata.kind` (`text` or `error`) and the thread's own metadata. A message is at most 256 KiB, a body 1 MiB.
 Nothing user-supplied is logged.
 
+## The budget window, on by default
+
+A node's context is finite and a pod thread is not: a card's thread runs for days and its tool results pile up.
+The window keeps the view under the node's limit without asking the model anything. When a thread's next view
+would pass `window_tokens` (default: the nodes' context length minus the output cap and an 8k margin), its oldest
+whole units leave the view until it is under `window_trim_tokens` (default five eighths of the budget), and the cut
+then holds until the budget is crossed again, so the node's prompt cache sees the same prefix for many turns: a
+cut is one cache miss, not one a turn. A unit starts at an input, a person's message or a tool result, so the view
+never opens with the model's own words; a result whose call left the view gets a stub call so the template still
+sees a call before every result. Nothing leaves the store. The view opens with a `[Paged.]` notice that names the
+range that left, copies the user messages among it in short, and says how to get any of it back: the `recall` tool
+returns stored messages by index, exactly as written, answered from the store within the same slice (a fault
+costs one more model pass, no tool round trip, at most 16 KiB a call). The token estimate is bytes / 4 scaled up by
+how the node counted the thread's last turn, so the guard does not trust a ratio the tokenizer does not keep.
+`GET /threads/{id}` reports `window.from` and `window.cuts`; the journal logs each cut with the view before and
+after. `window = false` turns it off; a refocus (below) restarts the window at its own cut.
+
+`freefitty replay` runs the same cut over the stored histories as if it had been live and prints, per thread and in
+total: the largest view a slice saw with and without the window, cuts, messages gone, the share of token-slices
+the node would not have re-read, and faults (a later tool call identical to one whose text had left the view).
+`--tau N --min-bytes B` adds the simulation of paging out tool results older than N user turns and over B bytes
+(after arXiv 2603.09023), with its own evictions, faults and savings, so a policy is measured on this pod's
+threads before it exists. The window's defaults came from that replay on 2026-11-07 (numbers in
+pod-reports `2026-11/2026-11-07-freefitty-context-paging-review.md`).
+
 ## Refocusing (compaction), off by default
 
 On strixite the context is rarely the limit; the coherence of what is in it is. A long thread fills with
@@ -204,7 +229,10 @@ double-encoded arguments, an unknown tool, a turn with nothing in it, three fail
 a redrive that keeps the input's id, two threads at once, a restart with a wake-up pending, the token checks;
 a refocus from the tool and from the operator with the pending call bridged and its late result answered, notes
 cut off and asked again, nothing-to-fold, the token trigger, failed notes; experts sharing their prefix bytes,
-version pinning across a file change, warm on start, and an expert frozen from a thread's notes.
+version pinning across a file change, warm on start, and an expert frozen from a thread's notes; the window cutting
+whole units at the budget, the notice carrying the first message, the cut point holding across turns, `recall`
+returning the exact text within the slice, and the replay agreeing with the live run; a full context closing the
+thread after one request; a wait for a node slot that is longer than the slice timeout and not a failure.
 `FREEFITTY_NODES=http://a:5300,http://b:5300 cargo test --test real_nodes -- --ignored` proves the cache move on
 two real strixite nodes.
 

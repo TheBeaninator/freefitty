@@ -58,6 +58,11 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
     }
     let message = if last["role"] == "tool" {
         json!({"role": "assistant", "content": format!("done: {content}")})
+    } else if let Some(n) = content.strip_prefix("recall ") {
+        // the model asks for a stored message back
+        json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_r", "type": "function", "function": {"name": "recall", "arguments": format!("{{\"indices\": [{n}]}}")}}]})
+    } else if content.starts_with("long ") {
+        json!({"role": "assistant", "content": format!("long answer: {}", "y".repeat(600))})
     } else if content.starts_with("sleep") {
         json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "sleep", "arguments": "{\"seconds\": 1}"}}]})
     } else if let Some(x) = content.strip_prefix("echo ") {
@@ -550,5 +555,64 @@ async fn waiting_for_a_slot_is_not_a_timeout() {
     assert_eq!(out["metadata"]["reply_to"], sent["id"]);
     assert!(api.get("/dlq").await.as_array().unwrap().is_empty(), "a 3 s wait under a 1 s slice timeout is not a failure");
     assert!(api.get("/health").await["router"]["waited"].as_u64().unwrap() >= 1);
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_window_pages_old_turns_out_and_recall_brings_them_back() {
+    let mut h = harness().await;
+    h.cfg.window_tokens = 1500;
+    h.cfg.window_trim_tokens = 900;
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let t = "thread-window";
+    api.say("first thing: the password is swordfish", Some(t)).await;
+    assert_eq!(api.output(t, 10).await.unwrap()["text"], "hi: first thing: the password is swordfish");
+    // long turns until the view passes the budget
+    let mut cuts = 0;
+    // the cut happens at the start of the slice whose view would pass the budget
+    for i in 0..12 {
+        api.say(&format!("long {i}"), Some(t)).await;
+        let out = api.output(t, 10).await.expect("a reply");
+        assert!(out["text"].as_str().unwrap().starts_with("long answer"), "{out}");
+        let th = api.get(&format!("/threads/{t}")).await;
+        eprintln!("turn {i}: live_tokens {} window {}", th["live_tokens"], th["window"]);
+        cuts = th["window"]["cuts"].as_u64().unwrap();
+        if cuts > 0 { break; }
+    }
+    assert!(cuts > 0, "the window never cut");
+    let th = api.get(&format!("/threads/{t}")).await;
+    let from = th["window"]["from"].as_u64().unwrap();
+    assert!(from > 0 && th["live_tokens"].as_u64().unwrap() < 1500, "{th}");
+    // what the model saw: the notice after the prefix, then the tail; the first message is only in the notice
+    let bodies = h.model.bodies.lock().unwrap().clone();
+    let last = bodies.last().unwrap();
+    let msgs = last["messages"].as_array().unwrap();
+    assert!(msgs[1]["content"].as_str().unwrap().starts_with("[Paged. Messages #0 to #"), "{}", msgs[1]);
+    assert!(msgs[1]["content"].as_str().unwrap().contains("#0: \"first thing: the password is swordfish\""), "{}", msgs[1]);
+    assert_eq!(msgs[2]["role"], "user", "the tail starts at an input");
+    assert!(msgs.iter().skip(2).all(|m| m["content"].as_str() != Some("first thing: the password is swordfish")));
+    let tools: Vec<&str> = last["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+    assert!(tools.contains(&"recall"), "{tools:?}");
+    // the frontier holds: the next turn's notice is the same text (the cache sees the same prefix)
+    let n_before = bodies.len();
+    api.say("short one", Some(t)).await;
+    assert_eq!(api.output(t, 10).await.unwrap()["text"], "hi: short one");
+    let bodies = h.model.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), n_before + 1);
+    assert_eq!(bodies[n_before]["messages"][1], msgs[1], "the cut point did not move");
+    assert_eq!(api.get(&format!("/threads/{t}")).await["window"]["cuts"], json!(cuts));
+    // recall returns the exact stored text within the same slice
+    api.say("recall 0", Some(t)).await;
+    let out = api.output(t, 10).await.expect("the recall reply");
+    let text = out["text"].as_str().unwrap();
+    assert!(text.starts_with("[Tool Call: recall with arguments {\"indices\":[0]}]"), "{out}");
+    assert!(text.ends_with("done: #0 user: first thing: the password is swordfish"), "{out}");
+    let stored = api.get(&format!("/threads/{t}/messages?tail=3")).await;
+    assert_eq!(stored[1]["role"], "tool", "the recall result is stored as a tool message: {stored}");
+    // replay over the same history agrees that cuts happened and nothing faulted
+    let hist = api.get(&format!("/threads/{t}/messages")).await;
+    let rp = freefitty::window::replay(hist.as_array().unwrap(), 1500, 900, 1.0, 200, 0, 0);
+    assert!(rp.cuts >= 1 && rp.peak_windowed < rp.peak_unwindowed, "{rp:?}");
     r.shutdown().await;
 }

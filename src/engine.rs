@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::rap::{self, ToolBox};
 use crate::router::{ChatError, Router};
 use crate::store::{now_ms, Commit, Compaction, Event, EventKind, Invocation, PendingCall, Store, ThreadMeta};
+use crate::window;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -67,33 +68,34 @@ pub fn prefix(system: &str, store: &Store, meta: &ThreadMeta) -> anyhow::Result<
     Ok(p)
 }
 
-/// What the model sees: prefix + bridge + history[from..]. `pending` is the thread's pending list as read at
-/// slice start; a call whose assistant message is inside the kept history is not shown twice.
+/// What the model sees: the prefix, then (after a refocus) the bridge and notes, then (after a window cut) the
+/// `[Paged.]` notice, then history from the window's start. A result whose call is not in the shown tail gets a
+/// stub call on the notes or notice side so the template sees a call before every result. `pending` is the
+/// thread's pending list as read at slice start.
 pub fn live_view(prefix: &[Value], meta: &ThreadMeta, history: &[Value], pending: &[PendingCall]) -> Vec<Value> {
     let mut v: Vec<Value> = prefix.to_vec();
+    let low = meta.compactions.last().map(|c| c.from as usize).unwrap_or(0).min(history.len());
+    let from = (meta.window_from as usize).max(low).min(history.len());
+    // pending calls need a stub only once the view no longer starts at the beginning (their own message may have left)
+    let stubs = window::orphan_calls(history, from, if from > 0 { pending } else { &[] });
+    let mut stubs_placed = false;
     if let Some(c) = meta.compactions.last() {
-        let from = (c.from as usize).min(history.len());
-        let tail = &history[from..];
-        let shown: Vec<&str> = tail
-            .iter()
-            .flat_map(|m| m.get("tool_calls").and_then(|t| t.as_array()).into_iter().flatten())
-            .filter_map(|tc| tc.get("id").and_then(|i| i.as_str()))
-            .collect();
-        let calls: Vec<Value> = pending
-            .iter()
-            .filter(|p| !shown.contains(&p.id.as_str()) && !p.provider_call_id.as_deref().is_some_and(|c| shown.contains(&c)))
-            .map(|p| json!({"id": p.provider_call_id.clone().unwrap_or_else(|| p.id.clone()), "type": "function",
-                "function": {"name": p.name, "arguments": if p.arguments.is_empty() { "{}".to_owned() } else { p.arguments.clone() }}}))
-            .collect();
         let focus = c.focus.as_deref().map(|f| format!(" Focus: {f}")).unwrap_or_default();
         v.push(json!({"role": "user", "content": format!("[Refocus. The conversation so far is replaced by your notes, which follow.{focus}]")}));
         let mut notes = json!({"role": "assistant", "content": c.summary});
-        if !calls.is_empty() { notes["tool_calls"] = Value::Array(calls); }
+        if !stubs.is_empty() && from == low { notes["tool_calls"] = Value::Array(stubs.clone()); stubs_placed = true; }
         v.push(notes);
-        v.extend(tail.iter().cloned());
-    } else {
-        v.extend(history.iter().cloned());
     }
+    if from > low {
+        v.push(json!({"role": "user", "content": window::notice(history, low, from)}));
+        if !stubs.is_empty() { v.push(json!({"role": "assistant", "content": "", "tool_calls": stubs.clone()})); stubs_placed = true; }
+    }
+    if !stubs.is_empty() && !stubs_placed {
+        // no refocus and no cut, yet a result's call is missing (a migrated history): a stub turn before the tail
+        v.push(json!({"role": "user", "content": "[The calls these results answer were made before this view begins.]"}));
+        v.push(json!({"role": "assistant", "content": "", "tool_calls": stubs}));
+    }
+    v.extend(history[from..].iter().cloned());
     v
 }
 
@@ -172,7 +174,7 @@ impl Engine {
         let prefix = prefix(&self.system, &self.store, &meta)?;
         let history = self.store.messages(thread)?;
         let tools = self.tools.current().await;
-        let mut defs = rap::builtin_defs(self.cfg.compaction);
+        let mut defs = rap::builtin_defs(self.cfg.compaction, self.cfg.window);
         defs.extend(tools.defs.iter().cloned());
 
         // ---- refocus -----------------------------------------------------------------------------
@@ -182,6 +184,7 @@ impl Engine {
             let focus = refocus.clone().flatten();
             match self.refocus(thread, &meta, &view, &history, &defs, focus, est).await? {
                 Refocused::Done(c) => {
+                    meta.window_from = c.from;
                     meta.compactions.push(c);
                     meta.node = None;
                     view = live_view(&prefix, &meta, &history, &pending_at_start);
@@ -200,6 +203,29 @@ impl Engine {
             // only a refocus was asked for: no turn
             self.store.commit(Commit { thread, meta, messages: vec![], done, done_ids, replies: vec![], events: vec![], invocations: vec![] })?;
             return Ok(Outcome::Done);
+        }
+
+        // ---- the window --------------------------------------------------------------------------
+        if self.cfg.window {
+            if let Some((budget, target)) = self.window_limits().await {
+                if est > budget {
+                    let low = meta.compactions.last().map(|c| c.from as usize).unwrap_or(0);
+                    let from = (meta.window_from as usize).max(low).min(history.len());
+                    // the tail may use what the budget leaves after the prefix, the bridges and the new messages
+                    let scale = if meta.prompt_est > 0 && meta.prompt_tokens > meta.prompt_est { meta.prompt_tokens as f64 / meta.prompt_est as f64 } else { 1.0 };
+                    let tail_est = (tokens(&history[from..]) as f64 * scale) as u64;
+                    let fixed = est.saturating_sub(tail_est);
+                    let new_from = window::cut(&history, from, target.saturating_sub(fixed), scale);
+                    if new_from > from {
+                        meta.window_from = new_from as u64;
+                        meta.window_cuts += 1;
+                        view = live_view(&prefix, &meta, &history, &pending_at_start);
+                        let before = est;
+                        est = calibrated(tokens(&view) + tokens(&new_messages), &meta);
+                        tracing::info!("{thread}: paged out messages #{from} to #{} (view ~{before} -> ~{est} tokens, budget {budget}, cut {})", new_from - 1, meta.window_cuts);
+                    }
+                }
+            }
         }
 
         // ---- room in the context -----------------------------------------------------------------
@@ -246,8 +272,17 @@ impl Engine {
                 }
             }
             let mut unknown = Vec::new();
+            let mut recalled: Vec<(Call, String)> = Vec::new();
             for call in &calls {
                 match call.name.as_str() {
+                    rap::RECALL if self.cfg.window => {
+                        // answered from the store within the slice: a fault costs one more model pass, no tool round trip
+                        let text = match window::recall_indices(&call.args, history.len()) {
+                            Ok(idx) => window::recall_text(&history, &idx),
+                            Err(e) => format!("Error: {e}"),
+                        };
+                        recalled.push((call.clone(), text));
+                    }
                     rap::SLEEP => {
                         let secs = call.args.get("seconds").and_then(|s| s.as_f64()).unwrap_or(0.0).clamp(0.0, 366.0 * 86400.0);
                         events.push(wake(thread, call, now_ms() + (secs * 1000.0) as u64, format!("Slept for {secs} seconds")));
@@ -290,18 +325,25 @@ impl Engine {
                     },
                 }
             }
-            if unknown.is_empty() { break; }
-            // the model asked for tools that do not exist: tell it in the same slice and let it try again
+            if unknown.is_empty() && recalled.is_empty() { break; }
+            // recalls are answered here; tools that do not exist are explained; both within the same slice
             let names: Vec<String> = defs.iter().filter_map(|d| d.pointer("/function/name").and_then(|n| n.as_str()).map(str::to_owned)).collect();
+            let answered = unknown.len() + recalled.len();
+            for (c, text) in &recalled {
+                new_messages.push(json!({"role": "tool", "tool_call_id": c.id, "content": text}));
+                reply_text.push_str(&format!("\n[Tool Call: recall with arguments {}]", c.args));
+            }
             for u in &unknown {
                 new_messages.push(json!({"role": "tool", "tool_call_id": u.id, "content": format!("Error: there is no tool named {:?}. The tools are: {}", u.name, names.join(", "))}));
             }
-            if rounds >= UNKNOWN_TOOL_ROUNDS || !events.is_empty() || !invocations.is_empty() {
+            if !unknown.is_empty() && (rounds >= UNKNOWN_TOOL_ROUNDS || !events.is_empty() || !invocations.is_empty()) {
                 reply_text.push_str(&format!("\n[Error: the model called tools that do not exist: {}]", unknown.iter().map(|u| u.name.as_str()).collect::<Vec<_>>().join(", ")));
                 break;
             }
+            // a turn that also slept or called a real tool ends here; the recall's text waits in the history for its next turn
+            if rounds >= UNKNOWN_TOOL_ROUNDS || !events.is_empty() || !invocations.is_empty() { break; }
             let mut msgs = body["messages"].as_array().cloned().unwrap_or_default();
-            msgs.extend(new_messages[new_messages.len() - 1 - unknown.len()..].iter().cloned());
+            msgs.extend(new_messages[new_messages.len() - 1 - answered..].iter().cloned());
             body["messages"] = Value::Array(msgs);
         }
 
@@ -313,6 +355,22 @@ impl Engine {
         }
         self.store.commit(Commit { thread, meta, messages: new_messages, done, done_ids, replies, events, invocations })?;
         Ok(Outcome::Done)
+    }
+
+    /// The window's budget and trim target: the config's numbers, or from the nodes' context length (none while
+    /// no node has said).
+    async fn window_limits(&self) -> Option<(u64, u64)> {
+        const MARGIN: u64 = 8192;
+        let budget = if self.cfg.window_tokens > 0 {
+            self.cfg.window_tokens
+        } else {
+            let ctx = if self.cfg.max_context_tokens > 0 { self.cfg.max_context_tokens } else { self.router.context_length().await };
+            if ctx == 0 { return None; }
+            ctx.saturating_sub(self.cfg.max_output_tokens + MARGIN)
+        };
+        if budget == 0 { return None; }
+        let target = if self.cfg.window_trim_tokens > 0 { self.cfg.window_trim_tokens.min(budget - 1) } else { budget * 5 / 8 };
+        Some((budget, target))
     }
 
     /// Ask the model for its notes and record the refocus. The cut keeps `compact_keep_messages` newest

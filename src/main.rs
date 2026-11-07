@@ -92,6 +92,28 @@ enum Cmd {
     },
     /// The daemon's health: nodes, queue, store.
     Status,
+    /// Replay stored histories under a budget window (and tool-result paging with --tau) to measure before
+    /// turning anything on: cuts, peak view, token-slices saved, and faults (a later call identical to one that
+    /// had left the view). --budget/--trim default to the daemon's; --scale auto uses each thread's node count.
+    Replay {
+        /// One thread; default every thread with messages.
+        #[arg(short, long)]
+        thread: Option<String>,
+        #[arg(long)]
+        budget: Option<u64>,
+        #[arg(long)]
+        trim: Option<u64>,
+        /// Tool results older than this many user turns are paged out in the simulation; 0 = off.
+        #[arg(long, default_value_t = 0)]
+        tau: usize,
+        #[arg(long, default_value_t = 500)]
+        min_bytes: u64,
+        /// Tokens the system prompt and tool definitions add to every view.
+        #[arg(long, default_value_t = 3000)]
+        fixed: u64,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -214,6 +236,50 @@ async fn main() -> Result<()> {
                 "redrive" => println!("{}", c.post("/dlq/redrive", &body).await?),
                 "drop" => println!("{}", c.post("/dlq/drop", &body).await?),
                 other => bail!("dlq action must be list, redrive or drop, not {other:?}"),
+            }
+            Ok(())
+        }
+        Cmd::Replay { thread, budget, trim, tau, min_bytes, fixed, json: as_json } => {
+            let c = Client::new(&cli.config)?;
+            let cfg = Config::load(&cli.config)?;
+            let health = c.get("/health").await?;
+            let ctx = health["nodes"].as_array().into_iter().flatten().filter_map(|n| n["context_length"].as_u64()).filter(|&c| c > 0).min().unwrap_or(262_144);
+            let budget = budget.or(Some(cfg.window_tokens).filter(|&b| b > 0)).unwrap_or(ctx.saturating_sub(cfg.max_output_tokens + 8192));
+            let trim = trim.or(Some(cfg.window_trim_tokens).filter(|&t| t > 0)).unwrap_or(budget * 5 / 8);
+            let threads: Vec<String> = match thread {
+                Some(t) => vec![t],
+                None => c.get("/threads").await?.as_array().into_iter().flatten().filter(|t| t["messages"].as_u64().unwrap_or(0) > 0).filter_map(|t| t["thread"].as_str().map(str::to_owned)).collect(),
+            };
+            eprintln!("replay: budget {budget}, trim to {trim}, tau {tau}, min_bytes {min_bytes}, fixed {fixed}; {} thread(s)", threads.len());
+            if !as_json {
+                println!("{:<18} {:>5} {:>7} {:>5} {:>8} {:>8} {:>4} {:>6} {:>6} {:>6} {:>5} {:>6} {:>6}", "thread", "msgs", "tokens", "scale", "peak", "peak-w", "cuts", "gone", "saved%", "wfault", "gc", "gcflt", "gcsv%");
+            }
+            let mut all = Vec::new();
+            let mut tot = freefitty::window::Replay::default();
+            for t in &threads {
+                let meta = c.get(&format!("/threads/{t}")).await?;
+                let scale = match (meta["prompt_tokens"].as_u64(), meta["prompt_est"].as_u64()) { (Some(p), Some(e)) if e > 0 && p > e => p as f64 / e as f64, _ => 1.0 };
+                let history = c.get(&format!("/threads/{t}/messages")).await?;
+                let history = history.as_array().cloned().unwrap_or_default();
+                let r = freefitty::window::replay(&history, budget, trim, scale, fixed, tau, min_bytes);
+                let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
+                if as_json {
+                    all.push(json!({"thread": t, "scale": scale, "replay": r}));
+                } else {
+                    println!("{:<18} {:>5} {:>7} {:>5.2} {:>8} {:>8} {:>4} {:>6} {:>5.1}% {:>6} {:>5} {:>6} {:>5.1}%", t, r.messages, r.tokens, scale, r.peak_unwindowed, r.peak_windowed, r.cuts, r.removed,
+                        pct(r.token_slices_saved, r.token_slices_total), r.window_faults, r.gc_evicted, r.gc_faults, pct(r.gc_token_slices_saved, r.token_slices_total));
+                }
+                tot.messages += r.messages; tot.slices += r.slices; tot.tokens += r.tokens; tot.peak_unwindowed = tot.peak_unwindowed.max(r.peak_unwindowed);
+                tot.peak_windowed = tot.peak_windowed.max(r.peak_windowed); tot.cuts += r.cuts; tot.removed += r.removed; tot.token_slices_total += r.token_slices_total;
+                tot.token_slices_saved += r.token_slices_saved; tot.window_faults += r.window_faults; tot.gc_evicted += r.gc_evicted; tot.gc_faults += r.gc_faults; tot.gc_token_slices_saved += r.gc_token_slices_saved;
+            }
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&json!({"budget": budget, "trim": trim, "tau": tau, "min_bytes": min_bytes, "fixed": fixed, "threads": all, "total": tot}))?);
+            } else {
+                let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
+                println!("{:<18} {:>5} {:>7} {:>5} {:>8} {:>8} {:>4} {:>6} {:>5.1}% {:>6} {:>5} {:>6} {:>5.1}%", "total", tot.messages, tot.tokens, "", tot.peak_unwindowed, tot.peak_windowed, tot.cuts, tot.removed,
+                    pct(tot.token_slices_saved, tot.token_slices_total), tot.window_faults, tot.gc_evicted, tot.gc_faults, pct(tot.gc_token_slices_saved, tot.token_slices_total));
+                println!("\nslices {}; peak = largest view a slice saw (tokens, with the fixed part), peak-w = the same under the window; gone = messages that left a view;\nsaved% = token-slices not re-read because of the window; wfault = later calls identical to one that had left the view; gc = tool results paged by tau/min_bytes, gcflt their faults, gcsv% their token-slices", tot.slices);
             }
             Ok(())
         }

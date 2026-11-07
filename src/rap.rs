@@ -33,9 +33,10 @@ pub const SLEEP: &str = "sleep";
 pub const SLEEP_UNTIL: &str = "sleep_until";
 pub const SLEEP_UNTIL_EVENT: &str = "sleep_until_event_or_input";
 pub const REFOCUS: &str = "refocus";
+pub const RECALL: &str = "recall";
 
-/// The built-in tools; `refocus` only with compaction on.
-pub fn builtin_defs(compaction: bool) -> Vec<Value> {
+/// The built-in tools; `refocus` only with compaction on, `recall` only with the window on.
+pub fn builtin_defs(compaction: bool, window: bool) -> Vec<Value> {
     let mut v = vec![
         json!({"type": "function", "function": {"name": SLEEP,
             "description": "Sleep for a number of seconds, then continue. The agent holds nothing while asleep; any message that arrives first wakes it early.",
@@ -58,6 +59,14 @@ pub fn builtin_defs(compaction: bool) -> Vec<Value> {
             "parameters": {"type": "object", "properties": {
                 "focus": {"type": "string", "description": "The focal point the notes should be written around, in a sentence"}}}}}));
     }
+    if window {
+        v.push(json!({"type": "function", "function": {"name": RECALL,
+            "description": "Return stored messages of this conversation by index, exactly as written: the ones a [Paged.] notice says left the view, or anything earlier. Up to 16 KiB per call; ask for a narrower range if it is cut.",
+            "parameters": {"type": "object", "properties": {
+                "indices": {"type": "array", "items": {"type": "integer"}, "description": "Message indices (#n in the notice)"},
+                "from": {"type": "integer", "description": "First index of a range"},
+                "to": {"type": "integer", "description": "Last index of the range, inclusive"}}}}}));
+    }
     v
 }
 
@@ -72,7 +81,7 @@ impl Tools {
             let endpoint = m.get("endpoint").and_then(|e| e.as_str()).with_context(|| format!("{url}: manifest has no endpoint"))?.to_owned();
             for tool in m.get("tools").and_then(|t| t.as_array()).into_iter().flatten() {
                 let name = tool.get("name").and_then(|n| n.as_str()).with_context(|| format!("{url}: a tool has no name"))?.to_owned();
-                if [SLEEP, SLEEP_UNTIL, SLEEP_UNTIL_EVENT, REFOCUS].contains(&name.as_str()) || t.by_name.contains_key(&name) {
+                if [SLEEP, SLEEP_UNTIL, SLEEP_UNTIL_EVENT, REFOCUS, RECALL].contains(&name.as_str()) || t.by_name.contains_key(&name) {
                     bail!("{url}: tool name {name:?} is taken");
                 }
                 let def = json!({"type": "function", "function": {

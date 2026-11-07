@@ -13,6 +13,7 @@ pub mod queue;
 pub mod rap;
 pub mod router;
 pub mod store;
+pub mod window;
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -85,7 +86,7 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
         tasks.push(tokio::spawn(async move {
             while !router2.any_up().await { tokio::time::sleep(std::time::Duration::from_secs(1)).await; }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let mut defs = rap::builtin_defs(cfg2.compaction);
+            let mut defs = rap::builtin_defs(cfg2.compaction, cfg2.window);
             defs.extend(tools2.current().await.defs.iter().cloned());
             for name in &cfg2.warm_on_start {
                 match experts2.warm(name, &store2, &router2, &engine2.system, &defs).await {

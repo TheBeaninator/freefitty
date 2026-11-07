@@ -124,6 +124,11 @@ pub struct ThreadMeta {
     pub prompt_tokens: u64,
     #[serde(default)]
     pub prompt_est: u64,
+    /// Where the window starts the view (at or past the last refocus's `from`), and how often it has moved.
+    #[serde(default)]
+    pub window_from: u64,
+    #[serde(default)]
+    pub window_cuts: u64,
     /// What the newest stored message is: user, tool_result, assistant_text, tool_call or assistant_empty.
     /// A watcher reads "stopped talking" here: assistant_empty, or tool_call with nothing pending.
     #[serde(default)]

@@ -103,6 +103,18 @@ pub struct Config {
     /// A file whose contents replace the built-in refocus instruction (src/compact.md).
     #[serde(default)]
     pub compact_prompt_file: Option<PathBuf>,
+    /// The budget window: when a thread's view would pass `window_tokens`, its oldest whole turns leave the view
+    /// (they stay stored; the model gets a `recall` tool and a notice naming them) until it is under
+    /// `window_trim_tokens`, and the cut then holds until the budget is crossed again. On by default: it is
+    /// the guard against the node's context limit and does nothing until a thread reaches it.
+    #[serde(default = "d_true")]
+    pub window: bool,
+    /// Tokens the view may reach before a cut; 0 = the nodes' context length minus the output cap and a margin.
+    #[serde(default)]
+    pub window_tokens: u64,
+    /// Tokens a cut trims the view to; 0 = five eighths of the budget.
+    #[serde(default)]
+    pub window_trim_tokens: u64,
     /// Directory of `<name>.toml` expert definitions, read at start and on `POST /experts/reload`; empty = none.
     #[serde(default)]
     pub experts_dir: Option<PathBuf>,
@@ -168,6 +180,12 @@ impl Config {
             if self.compact_at_tokens <= 4 * self.compact_summary_tokens {
                 bail!("compact_at_tokens must be over four times compact_summary_tokens");
             }
+        }
+        if self.window_trim_tokens > 0 && self.window_tokens > 0 && self.window_trim_tokens >= self.window_tokens {
+            bail!("window_trim_tokens must be under window_tokens");
+        }
+        if self.max_context_tokens > 0 && self.window_tokens > self.max_context_tokens {
+            bail!("window_tokens must not exceed max_context_tokens");
         }
         if !self.warm_on_start.is_empty() && self.experts_dir.is_none() {
             bail!("warm_on_start needs experts_dir");
