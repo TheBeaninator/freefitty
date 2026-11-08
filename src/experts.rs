@@ -187,15 +187,8 @@ impl Experts {
         if !self.freezing.lock().unwrap().insert(path.clone()) { bail!("{key} is being frozen already"); }
         let r = self.freeze_into(key, &path, store, router, system, defs, max_tokens).await;
         self.freezing.lock().unwrap().remove(&path);
-        if r.is_ok() {
-            // the state of older contexts of this version renders before nothing that is sent any more
-            if let (Some(dir), Some(name)) = (&self.state_dir, path.file_name().and_then(|f| f.to_str())) {
-                for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-                    let f = e.file_name().to_string_lossy().into_owned();
-                    if f.starts_with(&format!("{key}-")) && f.ends_with(".kv") && f != name { let _ = std::fs::remove_file(e.path()); }
-                }
-            }
-        }
+        // other contexts of this version stay: a goldfish (scoped tools) and a thread born with every tool are
+        // two live contexts of the same expert
         r
     }
 
