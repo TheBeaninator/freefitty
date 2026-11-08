@@ -79,7 +79,8 @@ requests, so a node shared with other work counts as busy; between polls the rou
 `context_length` sets the budget below. A thread's next turn goes to the node that served its last one, where its
 state is in the prompt cache. A new thread goes to the node with the most free slots, nodes with the cache transfer
 routes first. While a thread's node is full the turn waits in the router, and a slot that frees there goes to it
-before any newcomer. A thread leaves its node only when the node is full and the thread is under `spill_tokens` (it
+before any newcomer, for at most `newcomer_wait_s` (30): past that a newcomer takes any free slot, or steady load
+would never place a new thread (a goldfish, an expert's freeze). A thread leaves its node only when the node is full and the thread is under `spill_tokens` (it
 reads its prompt again) or, with `move_threads`, by taking its state along: `POST /cache/export` on the old node
 streams into `POST /cache/import` on the new one (strixite with `cache-xfer = on`), then the turn runs there. A node
 that refuses a connection is down until its `/health` answers; a turn that never reached it goes to another. While

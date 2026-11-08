@@ -31,6 +31,10 @@ pub struct Config {
     /// Move longer threads between nodes with their cached state (strixite cache-xfer = on).
     #[serde(default = "d_true")]
     pub move_threads: bool,
+    /// A new thread yields freed slots to threads waiting for their home node for at most this long, then takes
+    /// any free slot (else steady load starves new threads: goldfish, expert freezes).
+    #[serde(default = "d_newcomer_wait")]
+    pub newcomer_wait_s: u64,
     /// Park a quiet thread's cached state on this host's disk and put it back into the node that runs its next
     /// turn (strixite cache-xfer = on). A node's own disk tier is small and capped, so a sleeper's state is
     /// otherwise often dropped and its next turn reads the whole prompt again.
@@ -164,6 +168,7 @@ fn d_slots() -> u32 { 2 }
 fn d_spill() -> u64 { 16_384 }
 fn d_true() -> bool { true }
 fn d_park_after() -> u64 { 300 }
+fn d_newcomer_wait() -> u64 { 30 }
 fn d_park_gib() -> u64 { 64 }
 fn d_keep_images() -> usize { 4 }
 fn d_grant_check() -> u64 { 5 }

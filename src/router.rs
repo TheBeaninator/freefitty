@@ -218,7 +218,11 @@ impl Router {
                     }
                 } else {
                     let h = home.and_then(|h| up.iter().copied().find(|&i| nodes[i].url == h));
-                    let mut free: Vec<usize> = up.iter().copied().filter(|&i| !nodes[i].held && nodes[i].free() - nodes[i].wanted as i64 > 0).collect();
+                    // a slot freeing on a node goes to the threads waiting for that node (their cache is there)
+                    // before a newcomer; past newcomer_wait_s a newcomer stops yielding, or under steady load new
+                    // threads (goldfish, expert freezes) would never be placed (pod, 2026-11-08: 31 min)
+                    let overdue = home.is_none() && started.elapsed() >= Duration::from_secs(self.cfg.newcomer_wait_s);
+                    let mut free: Vec<usize> = up.iter().copied().filter(|&i| !nodes[i].held && nodes[i].free() - if overdue { 0 } else { nodes[i].wanted as i64 } > 0).collect();
                     // a node a thread can later leave with its cache first; then the least loaded
                     free.sort_by_key(|&i| (nodes[i].xfer == Some(false), nodes[i].wanted as i64 - nodes[i].free(), nodes[i].load(), i));
                     let choice = match h {
@@ -514,6 +518,20 @@ mod tests {
         let r = router(vec![node("a", true, true), node("b", false, true)], false);
         assert_eq!(r.place(Some("a"), 50_000, &[]).await.unwrap(), (1, None));
         assert_eq!(r.counts().spilled, 1);
+    }
+
+    #[tokio::test]
+    async fn a_newcomer_yields_to_waiting_threads_only_until_it_is_overdue() {
+        let mut a = node("a", false, true);
+        a.mine = 1;
+        a.wanted = 1;  // a thread waits for a's last free slot
+        let mut r = router(vec![a], true);
+        r.cfg.newcomer_wait_s = 1;
+        r.cfg.node_down_wait_s = 30;
+        let t = Instant::now();
+        assert_eq!(r.place(None, 10, &[]).await.unwrap(), (0, None));
+        assert!(t.elapsed() >= Duration::from_secs(1), "it waited its turn first");
+        assert_eq!(r.counts().new, 1);
     }
 
     #[tokio::test]
