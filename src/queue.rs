@@ -201,6 +201,7 @@ impl Queue {
                         if !dead.is_empty() {
                             tracing::error!("{thread}: {} event(s) dead-lettered after {} attempts", dead.len(), self.engine.cfg.max_attempts);
                             let _ = self.store.push_reply(&thread, &format!("Error: this turn failed {} times and was set aside ({why}). `freefitty dlq redrive` runs it again.", self.engine.cfg.max_attempts), reply_to.as_deref(), "error");
+                            if let Some(ev) = self.engine.goldfish_failed(&thread, &why) { let _ = self.push(ev); }
                             self.replies.notify_waiters();
                             let mut ev = self.events.lock().unwrap();
                             for s in &seqs { ev.remove(s); }
@@ -215,6 +216,7 @@ impl Queue {
                 tracing::error!("{thread}: {why}; its events are set aside and the thread is closed");
                 let r = self.store.bury(&seqs, &thread, &why).map(|_| ());
                 let _ = self.store.push_reply(&thread, &format!("Error: {why}. The thread is closed; start a new one."), reply_to.as_deref(), "error");
+                if let Some(ev) = self.engine.goldfish_failed(&thread, &why) { let _ = self.push(ev); }
                 self.replies.notify_waiters();
                 let mut ev = self.events.lock().unwrap();
                 for s in &seqs { ev.remove(s); }

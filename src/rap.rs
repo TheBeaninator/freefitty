@@ -34,6 +34,28 @@ pub const SLEEP_UNTIL: &str = "sleep_until";
 pub const SLEEP_UNTIL_EVENT: &str = "sleep_until_event_or_input";
 pub const REFOCUS: &str = "refocus";
 pub const RECALL: &str = "recall";
+pub const EXPERTS: &str = "experts";
+pub const GOLDFISH: &str = "goldfish";
+pub const COMMISSION: &str = "commission_expert";
+
+/// Built-ins every thread keeps whatever its tool list says.
+const PLAIN: [&str; 6] = [SLEEP, SLEEP_UNTIL, SLEEP_UNTIL_EVENT, REFOCUS, RECALL, EXPERTS];
+/// Built-ins a goldfish never has, whatever it was granted: it suggests a goldfish to its elephant instead.
+pub const ELEPHANT_ONLY: [&str; 2] = [GOLDFISH, COMMISSION];
+
+/// The definitions a thread with this tool list sees: the plain built-ins and the named tools; None = all.
+pub fn scope_defs(defs: Vec<Value>, allow: Option<&[String]>) -> Vec<Value> {
+    let Some(allow) = allow else { return defs };
+    defs.into_iter().filter(|d| {
+        let n = d.pointer("/function/name").and_then(|n| n.as_str()).unwrap_or("");
+        PLAIN.contains(&n) || allow.iter().any(|a| a == n)
+    }).collect()
+}
+
+/// A goldfish's tool list: what it was granted, less what only an elephant may call.
+pub fn goldfish_tools(granted: &[String]) -> Vec<String> {
+    granted.iter().filter(|t| !ELEPHANT_ONLY.contains(&t.as_str())).cloned().collect()
+}
 
 /// The built-in tools; `refocus` only with compaction on, `recall` only with the window on.
 pub fn builtin_defs(compaction: bool, window: bool) -> Vec<Value> {
@@ -52,6 +74,26 @@ pub fn builtin_defs(compaction: bool, window: bool) -> Vec<Value> {
         json!({"type": "function", "function": {"name": SLEEP_UNTIL_EVENT,
             "description": "Wait with no timer: the agent runs again only when a message, tool result or event arrives.",
             "parameters": {"type": "object", "properties": {}}}}),
+        json!({"type": "function", "function": {"name": EXPERTS,
+            "description": "List the experts: each one's name, what it has read in a line, and the tools a goldfish born from it may use. An expert is the model's cached state after reading; a goldfish born from one starts already knowing what it read.",
+            "parameters": {"type": "object", "properties": {}}}}),
+        json!({"type": "function", "function": {"name": GOLDFISH,
+            "description": "Ask a goldfish: a fresh thread born from an expert (see `experts`) that gets your question and any documents, answers once and is gone. Your turn ends and you sleep until its answer returns as this call's result; several calls in one turn run at once. A goldfish cannot ask goldfish or commission experts; it may suggest that you do.",
+            "parameters": {"type": "object", "properties": {
+                "expert": {"type": "string", "description": "The expert's name"},
+                "question": {"type": "string", "description": "What it should do or answer: the whole brief, since it knows nothing of your conversation"},
+                "documents": {"type": "array", "items": {"type": "string"}, "description": "Paths of files to put in front of the question (on the host running the agents; up to 256 KiB each)"},
+                "tools": {"type": "array", "items": {"type": "string"}, "description": "Tools it may use, instead of the expert's own list"}}, "required": ["expert", "question"]}}}),
+        json!({"type": "function", "function": {"name": COMMISSION,
+            "description": "Commission a new expert: it reads the documents once and is frozen as cached state under its name. You sleep until it is ready; the result gives its name and version, and from then on any thread can ask goldfish born from it.",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "1-64 of [A-Za-z0-9._-], not yet taken"},
+                "description": {"type": "string", "description": "One line: what it knows, for the catalog"},
+                "reads": {"type": "array", "items": {"type": "object", "properties": {
+                    "path": {"type": "string", "description": "A file to read"},
+                    "text": {"type": "string", "description": "Or text to read"}}}, "description": "What it reads, in order"},
+                "ack": {"type": "string", "description": "Its one-sentence acknowledgement, in its own voice (a persona goes here)"},
+                "tools": {"type": "array", "items": {"type": "string"}, "description": "Tools its goldfish may use; none by default"}}, "required": ["name", "description", "reads"]}}}),
     ];
     if compaction {
         v.push(json!({"type": "function", "function": {"name": REFOCUS,
@@ -81,7 +123,12 @@ impl Tools {
             let endpoint = m.get("endpoint").and_then(|e| e.as_str()).with_context(|| format!("{url}: manifest has no endpoint"))?.to_owned();
             for tool in m.get("tools").and_then(|t| t.as_array()).into_iter().flatten() {
                 let name = tool.get("name").and_then(|n| n.as_str()).with_context(|| format!("{url}: a tool has no name"))?.to_owned();
-                if [SLEEP, SLEEP_UNTIL, SLEEP_UNTIL_EVENT, REFOCUS, RECALL].contains(&name.as_str()) || t.by_name.contains_key(&name) {
+                if PLAIN.contains(&name.as_str()) || ELEPHANT_ONLY.contains(&name.as_str()) {
+                    // one server shadowing a built-in must not take every other tool down with it
+                    tracing::warn!("{url}: tool {name:?} is a built-in name; that tool is left out");
+                    continue;
+                }
+                if t.by_name.contains_key(&name) {
                     bail!("{url}: tool name {name:?} is taken");
                 }
                 let def = json!({"type": "function", "function": {

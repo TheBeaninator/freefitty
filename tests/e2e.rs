@@ -46,7 +46,9 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": {"message": "the prompt is 267832 tokens; the context holds 262144 (prompt + at least max_tokens)"}})));
     }
     let tool_names: Vec<&str> = body["tools"].as_array().expect("every request carries tools").iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-    assert!(tool_names.contains(&"sleep") && tool_names.contains(&"echo"), "tools offered: {tool_names:?}");
+    // a goldfish sees only the plain built-ins and what it was granted; everyone else sees every tool
+    let goldfish = msgs.iter().any(|m| m["content"].as_str().is_some_and(|c| c.starts_with("You are a goldfish")));
+    assert!(tool_names.contains(&"sleep") && (goldfish || tool_names.contains(&"echo")), "tools offered: {tool_names:?}");
     if content.starts_with("Stop working and refocus") {
         // the refocus ask: notes name how many messages they replace and the focus
         let focus = content.split("The focal point to write around: ").nth(1).map(|f| f.lines().next().unwrap_or("").to_owned());
@@ -65,7 +67,27 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
     }
     let shown: Vec<String> = last["content"].as_array().into_iter().flatten()
         .filter_map(|p| p.pointer("/image_url/url").and_then(|u| u.as_str()).map(str::to_owned)).collect();
-    let message = if !shown.is_empty() {
+    let gf_call = |expert: &str, q: &str| json!({"role": "assistant", "content": null, "tool_calls": [{"id": format!("call_g{}", msgs.len()), "type": "function", "function": {"name": "goldfish", "arguments": json!({"expert": expert, "question": q}).to_string()}}]});
+    let message = if goldfish && last["role"] == "user" {
+        // the goldfish: tries to ask a goldfish when told to, else answers with the tools it was offered
+        if content.ends_with("try goldfish") {
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_gg", "type": "function", "function": {"name": "goldfish", "arguments": "{\"expert\": \"railhand\", \"question\": \"x\"}"}}]})
+        } else {
+            let mut t: Vec<&str> = tool_names.clone();
+            t.sort();
+            json!({"role": "assistant", "content": format!("fish(tools={}): {}", t.join(","), content.lines().last().unwrap_or(""))})
+        }
+    } else if last["role"] == "user" && content == "catalog" {
+        json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_c", "type": "function", "function": {"name": "experts", "arguments": "{}"}}]})
+    } else if let Some(q) = content.strip_prefix("ask ").filter(|_| last["role"] == "user") {
+        gf_call("railhand", q)
+    } else if let Some(q) = content.strip_prefix("askr2 ").filter(|_| last["role"] == "user") {
+        gf_call("rail2", q)
+    } else if content == "askbad" {
+        gf_call("nobody", "x")
+    } else if let Some(n) = content.strip_prefix("commission ").filter(|_| last["role"] == "user") {
+        json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_m", "type": "function", "function": {"name": "commission_expert", "arguments": json!({"name": n, "description": "knows rail two", "reads": [{"text": "C is .52"}], "tools": ["echo", "goldfish"]}).to_string()}}]})
+    } else if !shown.is_empty() {
         // a tool's images arrive as a user message after its result: say what was seen and what came before
         let before = &msgs[msgs.len() - 2];
         json!({"role": "assistant", "content": format!("saw {} image(s) {} after {}: {}", shown.len(), shown.join(","), before["role"].as_str().unwrap_or(""), before["content"].as_str().unwrap_or(""))})
@@ -858,5 +880,56 @@ async fn an_expert_is_its_frozen_state_and_threads_are_born_into_it() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(reads(&h.model), 1, "not read again after the restart");
     assert_eq!(h.model.imports.lock().unwrap().len(), 3);
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn elephants_find_ask_and_commission_goldfish() {
+    let mut h = harness().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("railhand.toml"), "description = \"knows the rail\"\nack = \"Read.\"\n[[reads]]\ntext = \"B is .51\"\n").unwrap();
+    h.cfg.experts_dir = Some(dir.path().to_path_buf());
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    // finding: the catalog names each expert, its line and its goldfish's tools
+    api.say("catalog", Some("el")).await;
+    let out = api.output("el", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.contains("- railhand: knows the rail (no tools as a goldfish)"), "{out}");
+    // asking: the elephant sleeps, the goldfish is born from the expert with only the plain built-ins, and its
+    // answer returns as the call's result
+    api.say("ask what is B", Some("el")).await;
+    assert!(api.output("el", 10).await.unwrap()["text"].as_str().unwrap().contains("[Tool Call: goldfish"));
+    let out = api.output("el", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.starts_with("done: fish(tools=") && out.ends_with("): what is B"), "{out}");
+    assert!(out.contains("experts") && out.contains("sleep") && !out.contains("echo") && !out.contains("goldfish,") && !out.contains("commission"), "{out}");
+    let threads = api.get("/threads").await;
+    let fish: Vec<&Value> = threads.as_array().unwrap().iter().filter(|t| t["thread"].as_str().unwrap().starts_with("el.gf-railhand-")).collect();
+    assert_eq!(fish.len(), 1);
+    assert_eq!(fish[0]["closed"], "answered its elephant");
+    let fish_body = h.model.bodies.lock().unwrap().iter().find(|b| b["messages"].as_array().unwrap().last().unwrap()["content"].as_str().is_some_and(|c| c.ends_with("what is B") && c.starts_with("You are a goldfish"))).cloned().unwrap();
+    assert!(fish_body["messages"][1]["content"].as_str().unwrap().contains("B is .51"), "born from the expert");
+    // a goldfish cannot ask goldfish, even when it tries: it is told there is no such tool, and says so
+    api.say("ask try goldfish", Some("el")).await;
+    api.output("el", 10).await.unwrap();
+    let out = api.output("el", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.contains("there is no tool named \"goldfish\""), "{out}");
+    // an unknown expert is answered in the same turn, with the catalog
+    api.say("askbad", Some("el")).await;
+    let out = api.output("el", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.contains("no expert named \"nobody\"") && out.contains("- railhand:"), "{out}");
+    // commissioning: registered at once, frozen, the definition written with its provenance; a goldfish asked
+    // for it was granted `goldfish` by the elephant, which no goldfish keeps
+    *h.model.kv.lock().unwrap() = Some(vec![5u8; 1 << 10]);
+    api.say("commission rail2", Some("el")).await;
+    api.output("el", 10).await.unwrap();
+    let out = api.output("el", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.starts_with("done: Expert rail2@") && out.contains("is ready"), "{out}");
+    let def = std::fs::read_to_string(dir.path().join("rail2.toml")).unwrap();
+    assert!(def.starts_with("# commissioned by thread el") && def.contains("C is .52") && !def.contains("goldfish"), "{def}");
+    api.say("askr2 what is C", Some("el")).await;
+    api.output("el", 10).await.unwrap();
+    let out = api.output("el", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.contains("echo") && !out.contains("goldfish,") && out.ends_with("): what is C"), "{out}");
+    assert!(h.model.imports.lock().unwrap().len() >= 1, "the goldfish was born into the frozen expert");
     r.shutdown().await;
 }

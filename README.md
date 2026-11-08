@@ -209,6 +209,27 @@ into every up node (a reading on each, where nodes cannot take state); `warm_on_
 is the work, and it is a board card (FF-EXPERTS) to grow a small set from the kinds of work the pod repeats,
 measure their cache reuse, and retire what nothing uses.
 
+**Goldfish.** Elephants are long threads that hold a piece of work; goldfish are threads born for one brief,
+which answer once and are gone. Three built-ins make that general:
+- `experts` is the catalog an elephant chooses from: each expert's name, its line, and the tools its goldfish may
+  use. It is a tool, not part of the tool definitions, so a new expert never changes the bytes every thread
+  shares.
+- `goldfish {expert, question, documents?, tools?}` makes a thread `<elephant>.gf-<expert>-<call>` born from the
+  expert (its frozen state is imported into the node that takes its first turn), puts the documents (paths on
+  this host, 256 KiB each, 1 MiB together) and the question in its first message, and ends the elephant's turn;
+  several in one turn run at once. When the goldfish ends a turn with nothing out, its text returns as the call's
+  result and the goldfish is closed; if it fails or dead-letters, the elephant gets the error as the result.
+- `commission_expert {name, description, reads, ack?, tools?}` registers a new expert at once, writes its
+  definition to `experts_dir` with the commissioning thread named, and freezes it; the elephant sleeps until the
+  freeze ends and wakes to the expert's name and version.
+
+A goldfish sees and may call only the plain built-ins (the sleeps, `recall`, `refocus`, `experts`) and the tools
+it was granted: the call's `tools`, else its expert's `tools = [...]`, else none. An expert's tool list is part of
+its version, since the definitions render before it, and it is frozen in that context. `goldfish` and
+`commission_expert` are never a goldfish's, whatever it was granted: it says in its answer which expert should look
+next, and the elephant decides. An expert without a tool list gives a thread born from it with `/say` every
+tool. A tool server publishing a built-in's name has that tool left out, with a warning.
+
 **Paging old tool results, on.** Most of a pod thread is tool output, and most of it is read once. A result the
 model has answered `page_results_after_turns` (4) model turns ago and that is over `page_results_min_bytes` (500)
 is shown as a handle in its place, `[Paged out: name(args...) answered with N bytes; recall(#i) returns it]`, under
@@ -286,7 +307,10 @@ tool and from the operator with the pending call bridged and its late result ans
 again, nothing-to-fold, the token trigger, failed notes; experts sharing their prefix bytes, version pinning across
 a file change, warm on start, and an expert frozen from a thread's notes; an expert frozen once into a state file
 that each born thread's first turn imports byte for byte, a later turn importing nothing, and a restart keeping the
-state without a second reading; the window cutting whole units at the
+state without a second reading; an elephant reading the catalog, asking a goldfish born from an expert with only
+the plain built-ins and getting its answer as the call's result, a goldfish that tries to ask a goldfish being
+told there is no such tool, an unknown expert answered with the catalog, and a commissioned expert frozen, its
+definition written, and its goldfish holding the granted tool but never `goldfish`; the window cutting whole units at the
 budget, the notice carrying the first message, the cut point holding across turns, `recall` returning the exact
 text within the slice, and the replay agreeing with the live run; old results paging out in a batch as handles, an
 error result staying, and a recalled result pinned back in full; a node's count correcting a wrong estimate so

@@ -14,7 +14,7 @@
 use crate::config::Config;
 use crate::rap::{self, ToolBox};
 use crate::router::{ChatError, Router};
-use crate::store::{now_ms, Commit, Compaction, Event, EventKind, Invocation, PendingCall, Store, ThreadMeta};
+use crate::store::{now_ms, Commit, Compaction, Event, EventKind, GoldfishOf, Invocation, PendingCall, Store, ThreadMeta};
 use crate::window;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -34,6 +34,13 @@ pub struct Engine {
     /// Threads with a slice running (waiting for a slot counts): never parked mid-turn.
     pub running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub experts: Arc<crate::experts::Experts>,
+    /// Queues an event from outside a slice (a commissioned expert's result); set once the queue exists.
+    pub deliver: Arc<std::sync::OnceLock<Box<dyn Fn(Event) + Send + Sync>>>,
+}
+
+/// What a goldfish's turn said, for its elephant: the text of its assistant messages.
+fn text_for_elephant(msgs: &[Value]) -> String {
+    msgs.iter().filter(|m| m["role"] == "assistant").filter_map(|m| m["content"].as_str()).map(str::trim).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n")
 }
 
 /// Marks a thread as running for as long as it lives.
@@ -221,6 +228,10 @@ impl Engine {
         let tools = self.tools.current().await;
         let mut defs = rap::builtin_defs(self.cfg.compaction, self.cfg.window);
         defs.extend(tools.defs.iter().cloned());
+        // a thread born with a tool list (a goldfish, an expert that declares one) sees and may call only those
+        let defs = rap::scope_defs(defs, meta.tools.as_deref());
+        let allowed: std::collections::HashSet<String> = defs.iter().filter_map(|d| d.pointer("/function/name").and_then(|n| n.as_str()).map(str::to_owned)).collect();
+        let mut asked = 0usize;
 
         // ---- refocus -----------------------------------------------------------------------------
         let mut view = live_view(&prefix, &meta, &history, &pending_at_start, self.page_min());
@@ -359,6 +370,31 @@ impl Engine {
             let mut recalled: Vec<(Call, String)> = Vec::new();
             for call in &calls {
                 match call.name.as_str() {
+                    rap::EXPERTS => recalled.push((call.clone(), self.experts.catalog(&self.store).await)),
+                    rap::GOLDFISH if allowed.contains(rap::GOLDFISH) => match self.goldfish(thread, call).await {
+                        Ok((child_meta, first)) => {
+                            let child = first.thread.clone();
+                            match self.store.new_thread(&child, &child_meta) {
+                                Ok(_) => {
+                                    events.push(first);
+                                    meta.pending.push(call.pending());
+                                    asked += 1;
+                                    tracing::info!("{thread}: asked goldfish {child}");
+                                    reply_text.push_str(&format!("\n[Tool Call: goldfish with arguments {}]", call.args));
+                                }
+                                Err(e) => recalled.push((call.clone(), format!("Error: the goldfish could not be made: {e}"))),
+                            }
+                        }
+                        Err(e) => recalled.push((call.clone(), format!("Error: {e:#}"))),
+                    },
+                    rap::COMMISSION if allowed.contains(rap::COMMISSION) => match self.commission(thread, call).await {
+                        Ok(()) => {
+                            meta.pending.push(call.pending());
+                            asked += 1;
+                            reply_text.push_str(&format!("\n[Tool Call: commission_expert with arguments {}]", call.args));
+                        }
+                        Err(e) => recalled.push((call.clone(), format!("Error: {e:#}"))),
+                    },
                     rap::RECALL if self.cfg.window => {
                         // answered from the store within the slice: a fault costs one more model pass, no tool round trip
                         let text = match window::recall_indices(&call.args, history.len()) {
@@ -402,7 +438,7 @@ impl Engine {
                         meta.pending.push(call.pending());
                         reply_text.push_str(&format!("\n[Tool Call: refocus with arguments {}]", call.args));
                     }
-                    name => match tools.get(name) {
+                    name => match tools.get(name).filter(|_| allowed.contains(name)) {
                         Some(tool) => {
                             invocations.push(Invocation {
                                 call: call.id.clone(),
@@ -431,12 +467,12 @@ impl Engine {
             for u in &unknown {
                 new_messages.push(json!({"role": "tool", "tool_call_id": u.shown_id(), "content": format!("Error: there is no tool named {:?}. The tools are: {}", u.name, names.join(", "))}));
             }
-            if !unknown.is_empty() && (rounds >= UNKNOWN_TOOL_ROUNDS || !events.is_empty() || !invocations.is_empty()) {
+            if !unknown.is_empty() && (rounds >= UNKNOWN_TOOL_ROUNDS || !events.is_empty() || !invocations.is_empty() || asked > 0) {
                 reply_text.push_str(&format!("\n[Error: the model called tools that do not exist: {}]", unknown.iter().map(|u| u.name.as_str()).collect::<Vec<_>>().join(", ")));
                 break;
             }
             // a turn that also slept or called a real tool ends here; the recall's text waits in the history for its next turn
-            if rounds >= UNKNOWN_TOOL_ROUNDS || !events.is_empty() || !invocations.is_empty() { break; }
+            if rounds >= UNKNOWN_TOOL_ROUNDS || !events.is_empty() || !invocations.is_empty() || asked > 0 { break; }
             let mut msgs = body["messages"].as_array().cloned().unwrap_or_default();
             msgs.extend(new_messages[new_messages.len() - 1 - answered..].iter().cloned());
             body["messages"] = Value::Array(msgs);
@@ -450,13 +486,27 @@ impl Engine {
         }
         // parking: at once for a long sleep or a wait on events alone; after park_after_s for a tool call out or
         // a finished turn; never for a sleep that ends sooner (the node still has the state then)
+        // (a goldfish asked or an expert commissioned counts as a tool call out; a goldfish's first event is
+        // its own thread's, not this one's)
         let after_ms = self.cfg.park_after_s * 1000;
-        let park_in = match events.iter().map(|e| e.due_ms).min() {
-            Some(due) if invocations.is_empty() && due >= now_ms() + after_ms => Some(0),
+        let out = !invocations.is_empty() || asked > 0;
+        let park_in = match events.iter().filter(|e| e.thread == thread).map(|e| e.due_ms).min() {
+            Some(due) if !out && due >= now_ms() + after_ms => Some(0),
             Some(_) => None,
-            None if waits_for_event && invocations.is_empty() => Some(0),
+            None if waits_for_event && !out => Some(0),
             None => Some(after_ms),
         };
+        // a goldfish that ended a turn with nothing out has answered: its text returns to the elephant as the
+        // call's result, and the goldfish is done
+        if let Some(g) = meta.goldfish_of.clone() {
+            if !out && meta.pending.is_empty() && !events.iter().any(|e| e.thread == thread) {
+                let answer = if text_for_elephant(&new_messages).is_empty() { "(the goldfish ended without an answer)".to_owned() } else { text_for_elephant(&new_messages) };
+                events.push(Event { id: format!("goldfish-{}", g.call), thread: g.thread.clone(), due_ms: 0, created_ms: 0, attempts: 0,
+                                    kind: EventKind::ToolResult { call: g.call.clone(), provider_call_id: g.provider_call_id.clone(), text: answer, images: vec![] } });
+                meta.closed = Some("answered its elephant".into());
+                tracing::info!("{thread}: answered {}", g.thread);
+            }
+        }
         let node = meta.node.clone();
         self.store.commit(Commit { thread, meta, messages: new_messages, done, done_ids, replies, events, invocations })?;
         if let Some(p) = &self.parking {
@@ -468,6 +518,85 @@ impl Engine {
             }
         }
         Ok(Outcome::Done)
+    }
+
+    /// A goldfish for a `goldfish` call: its thread's meta and first event. Born from the expert, with the
+    /// expert's tool list (or the call's), never the tools only an elephant may call.
+    async fn goldfish(&self, thread: &str, call: &Call) -> anyhow::Result<(ThreadMeta, Event)> {
+        let name = call.args.get("expert").and_then(|e| e.as_str()).unwrap_or("");
+        let question = call.args.get("question").and_then(|q| q.as_str()).unwrap_or("").trim();
+        if question.is_empty() { anyhow::bail!("goldfish needs a question"); }
+        let Some(key) = self.experts.key(name).await else {
+            anyhow::bail!("there is no expert named {name:?}.\n{}", self.experts.catalog(&self.store).await)
+        };
+        let expert = self.store.expert(&key)?.ok_or_else(|| anyhow::anyhow!("expert {key} is not stored"))?;
+        let granted: Vec<String> = match call.args.get("tools").and_then(|t| t.as_array()) {
+            Some(a) => a.iter().filter_map(|t| t.as_str().map(str::to_owned)).collect(),
+            None => expert.tools.clone().unwrap_or_default(),
+        };
+        let mut text = String::from("You are a goldfish: you were born for this one brief and answer it once; your answer returns to the agent that asked. You cannot ask goldfish or commission experts. If another expert should look at something, say so in your answer and name it (`experts` lists them).\n\n");
+        let mut total = 0usize;
+        for p in call.args.get("documents").and_then(|d| d.as_array()).into_iter().flatten().filter_map(|p| p.as_str()) {
+            let doc = std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("reading document {p}: {e}"))?;
+            if doc.len() > 256 << 10 { anyhow::bail!("document {p} is {} bytes, over 256 KiB", doc.len()); }
+            total += doc.len();
+            if total > 1 << 20 { anyhow::bail!("the documents are over 1 MiB together"); }
+            text.push_str(&format!("<document path=\"{p}\">\n{doc}\n</document>\n\n"));
+        }
+        text.push_str(question);
+        let tag: String = call.id.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
+        let mut child = format!("{thread}.gf-{name}-{tag}");
+        if child.len() > 128 { child = format!("gf-{name}-{tag}-{}", crate::config::id()).chars().take(128).collect(); }
+        let meta = ThreadMeta {
+            created_ms: now_ms(), updated_ms: now_ms(),
+            metadata: json!({"goldfish_of": thread, "expert": key}),
+            expert: Some(key),
+            tools: Some(rap::goldfish_tools(&granted)),
+            goldfish_of: Some(GoldfishOf { thread: thread.to_owned(), call: call.id.clone(), provider_call_id: call.provider_call_id.clone() }),
+            ..Default::default()
+        };
+        let first = Event { id: format!("gf-{}", call.id), thread: child, due_ms: 0, created_ms: 0, attempts: 0, kind: EventKind::User { text, metadata: Value::Null } };
+        Ok((meta, first))
+    }
+
+    /// Start a `commission_expert` call: the expert is registered now and frozen in the background; the result
+    /// returns to the caller when the freeze ends.
+    async fn commission(&self, thread: &str, call: &Call) -> anyhow::Result<()> {
+        let a = &call.args;
+        let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if self.experts.key(name).await.is_some() { anyhow::bail!("an expert named {name:?} exists already"); }
+        let reads: Vec<crate::experts::Read> = serde_json::from_value(a.get("reads").cloned().unwrap_or(json!([])))
+            .map_err(|e| anyhow::anyhow!("reads must be a list of {{path}} or {{text}}: {e}"))?;
+        let tools: Vec<String> = a.get("tools").and_then(|t| t.as_array()).map(|t| t.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+        let e = crate::experts::commission(&self.cfg, name, a.get("description").and_then(|d| d.as_str()).unwrap_or(""), a.get("ack").and_then(|d| d.as_str()), &reads, rap::goldfish_tools(&tools), thread)?;
+        let key = self.experts.add(&self.store, &e).await?;
+        tracing::info!("{thread}: commissioned expert {key}");
+        // frozen in the context its goldfish will see: the plain built-ins and its own tools (from the whole set,
+        // not the commissioning thread's, which may be scoped)
+        let mut full = rap::builtin_defs(self.cfg.compaction, self.cfg.window);
+        full.extend(self.tools.current().await.defs.iter().cloned());
+        let scoped = rap::scope_defs(full, e.tools.as_deref());
+        let (experts, store, router, system, max) = (self.experts.clone(), self.store.clone(), self.router.clone(), self.system.clone(), self.cfg.max_output_tokens);
+        let (deliver, thread, call_id, provider) = (self.deliver.clone(), thread.to_owned(), call.id.clone(), call.provider_call_id.clone());
+        tokio::spawn(async move {
+            let text = match experts.freeze(&key, &store, &router, &system, &scoped, max).await {
+                Ok(r) => format!("Expert {key} is ready: frozen from {} prompt tokens ({:.2} GB of cached state). Ask it with goldfish {{\"expert\": \"{}\", ...}}.",
+                                 r["prompt_tokens"].as_u64().unwrap_or(0), r["bytes"].as_u64().unwrap_or(0) as f64 / 1e9, key.split('@').next().unwrap_or("")),
+                Err(e) => format!("Expert {key} is registered, but freezing it failed ({e:#}); a goldfish born from it reads it instead."),
+            };
+            if let Some(d) = deliver.get() {
+                d(Event { id: format!("commission-{call_id}"), thread, due_ms: 0, created_ms: 0, attempts: 0,
+                          kind: EventKind::ToolResult { call: call_id, provider_call_id: provider, text, images: vec![] } });
+            }
+        });
+        Ok(())
+    }
+
+    /// The error result a failed goldfish owes its elephant, if the thread is one.
+    pub fn goldfish_failed(&self, thread: &str, why: &str) -> Option<Event> {
+        let g = self.store.thread(thread).ok().flatten()?.goldfish_of?;
+        Some(Event { id: format!("goldfish-{}", g.call), thread: g.thread, due_ms: 0, created_ms: 0, attempts: 0,
+                     kind: EventKind::ToolResult { call: g.call, provider_call_id: g.provider_call_id, text: format!("Error: the goldfish failed: {why}"), images: vec![] } })
     }
 
     /// Park the thread's state `delay_ms` from now unless it has run another turn by then. `body` is its last

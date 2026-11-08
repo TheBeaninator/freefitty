@@ -44,10 +44,13 @@ struct Definition {
     ack: String,
     #[serde(default)]
     reads: Vec<Read>,
+    /// The tools a thread born from it may call; unset = every tool (an elephant's expert), [] = none.
+    #[serde(default)]
+    tools: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
-struct Read {
+#[derive(Deserialize, serde::Serialize, Clone)]
+pub struct Read {
     #[serde(default)]
     path: Option<String>,
     #[serde(default)]
@@ -62,8 +65,9 @@ pub fn name_ok(n: &str) -> bool {
     !n.is_empty() && n.len() <= 64 && n.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
-/// The expert's two messages from its documents: byte-identical for the same documents in the same order.
-fn build(name: &str, description: &str, ack: &str, docs: &[(Option<String>, String)]) -> Expert {
+/// The expert's two messages from its documents: byte-identical for the same documents in the same order. Its
+/// tool list is part of its identity (the definitions render before it), so it is in the hash when set.
+fn build(name: &str, description: &str, ack: &str, docs: &[(Option<String>, String)], tools: Option<Vec<String>>) -> Expert {
     let mut body = format!("<expert name=\"{name}\">\n");
     for (path, text) in docs {
         match path {
@@ -74,28 +78,60 @@ fn build(name: &str, description: &str, ack: &str, docs: &[(Option<String>, Stri
     body.push_str("</expert>\nYou have read these documents. Acknowledge in one sentence.");
     let messages = vec![json!({"role": "user", "content": body}), json!({"role": "assistant", "content": ack})];
     let bytes = serde_json::to_vec(&messages).map(|b| b.len()).unwrap_or(0) as u64;
-    let hash = rap::short_hash(&serde_json::to_string(&messages).unwrap_or_default());
-    Expert { name: name.to_owned(), hash, description: description.to_owned(), messages, bytes, loaded_ms: now_ms() }
+    let mut hashed = serde_json::to_string(&messages).unwrap_or_default();
+    if let Some(t) = &tools { hashed.push_str(&format!("\u{0}tools={}", t.join(","))); }
+    let hash = rap::short_hash(&hashed);
+    Expert { name: name.to_owned(), hash, description: description.to_owned(), messages, bytes, loaded_ms: now_ms(), tools }
+}
+
+/// Read a definition's documents: (path, text) pairs, each file at most `max_file` bytes.
+pub fn read_docs(reads: &[Read], max_file: usize) -> Result<Vec<(Option<String>, String)>> {
+    let mut docs = Vec::new();
+    for r in reads {
+        match (&r.path, &r.text) {
+            (Some(p), _) => {
+                let text = std::fs::read_to_string(p).with_context(|| format!("reading {p}"))?;
+                if text.len() > max_file { bail!("{p} is {} bytes, over {max_file}", text.len()); }
+                docs.push((Some(p.clone()), text));
+            }
+            (None, Some(t)) => docs.push((None, t.clone())),
+            (None, None) => bail!("a read needs path or text"),
+        }
+    }
+    Ok(docs)
+}
+
+/// An expert an elephant commissioned; its definition is written to `experts_dir` (when set) so it survives
+/// a restart, with who commissioned it.
+pub fn commission(cfg: &Config, name: &str, description: &str, ack: Option<&str>, reads: &[Read], tools: Vec<String>, by: &str) -> Result<Expert> {
+    if !name_ok(name) { bail!("expert names are 1-64 of [A-Za-z0-9._-]"); }
+    if reads.is_empty() { bail!("an expert needs something to read"); }
+    let docs = read_docs(reads, 1 << 20)?;
+    let ack = ack.map(str::to_owned).unwrap_or_else(default_ack);
+    let e = build(name, description, &ack, &docs, Some(tools.clone()));
+    if let Some(dir) = &cfg.experts_dir {
+        let path = dir.join(format!("{name}.toml"));
+        if path.exists() { bail!("an expert definition named {name} exists already"); }
+        #[derive(serde::Serialize)]
+        struct Def<'a> { description: &'a str, ack: &'a str, tools: &'a [String], reads: &'a [Read] }
+        let body = toml::to_string(&Def { description, ack: &ack, tools: &tools, reads })?;
+        std::fs::write(&path, format!("# commissioned by thread {by} on {}\n{body}", chrono::Utc::now().to_rfc3339()))
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(e)
 }
 
 fn load_file(path: &std::path::Path) -> Result<Expert> {
     let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_owned();
     if !name_ok(&name) { bail!("{}: expert names are 1-64 of [A-Za-z0-9._-]", path.display()); }
     let def: Definition = toml::from_str(&std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?).with_context(|| format!("parsing {}", path.display()))?;
-    let mut docs = Vec::new();
-    for r in &def.reads {
-        match (&r.path, &r.text) {
-            (Some(p), _) => docs.push((Some(p.clone()), std::fs::read_to_string(p).with_context(|| format!("{}: reading {p}", path.display()))?)),
-            (None, Some(t)) => docs.push((None, t.clone())),
-            (None, None) => bail!("{}: a [[reads]] entry needs path or text", path.display()),
-        }
-    }
-    Ok(build(&name, &def.description, &def.ack, &docs))
+    let docs = read_docs(&def.reads, usize::MAX).with_context(|| path.display().to_string())?;
+    Ok(build(&name, &def.description, &def.ack, &docs, def.tools))
 }
 
 /// An expert whose reading is a thread's focal point: its latest refocus notes.
 pub fn from_notes(name: &str, description: &str, thread: &str, notes: &str) -> Expert {
-    build(name, description, "I hold this understanding and will continue from it.", &[(Some(format!("notes-of-thread-{thread}")), notes.to_owned())])
+    build(name, description, "I hold this understanding and will continue from it.", &[(Some(format!("notes-of-thread-{thread}")), notes.to_owned())], None)
 }
 
 /// What renders before an expert's messages: the system prompt and the tool definitions.
@@ -182,7 +218,10 @@ impl Experts {
     pub async fn freeze_all(&self, store: &Store, router: &Router, system: &str, defs: &[Value], max_tokens: u64) {
         let keys: Vec<String> = self.current.read().await.values().cloned().collect();
         for key in keys {
-            if let Err(e) = self.freeze(&key, store, router, system, defs, max_tokens).await { tracing::warn!("expert {key}: not frozen: {e:#}"); }
+            // frozen in the context a thread born from it sees: the tools its list allows
+            let tools = store.expert(&key).ok().flatten().and_then(|e| e.tools);
+            let scoped = rap::scope_defs(defs.to_vec(), tools.as_deref());
+            if let Err(e) = self.freeze(&key, store, router, system, &scoped, max_tokens).await { tracing::warn!("expert {key}: not frozen: {e:#}"); }
         }
     }
 
@@ -209,6 +248,25 @@ impl Experts {
         let key = store.save_expert(e)?;
         self.current.write().await.insert(e.name.clone(), key.clone());
         Ok(key)
+    }
+
+    /// The catalog an elephant chooses goldfish from: each expert's name, its line, its goldfish's tools.
+    pub async fn catalog(&self, store: &Store) -> String {
+        let mut cur: Vec<(String, String)> = self.current.read().await.iter().map(|(n, k)| (n.clone(), k.clone())).collect();
+        cur.sort();
+        if cur.is_empty() { return "No experts yet. commission_expert makes one.".into(); }
+        let mut out = String::from("Experts (ask one with goldfish {expert, question}):\n");
+        for (name, key) in cur {
+            let e = store.expert(&key).ok().flatten();
+            let desc = e.as_ref().map(|e| e.description.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| "(no description)".into());
+            let tools = match e.as_ref().and_then(|e| e.tools.clone()) {
+                Some(t) if t.is_empty() => "no tools".to_owned(),
+                Some(t) => format!("tools: {}", t.join(", ")),
+                None => "no tools as a goldfish".to_owned(),
+            };
+            out.push_str(&format!("- {name}: {desc} ({tools})\n"));
+        }
+        out
     }
 
     pub async fn key(&self, name: &str) -> Option<String> {

@@ -106,6 +106,9 @@ pub struct Expert {
     pub messages: Vec<Value>,
     pub bytes: u64,
     pub loaded_ms: u64,
+    /// The tools a thread born from it may call, besides the plain built-ins; None = every tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -154,6 +157,20 @@ pub struct ThreadMeta {
     /// "name@hash" of the expert prefix this thread was born with.
     #[serde(default)]
     pub expert: Option<String>,
+    /// The tools this thread may call besides the plain built-ins (sleeps, recall, refocus, experts); None = all.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    /// Set on a goldfish: the elephant's thread and the call its answer returns as.
+    #[serde(default)]
+    pub goldfish_of: Option<GoldfishOf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct GoldfishOf {
+    pub thread: String,
+    pub call: String,
+    #[serde(default)]
+    pub provider_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +363,19 @@ impl Store {
         }
         w.commit()?;
         Ok(())
+    }
+
+    /// Create a thread with this meta unless it exists; whether it was created.
+    pub fn new_thread(&self, thread: &str, meta: &ThreadMeta) -> Result<bool> {
+        let w = self.db.begin_write()?;
+        let created;
+        {
+            let mut threads = w.open_table(THREADS)?;
+            created = threads.get(thread)?.is_none();
+            if created { threads.insert(thread, enc(meta).as_slice())?; }
+        }
+        w.commit()?;
+        Ok(created)
     }
 
     /// Create a thread pinned to an expert version before its first event is queued.
