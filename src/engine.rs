@@ -29,6 +29,8 @@ pub struct Engine {
     pub callback_url: String,
     /// The latest node-count-over-estimate ratio any thread saw, times 1000; 0 until a turn has run.
     pub scale_hint: std::sync::atomic::AtomicU64,
+    /// Where quiet threads' cached state is parked (`park`); None = off.
+    pub parking: Option<Arc<crate::park::Parking>>,
 }
 
 pub enum Outcome {
@@ -273,9 +275,13 @@ impl Engine {
         let mut invocations: Vec<Invocation> = Vec::new();
         let mut rounds = 0;
         let mut recut = false;
+        let mut waits_for_event = false;
+        let parked = self.parking.as_ref().and_then(|p| p.has(thread));
+        let mut restore = parked.clone();
         loop {
             rounds += 1;
-            let turn = match self.router.chat(meta.node.as_deref(), &body).await {
+            let r = restore.take();
+            let turn = match self.router.chat_restoring(meta.node.as_deref(), &body, r.as_deref()).await {
                 Ok(t) => t,
                 // the node says the prompt does not fit. With the window on and the node's own count in the message,
                 // the estimate was wrong: learn the ratio, cut, and send once more; otherwise the thread is done
@@ -360,6 +366,7 @@ impl Engine {
                         // nothing is pending for this call: the next event or message wakes the thread anyway. Its
                         // result is written now, so the transcript is whole and a watcher does not read a stall
                         new_messages.push(json!({"role": "tool", "tool_call_id": call.shown_id(), "content": "Waiting for the next event or message."}));
+                        waits_for_event = true;
                         reply_text.push_str(&format!("\n[Tool Call: sleep_until_event_or_input with arguments {}]", call.args));
                     }
                     rap::REFOCUS if self.cfg.compaction => {
@@ -416,8 +423,51 @@ impl Engine {
         if !text.is_empty() {
             replies.push((text, reply_to, "text".to_owned(), meta.metadata.clone()));
         }
+        // parking: at once for a long sleep or a wait on events alone; after park_after_s for a tool call out or
+        // a finished turn; never for a sleep that ends sooner (the node still has the state then)
+        let after_ms = self.cfg.park_after_s * 1000;
+        let park_in = match events.iter().map(|e| e.due_ms).min() {
+            Some(due) if invocations.is_empty() && due >= now_ms() + after_ms => Some(0),
+            Some(_) => None,
+            None if waits_for_event && invocations.is_empty() => Some(0),
+            None => Some(after_ms),
+        };
+        let node = meta.node.clone();
         self.store.commit(Commit { thread, meta, messages: new_messages, done, done_ids, replies, events, invocations })?;
+        if let Some(p) = &self.parking {
+            // the node's cache is newer than any parked copy from here on
+            if parked.is_some() { p.forget(thread); }
+            if let (Some(node), Some(delay)) = (node, park_in) {
+                self.park_later(thread, node, body, delay);
+            }
+        }
         Ok(Outcome::Done)
+    }
+
+    /// Park the thread's state `delay_ms` from now unless it has run another turn by then. `body` is its last
+    /// request: the node's entry for it is the newest state it holds for this thread.
+    fn park_later(&self, thread: &str, node: String, body: Value, delay_ms: u64) {
+        let (Some(park), Ok(Some(m))) = (self.parking.clone(), self.store.thread(thread)) else { return };
+        let (router, store, thread, stamp) = (self.router.clone(), self.store.clone(), thread.to_owned(), m.updated_ms);
+        let unchanged = move |store: &Store, thread: &str| matches!(store.thread(thread), Ok(Some(m)) if m.updated_ms == stamp);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            if !unchanged(&store, &thread) { return; }
+            let path = park.path(&thread);
+            let t = std::time::Instant::now();
+            match router.park_state(&node, &body, &path).await {
+                Ok(Some(n)) => {
+                    if unchanged(&store, &thread) {
+                        tracing::info!("{thread}: parked its cached state from {node} ({:.1} GB in {:.1}s)", n as f64 / 1e9, t.elapsed().as_secs_f64());
+                        park.prune();
+                    } else {
+                        park.forget(&thread);  // a turn ran while it was written
+                    }
+                }
+                Ok(None) => tracing::info!("{thread}: nothing to park, {node} no longer holds its state"),
+                Err(e) => tracing::warn!("{thread}: parking its state from {node} failed: {e:#}"),
+            }
+        });
     }
 
     /// The paging size threshold, or 0 while paging is off.

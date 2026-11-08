@@ -15,6 +15,9 @@ struct FakeModel {
     /// the next notes answer is cut off (finish_reason length)
     cut_notes: AtomicBool,
     bodies: std::sync::Mutex<Vec<Value>>,
+    /// what /cache/export answers (None: 404, nothing cached), and every body /cache/import got
+    kv: std::sync::Mutex<Option<Vec<u8>>>,
+    imports: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 async fn health(State(m): State<Arc<FakeModel>>) -> Json<Value> {
@@ -91,8 +94,17 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
     (axum::http::StatusCode::OK, Json(json!({"choices": [{"message": message}], "usage": {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 90}}})))
 }
 
-async fn export() -> axum::http::StatusCode {
-    axum::http::StatusCode::NOT_FOUND
+async fn export(State(m): State<Arc<FakeModel>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match m.kv.lock().unwrap().clone() {
+        Some(b) => b.into_response(),
+        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn import(State(m): State<Arc<FakeModel>>, body: bytes::Bytes) -> Json<Value> {
+    m.imports.lock().unwrap().push(body.to_vec());
+    Json(json!({"status": "ok"}))
 }
 
 struct FakeTools {
@@ -143,8 +155,8 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
-    let model = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(0), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()) });
-    let model_url = serve(Router::new().route("/health", get(health)).route("/v1/chat/completions", post(completions)).route("/cache/export", post(export)).with_state(model.clone())).await;
+    let model = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(0), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()) });
+    let model_url = serve(Router::new().route("/health", get(health)).route("/v1/chat/completions", post(completions)).route("/cache/export", post(export)).route("/cache/import", post(import)).with_state(model.clone())).await;
     let tools = Arc::new(FakeTools { base: String::new(), invocations: AtomicUsize::new(0) });
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let tools_url = format!("http://{}", l.local_addr().unwrap());
@@ -747,5 +759,51 @@ async fn old_results_page_out_in_batches_and_recall_pins_them() {
     let bodies = h.model.bodies.lock().unwrap().clone();
     let last = bodies.last().unwrap()["messages"].as_array().unwrap().clone();
     assert!(last.iter().any(|m| m["content"].as_str().is_some_and(|c| c.starts_with("[Paged out:"))));
+    r.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_sleeper_is_parked_and_its_state_restored_on_waking() {
+    let mut h = harness().await;
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    // any sleep counts as long here; the scripted one is 1 s
+    h.cfg.park_after_s = 0;
+    *h.model.kv.lock().unwrap() = Some(vec![7u8; 3 << 19]);
+    let parked = h.cfg.data_dir.join("parked");
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let t = api.say("sleep please", None).await["thread"].as_str().unwrap().to_owned();
+    let out = api.output(&t, 10).await.expect("the tool call line");
+    assert!(out["text"].as_str().unwrap().contains("[Tool Call: sleep"), "{out}");
+    let out = api.output(&t, 10).await.expect("the reply after waking");
+    assert_eq!(out["text"], "done: Slept for 1 seconds");
+    let imports = h.model.imports.lock().unwrap().clone();
+    assert_eq!(imports.len(), 1, "the parked state went back into the node once");
+    assert_eq!(imports[0], vec![7u8; 3 << 19], "byte for byte what the node exported");
+    // the turn that ran made the copy stale and removed it; the finished turn parks again after park_after_s
+    // (0 here), and what lands is a whole copy, never a half-written one
+    let c = api.get("/health").await;
+    assert_eq!(c["router"]["parked"].as_u64().unwrap() >= 1, true, "{c}");
+    assert_eq!(c["router"]["restored"], 1, "{c}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for e in std::fs::read_dir(&parked).unwrap().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        assert!(name.ends_with(".kv") && e.metadata().unwrap().len() == 3 << 19, "{name}: only whole copies stay");
+    }
+
+    // a node with nothing cached: nothing is parked, and nothing is restored
+    *h.model.kv.lock().unwrap() = None;
+    for e in std::fs::read_dir(&parked).unwrap().flatten() { std::fs::remove_file(e.path()).unwrap(); }
+    let t2 = api.say("sleep please", None).await["thread"].as_str().unwrap().to_owned();
+    api.output(&t2, 10).await.expect("the tool call line");
+    api.output(&t2, 10).await.expect("the reply after waking");
+    assert_eq!(h.model.imports.lock().unwrap().len(), 1);
+    assert!(!parked.join(format!("{t2}.kv")).exists());
+
+    // deleting a thread removes its parked state
+    std::fs::write(parked.join(format!("{t}.kv")), b"x").unwrap();
+    let s = reqwest::Client::new().delete(format!("{}/threads/{t}", api.base)).bearer_auth(&api.token).send().await.unwrap().status();
+    assert!(s.is_success(), "{s}");
+    assert!(!parked.join(format!("{t}.kv")).exists());
     r.shutdown().await;
 }

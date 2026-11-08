@@ -15,6 +15,7 @@
 use crate::config::Config;
 use anyhow::{bail, Result};
 use serde_json::Value;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
@@ -55,6 +56,10 @@ pub struct Counts {
     pub spilled: u64,
     pub moved: u64,
     pub move_failed: u64,
+    pub parked: u64,
+    pub park_missed: u64,
+    pub restored: u64,
+    pub restore_failed: u64,
     pub waited: u64,
     pub broken: u64,
 }
@@ -273,8 +278,68 @@ impl Router {
         Ok(true)
     }
 
+    /// Copy a thread's cached state from its node into `path` (written beside it and renamed); the bytes
+    /// written, or None when the node holds nothing for this conversation.
+    pub async fn park_state(&self, from: &str, body: &Value, path: &Path) -> Result<Option<u64>> {
+        use futures_util::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        let exp = self.xfer_client.post(format!("{from}/cache/export")).json(body).send().await?;
+        match exp.status().as_u16() {
+            200 => {}
+            404 => {
+                self.counts.lock().await.park_missed += 1;
+                return Ok(None);
+            }
+            s => bail!("export answered {s}"),
+        }
+        let part = crate::park::part_path(path);
+        let written = async {
+            let mut f = tokio::fs::File::create(&part).await?;
+            let mut n = 0u64;
+            let mut stream = exp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                f.write_all(&chunk).await?;
+                n += chunk.len() as u64;
+            }
+            f.flush().await?;
+            tokio::fs::rename(&part, path).await?;
+            anyhow::Ok(n)
+        }.await;
+        if written.is_err() { let _ = tokio::fs::remove_file(&part).await; }
+        let n = written?;
+        self.counts.lock().await.parked += 1;
+        Ok(Some(n))
+    }
+
+    /// Put parked state into a node's cache.
+    async fn restore_state(&self, to: &str, path: &Path) -> Result<u64> {
+        use tokio::io::AsyncReadExt;
+        let f = tokio::fs::File::open(path).await?;
+        let len = f.metadata().await?.len();
+        let stream = futures_util::stream::unfold(f, |mut f| async move {
+            let mut buf = vec![0u8; 8 << 20];
+            match f.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => { buf.truncate(n); Some((Ok::<_, std::io::Error>(bytes::Bytes::from(buf)), f)) }
+                Err(e) => Some((Err(e), f)),
+            }
+        });
+        let imp = self.xfer_client.post(format!("{to}/cache/import")).header("content-type", "application/octet-stream")
+            .header("content-length", len).body(reqwest::Body::wrap_stream(stream)).send().await?;
+        if !imp.status().is_success() {
+            bail!("import answered {}: {}", imp.status(), imp.text().await.unwrap_or_default().chars().take(200).collect::<String>());
+        }
+        Ok(len)
+    }
+
     /// Run one chat completion for a thread. `home` is the node that served its last turn.
     pub async fn chat(&self, home: Option<&str>, body: &Value) -> Result<Turn, ChatError> {
+        self.chat_restoring(home, body, None).await
+    }
+
+    /// `chat`, first putting the thread's parked state (if any) into the node the turn is placed on.
+    pub async fn chat_restoring(&self, home: Option<&str>, body: &Value, parked: Option<&Path>) -> Result<Turn, ChatError> {
         let tokens = (serde_json::to_vec(body).map(|b| b.len()).unwrap_or(0) / 4) as u64;
         let mut avoid = Vec::new();
         let total = self.cfg.nodes.len();
@@ -286,7 +351,20 @@ impl Router {
                 let nodes = self.nodes.lock().await;
                 (nodes[i].url.clone(), from.map(|f| nodes[f].url.clone()))
             };
-            if let Some(f) = &from_url {
+            if let Some(p) = parked.filter(|_| avoid.is_empty()) {
+                // the parked copy is what the thread's node had when it went quiet: it serves on any node
+                let t = Instant::now();
+                match self.restore_state(&url, p).await {
+                    Ok(n) => {
+                        self.counts.lock().await.restored += 1;
+                        tracing::info!("parked state ({:.1} GB) restored into {url} in {:.1}s", n as f64 / 1e9, t.elapsed().as_secs_f64());
+                    }
+                    Err(e) => {
+                        self.counts.lock().await.restore_failed += 1;
+                        tracing::warn!("restoring parked state into {url} failed ({e}); it reads the prompt itself");
+                    }
+                }
+            } else if let Some(f) = &from_url {
                 let t = Instant::now();
                 match self.move_state(f, &url, body).await {
                     Ok(true) => tracing::info!("thread moved {f} -> {url} with its cache in {:.1}s", t.elapsed().as_secs_f64()),

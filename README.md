@@ -88,6 +88,19 @@ shorter turn. With `grant_cmd` set (for example `["pod-worker", "may", "{node}",
 node's command runs every `grant_check_s` seconds; while it exits 1 the node is held: it gets no new, spilled or
 moved threads, and a thread living there leaves at its next turn, with its state when the node can export it.
 
+**Parking.** A node's prompt cache spills to its own disk, but that tier is small: the drive is shared with
+weights and the cache caps its writes an hour, so under memory pressure a sleeper's state is dropped and its next
+turn reads the whole prompt again (on the pod on 2026-11-07, 12 of 621 resumes on one node came from disk). With
+`park` (on) the daemon keeps quiet threads' state itself: `POST /cache/export` on the thread's node, with its last
+request as the body, writes `<park_dir>/<thread>.kv` (default `<data_dir>/parked`), and the next turn first
+`POST /cache/import`s that file into whichever node it is placed on. A thread is parked at once when it sleeps at
+least `park_after_s` (300) or waits on events with nothing else out, and after `park_after_s` when a tool call is
+out or its turn ended with nothing pending, if no turn ran in between. A shorter sleep is never parked: the node
+still has it. Files are written under a temporary name and renamed; a turn that runs removes its thread's file,
+deleting a thread removes it, and the oldest files go past `park_max_gib` (64). On because the node's own disk
+tier was measured failing on the pod; a node without cache transfer answers the export with an error and nothing
+is parked. `/health` counts `parked`, `park_missed` (the node held nothing), `restored` and `restore_failed`.
+
 **Tools.** Each server in `tool_servers` publishes `/.well-known/rap-toolset`; the manifests are read at start and
 every `toolset_refresh_s`, and the last one read is kept for a server that is down. An invocation is posted to the
 manifest's endpoint after its slice committed; one the server does not acknowledge is posted again with a growing
@@ -217,9 +230,8 @@ recompute once in some thirty turns.
 `/data/pod/freefitty`. It is an enabled unit, not a transient one, so pod-mem-guard never takes it for an idle
 stray. pod-ff and pod-hands speak this API as they spoke freefinity's: `/data/pod/freefitty/.env` carries
 `FREEFINITY_PORT`, `BRIDGE_TOKEN` (the operator token) and `CALLBACK_TOKEN` for them, and their units set `FF_STACK`
-to that directory. pod-ff reads thread sizes and last turns from `/threads` and prunes with `DELETE`. A second
-daemon with its own config and port serves the Isekai'd director rounds; nothing is shared between daemons but the
-nodes.
+to that directory. pod-ff reads thread sizes and last turns from `/threads` and prunes with `DELETE`. The Isekai'd
+director rounds run on the same daemon under thread ids starting `isk-`.
 
 Upgrading: build on a machine with the pod's glibc or older, copy the binary over, `install` it, and
 `systemctl --user restart freefitty`; running slices finish first, and a turn that was waiting re-queues. Keep the
@@ -269,7 +281,9 @@ budget, the notice carrying the first message, the cut point holding across turn
 text within the slice, and the replay agreeing with the live run; old results paging out in a batch as handles, an
 error result staying, and a recalled result pinned back in full; a node's count correcting a wrong estimate so
 the turn runs; a full context closing a thread that has nothing to cut; a wait for a node slot longer than the
-slice timeout that is not a failure; and a tool's images reaching the model. `FREEFITTY_NODES=http://a:5300,http://b:5300
+slice timeout that is not a failure; a tool's images reaching the model; and a sleeper parked and its exact bytes
+restored into the node when it wakes, nothing parked when the node holds nothing, and its file removed with the
+thread. `FREEFITTY_NODES=http://a:5300,http://b:5300
 cargo test --test real_nodes -- --ignored` proves the cache move on two real strixite nodes.
 
 ## License

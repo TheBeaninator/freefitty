@@ -353,6 +353,7 @@ async fn delete_thread(State(app): Shared, headers: HeaderMap, Path(id): Path<St
     if let Err(r) = operator(&app, &headers) { return *r; }
     if app.queue.is_inflight(&id) { return err(StatusCode::CONFLICT, "a slice of this thread is running; try again when it has committed"); }
     app.queue.forget_thread(&id);
+    if let Some(p) = &app.engine.parking { p.forget(&id); }
     match app.store.delete_thread(&id) {
         Ok(()) => Json(json!({"deleted": id})).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),

@@ -31,6 +31,21 @@ pub struct Config {
     /// Move longer threads between nodes with their cached state (strixite cache-xfer = on).
     #[serde(default = "d_true")]
     pub move_threads: bool,
+    /// Park a quiet thread's cached state on this host's disk and put it back into the node that runs its next
+    /// turn (strixite cache-xfer = on). A node's own disk tier is small and capped, so a sleeper's state is
+    /// otherwise often dropped and its next turn reads the whole prompt again.
+    #[serde(default = "d_true")]
+    pub park: bool,
+    /// Where parked state goes; unset = `<data_dir>/parked`.
+    #[serde(default)]
+    pub park_dir: Option<PathBuf>,
+    /// A thread sleeping at least this long is parked at once; one with a tool call out, or done with nothing
+    /// pending, is parked after this long if nothing came in.
+    #[serde(default = "d_park_after")]
+    pub park_after_s: u64,
+    /// The park directory's cap; the oldest files go first.
+    #[serde(default = "d_park_gib")]
+    pub park_max_gib: u64,
     /// A command that says whether a node may take work now, run every `grant_check_s` per node with `{node}`
     /// replaced by its URL: exit 1 = held (no new, spilled or moved threads; a thread living there leaves at its
     /// next turn), anything else = free. Empty = every node is free.
@@ -148,6 +163,8 @@ fn d_model() -> String { "qwen3.8-flash-next".into() }
 fn d_slots() -> u32 { 2 }
 fn d_spill() -> u64 { 16_384 }
 fn d_true() -> bool { true }
+fn d_park_after() -> u64 { 300 }
+fn d_park_gib() -> u64 { 64 }
 fn d_keep_images() -> usize { 4 }
 fn d_grant_check() -> u64 { 5 }
 fn d_toolset_refresh() -> u64 { 300 }
