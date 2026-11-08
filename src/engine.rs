@@ -60,6 +60,8 @@ pub enum Outcome {
 }
 
 const UNKNOWN_TOOL_ROUNDS: usize = 3;
+/// Turns cut off at the output limit with no whole tool call that a slice answers with a note and goes on.
+const CUT_OFF_ROUNDS: usize = 2;
 
 pub fn tokens(v: &[Value]) -> u64 {
     v.iter().map(window::weigh).sum()
@@ -308,6 +310,7 @@ impl Engine {
         let mut invocations: Vec<Invocation> = Vec::new();
         let mut rounds = 0;
         let mut recut = false;
+        let mut cut_off = 0;
         let mut waits_for_event = false;
         let mut restore = self.parking.as_ref().and_then(|p| p.has(thread));
         // a thread born from an expert, with no node holding it yet: the expert's frozen state goes into whichever
@@ -380,6 +383,20 @@ impl Engine {
                     if !reply_text.is_empty() { reply_text.push('\n'); }
                     reply_text.push_str(t.trim());
                 }
+            }
+            // cut off at the output limit with no whole tool call: the model was acting (a file too long for one
+            // reply, usually), so the text is not its answer and the slice must not end on it (a goldfish would
+            // answer with it, and its elephant wait on a call that never comes). Say so and let it go on.
+            if calls.is_empty() && turn.finish_reason.as_deref() == Some("length") && cut_off < CUT_OFF_ROUNDS {
+                cut_off += 1;
+                tracing::warn!("{thread}: the reply hit the output limit ({} tokens) with no whole tool call; asking it to go on in smaller calls", self.cfg.max_output_tokens);
+                let note = json!({"role": "user", "content": format!("[FreeFitty] Your reply reached the output limit ({} tokens) and was cut off; a tool call in it was lost. Go on from where you were, keeping each tool call well under the limit: write a long file in parts (write_file the first part, then add the rest with further calls).", self.cfg.max_output_tokens)});
+                new_messages.push(note.clone());
+                let mut msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                msgs.push(assistant);
+                msgs.push(note);
+                body["messages"] = Value::Array(msgs);
+                continue;
             }
             let mut unknown = Vec::new();
             let mut recalled: Vec<(Call, String)> = Vec::new();

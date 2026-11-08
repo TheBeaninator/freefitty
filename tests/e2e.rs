@@ -77,6 +77,15 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
             return (axum::http::StatusCode::OK, Json(json!({"choices": [{"message": message}], "usage": {"prompt_tokens": 1}})));
         }
     }
+    if last["role"] == "user" && (content.starts_with("cutoff") || content.starts_with("[FreeFitty] Your reply reached the output limit")) {
+        // a write_file call too long for the output limit: cut off twice, then written in parts
+        let notes = msgs.iter().filter(|m| m["content"].as_str().is_some_and(|c| c.starts_with("[FreeFitty] Your reply reached"))).count();
+        let forever = msgs.iter().any(|m| m["content"].as_str() == Some("cutoff forever"));
+        if notes < 2 || forever {
+            return (axum::http::StatusCode::OK, Json(json!({"choices": [{"message": {"role": "assistant", "content": format!("writing the file ({notes})")}, "finish_reason": "length"}], "usage": {"prompt_tokens": 100}})));
+        }
+        return (axum::http::StatusCode::OK, Json(json!({"choices": [{"message": {"role": "assistant", "content": format!("wrote it in parts after {notes} notes")}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 100}})));
+    }
     let shown: Vec<String> = last["content"].as_array().into_iter().flatten()
         .filter_map(|p| p.pointer("/image_url/url").and_then(|u| u.as_str()).map(str::to_owned)).collect();
     let gf_call = |expert: &str, q: &str| json!({"role": "assistant", "content": null, "tool_calls": [{"id": format!("call_g{}", msgs.len()), "type": "function", "function": {"name": "goldfish", "arguments": json!({"expert": expert, "question": q}).to_string()}}]});
@@ -1178,5 +1187,24 @@ async fn a_stop_does_not_wait_for_turns_still_queued_for_a_slot() {
     assert!(api.get("/dlq").await.as_array().unwrap().is_empty());
     let m = reqwest::get(format!("{}/metrics", api.base)).await.unwrap().text().await.unwrap();
     assert!(!m.contains("outcome=\"transient\""), "a stop is not a failure: {m}");
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_cut_off_mid_call_goes_on_in_the_same_slice() {
+    let h = harness().await;
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    // cut off twice, told so each time, then written in parts: one slice, three model calls
+    api.say("cutoff", Some("thread-cut")).await;
+    let out = api.output("thread-cut", 10).await.expect("a reply");
+    let text = out["text"].as_str().unwrap();
+    assert!(text.contains("writing the file (0)") && text.ends_with("wrote it in parts after 2 notes"), "{out}");
+    assert_eq!(h.model.calls.load(Ordering::Relaxed), 3);
+    // a model that never fits gets two notes, then the slice ends on its text as before
+    api.say("cutoff forever", Some("thread-cut2")).await;
+    let out = api.output("thread-cut2", 10).await.expect("a reply");
+    assert!(out["text"].as_str().unwrap().ends_with("writing the file (2)"), "{out}");
+    assert_eq!(h.model.calls.load(Ordering::Relaxed), 6);
     r.shutdown().await;
 }
