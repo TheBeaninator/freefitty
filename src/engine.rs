@@ -31,6 +31,17 @@ pub struct Engine {
     pub scale_hint: std::sync::atomic::AtomicU64,
     /// Where quiet threads' cached state is parked (`park`); None = off.
     pub parking: Option<Arc<crate::park::Parking>>,
+    /// Threads with a slice running (waiting for a slot counts): never parked mid-turn.
+    pub running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// Marks a thread as running for as long as it lives.
+struct Running(Arc<std::sync::Mutex<std::collections::HashSet<String>>>, String);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().remove(&self.1);
+    }
 }
 
 pub enum Outcome {
@@ -124,6 +135,8 @@ pub fn live_view(prefix: &[Value], meta: &ThreadMeta, history: &[Value], pending
 
 impl Engine {
     pub async fn slice(&self, thread: &str, batch: &[(u64, Event)]) -> Outcome {
+        self.running.lock().unwrap().insert(thread.to_owned());
+        let _running = Running(self.running.clone(), thread.to_owned());
         match self.run(thread, batch).await {
             Ok(o) => o,
             Err(e) => Outcome::Transient(format!("store: {e:#}")),
@@ -276,8 +289,7 @@ impl Engine {
         let mut rounds = 0;
         let mut recut = false;
         let mut waits_for_event = false;
-        let parked = self.parking.as_ref().and_then(|p| p.has(thread));
-        let mut restore = parked.clone();
+        let mut restore = self.parking.as_ref().and_then(|p| p.has(thread));
         loop {
             rounds += 1;
             let r = restore.take();
@@ -435,8 +447,9 @@ impl Engine {
         let node = meta.node.clone();
         self.store.commit(Commit { thread, meta, messages: new_messages, done, done_ids, replies, events, invocations })?;
         if let Some(p) = &self.parking {
-            // the node's cache is newer than any parked copy from here on
-            if parked.is_some() { p.forget(thread); }
+            // the node's cache is newer than any parked copy from here on, including one whose write began
+            // before this slice and ended during it
+            p.forget(thread);
             if let (Some(node), Some(delay)) = (node, park_in) {
                 self.park_later(thread, node, body, delay);
             }
@@ -448,8 +461,11 @@ impl Engine {
     /// request: the node's entry for it is the newest state it holds for this thread.
     fn park_later(&self, thread: &str, node: String, body: Value, delay_ms: u64) {
         let (Some(park), Ok(Some(m))) = (self.parking.clone(), self.store.thread(thread)) else { return };
-        let (router, store, thread, stamp) = (self.router.clone(), self.store.clone(), thread.to_owned(), m.updated_ms);
-        let unchanged = move |store: &Store, thread: &str| matches!(store.thread(thread), Ok(Some(m)) if m.updated_ms == stamp);
+        let (router, store, thread, stamp, running) = (self.router.clone(), self.store.clone(), thread.to_owned(), m.updated_ms, self.running.clone());
+        // no turn committed since, and none running now (a turn waiting for a slot would never read the copy)
+        let unchanged = move |store: &Store, thread: &str| {
+            !running.lock().unwrap().contains(thread) && matches!(store.thread(thread), Ok(Some(m)) if m.updated_ms == stamp)
+        };
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             if !unchanged(&store, &thread) { return; }

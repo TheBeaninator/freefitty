@@ -70,7 +70,7 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
         tracing::info!("parking sleepers' cached state in {} ({} GiB parked now, cap {} GiB)", dir.display(), p.bytes() >> 30, cfg.park_max_gib);
         Some(Arc::new(p))
     } else { None };
-    let engine = Arc::new(engine::Engine { cfg: cfg.clone(), store: store.clone(), router: router.clone(), tools: tools.clone(), system, compact_prompt, callback_url: cfg.callback_url(), scale_hint: std::sync::atomic::AtomicU64::new(0), parking });
+    let engine = Arc::new(engine::Engine { cfg: cfg.clone(), store: store.clone(), router: router.clone(), tools: tools.clone(), system, compact_prompt, callback_url: cfg.callback_url(), scale_hint: std::sync::atomic::AtomicU64::new(0), parking, running: Default::default() });
     let replies = Arc::new(Notify::new());
 
     // the dispatcher's failures become events; the queue is built after it, so it reaches the queue through a slot

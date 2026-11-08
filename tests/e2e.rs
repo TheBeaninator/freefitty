@@ -799,6 +799,11 @@ async fn a_sleeper_is_parked_and_its_state_restored_on_waking() {
     api.output(&t2, 10).await.expect("the reply after waking");
     assert_eq!(h.model.imports.lock().unwrap().len(), 1);
     assert!(!parked.join(format!("{t2}.kv")).exists());
+    // a copy that lands while a turn runs is stale once the turn commits: the commit removes it
+    std::fs::write(parked.join(format!("{t2}.kv")), b"stale").unwrap();
+    api.say("hello", Some(&t2)).await;
+    assert_eq!(api.output(&t2, 10).await.expect("a reply")["text"], "hi: hello");
+    assert!(!parked.join(format!("{t2}.kv")).exists());
 
     // deleting a thread removes its parked state
     std::fs::write(parked.join(format!("{t}.kv")), b"x").unwrap();

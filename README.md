@@ -95,8 +95,8 @@ turn reads the whole prompt again (on the pod on 2026-11-07, 12 of 621 resumes o
 request as the body, writes `<park_dir>/<thread>.kv` (default `<data_dir>/parked`), and the next turn first
 `POST /cache/import`s that file into whichever node it is placed on. A thread is parked at once when it sleeps at
 least `park_after_s` (300) or waits on events with nothing else out, and after `park_after_s` when a tool call is
-out or its turn ended with nothing pending, if no turn ran in between. A shorter sleep is never parked: the node
-still has it. Files are written under a temporary name and renamed; a turn that runs removes its thread's file,
+out or its turn ended with nothing pending, if no turn ran in between and none is running or waiting for a slot. A shorter sleep is never parked: the node
+still has it. Files are written under a temporary name and renamed; a turn that commits removes its thread's file,
 deleting a thread removes it, and the oldest files go past `park_max_gib` (64). On because the node's own disk
 tier was measured failing on the pod; a node without cache transfer answers the export with an error and nothing
 is parked. `/health` counts `parked`, `park_missed` (the node held nothing), `restored` and `restore_failed`.
