@@ -20,6 +20,11 @@ struct FakeModel {
     imports: std::sync::Mutex<Vec<Vec<u8>>>,
     /// the next export answers an older, shorter entry, as strixite does while a turn's entries are being saved
     short_first: AtomicBool,
+    /// what /cache/probe says the node holds (u64::MAX: the route does not exist), GET /steer's answer, and
+    /// whether a steered request is refused (no such vector)
+    probe_tokens: std::sync::atomic::AtomicU64,
+    steer_list: std::sync::Mutex<Option<Value>>,
+    refuse_steer: AtomicBool,
 }
 
 async fn health(State(m): State<Arc<FakeModel>>) -> Json<Value> {
@@ -37,6 +42,9 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
     }
     let msgs = body["messages"].as_array().cloned().unwrap_or_default();
     assert_eq!(msgs[0]["role"], "system");
+    if body.get("steer").is_some() && m.refuse_steer.load(Ordering::Relaxed) {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": {"message": "steer[0]: no vector named 'villain24' (0 loaded)", "param": "steer"}})));
+    }
     let last = msgs.last().cloned().unwrap_or(Value::Null);
     let content = last["content"].as_str().unwrap_or("").to_owned();
     if content.starts_with("wall") && msgs.len() > 6 {
@@ -88,7 +96,7 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
     } else if content == "askbad" {
         gf_call("nobody", "x")
     } else if let Some(n) = content.strip_prefix("commission ").filter(|_| last["role"] == "user") {
-        json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_m", "type": "function", "function": {"name": "commission_expert", "arguments": json!({"name": n, "description": "knows rail two", "reads": [{"text": "C is .52"}], "tools": ["echo", "goldfish"]}).to_string()}}]})
+        json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_m", "type": "function", "function": {"name": "commission_expert", "arguments": json!({"name": n, "description": "knows rail two", "reads": [{"text": "C is .52"}], "tools": ["echo", "goldfish"], "steer": if n.starts_with("persona") { json!([{"vector": "villain24", "scale": 6.0}]) } else { json!([]) }}).to_string()}}]})
     } else if !shown.is_empty() {
         // a tool's images arrive as a user message after its result: say what was seen and what came before
         let before = &msgs[msgs.len() - 2];
@@ -125,6 +133,36 @@ async fn export(State(m): State<Arc<FakeModel>>) -> axum::response::Response {
         Some(b) => ([("x-cache-tokens", if m.short_first.swap(false, Ordering::Relaxed) { "10" } else { "100" })], b).into_response(),
         None => axum::http::StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+async fn probe(State(m): State<Arc<FakeModel>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match m.probe_tokens.load(Ordering::Relaxed) {
+        u64::MAX => axum::http::StatusCode::NOT_FOUND.into_response(),
+        n => Json(json!({"tokens": n, "ram": true})).into_response(),
+    }
+}
+
+async fn steer_list(State(m): State<Arc<FakeModel>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match m.steer_list.lock().unwrap().clone() {
+        Some(v) => Json(v).into_response(),
+        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// A saved state file in strixite's prompt cache layout: one entry of `n` tokens.
+fn kv_file(n: u64) -> Vec<u8> {
+    let state = 64usize;
+    let state_at = (4096 + n as usize * 4).div_ceil(4096) * 4096;
+    let mut f = vec![0u8; state_at + state];
+    f[..8].copy_from_slice(b"STRXPCCH");
+    f[8..12].copy_from_slice(&2u32.to_le_bytes());
+    f[12..16].copy_from_slice(&2u32.to_le_bytes());
+    f[16..24].copy_from_slice(&n.to_le_bytes());
+    f[24..32].copy_from_slice(&(state as u64).to_le_bytes());
+    f[32..40].copy_from_slice(&(state_at as u64).to_le_bytes());
+    f
 }
 
 async fn import(State(m): State<Arc<FakeModel>>, body: bytes::Bytes) -> Json<Value> {
@@ -180,8 +218,8 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
-    let model = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(0), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false) });
-    let model_url = serve(Router::new().route("/health", get(health)).route("/v1/chat/completions", post(completions)).route("/cache/export", post(export)).route("/cache/import", post(import)).with_state(model.clone())).await;
+    let model = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(0), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false), probe_tokens: std::sync::atomic::AtomicU64::new(u64::MAX), steer_list: std::sync::Mutex::new(None), refuse_steer: AtomicBool::new(false) });
+    let model_url = serve(Router::new().route("/health", get(health)).route("/v1/chat/completions", post(completions)).route("/cache/export", post(export)).route("/cache/import", post(import)).route("/cache/probe", post(probe)).route("/steer", get(steer_list)).with_state(model.clone())).await;
     let tools = Arc::new(FakeTools { base: String::new(), invocations: AtomicUsize::new(0) });
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let tools_url = format!("http://{}", l.local_addr().unwrap());
@@ -983,5 +1021,60 @@ async fn a_steered_expert_steers_every_request_of_its_threads() {
     api.say("catalog", Some("sc")).await;
     let out = api.output("sc", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
     assert!(out.contains("- villain: a villain (no tools as a goldfish; steered: villain24 x6.0)"), "{out}");
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_that_holds_the_state_is_not_sent_it_again() {
+    let mut h = harness().await;
+    h.cfg.park_after_s = 0;
+    *h.model.kv.lock().unwrap() = Some(kv_file(100));
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    // the node says it holds all 100 tokens the parked copy covers: nothing is sent
+    h.model.probe_tokens.store(100, Ordering::Relaxed);
+    let t = api.say("sleep please", None).await["thread"].as_str().unwrap().to_owned();
+    api.output(&t, 10).await.expect("the tool call line");
+    api.output(&t, 10).await.expect("the reply after waking");
+    assert_eq!(h.model.imports.lock().unwrap().len(), 0);
+    assert_eq!(api.get("/health").await["router"]["restore_skipped"], 1);
+    // it holds less: the copies go (the one parked after the last turn, then the one parked for this sleep)
+    h.model.probe_tokens.store(50, Ordering::Relaxed);
+    api.say("sleep again", Some(&t)).await;
+    api.output(&t, 10).await.expect("the tool call line");
+    api.output(&t, 10).await.expect("the reply after waking");
+    assert_eq!(h.model.imports.lock().unwrap().len(), 2);
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commissioned_persona_is_checked_before_it_exists() {
+    let mut h = harness().await;
+    let dir = tempfile::tempdir().unwrap();
+    h.cfg.experts_dir = Some(dir.path().to_path_buf());
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    // steered commissions are off until measured; the fake elephant asks with steer
+    api.say("commission persona1", Some("ce")).await;
+    let out = api.output("ce", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.contains("cannot be steered yet"), "{out}");
+    assert!(!dir.path().join("persona1.toml").exists());
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_refusing_a_threads_steering_closes_it_at_once() {
+    let mut h = harness().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("villain.toml"), "description = \"v\"\nack = \"Read.\"\n[[reads]]\ntext = \"x\"\n[[steer]]\nvector = \"villain24\"\nscale = 6.0\n").unwrap();
+    h.cfg.experts_dir = Some(dir.path().to_path_buf());
+    h.model.refuse_steer.store(true, Ordering::Relaxed);
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.post("/say", json!({"text": "hello", "thread": "rv", "expert": "villain"})).await;
+    let out = api.output("rv", 10).await.unwrap();
+    assert!(out["text"].as_str().unwrap().contains("refuses this thread's steering"), "{out}");
+    assert!(api.get("/threads/rv").await["closed"].as_str().unwrap().contains("steering"));
+    assert!(api.get("/dlq").await.as_array().unwrap().iter().all(|e| e["thread"] != "rv" || e["attempts"].as_u64().unwrap() <= 1), "not retried");
     r.shutdown().await;
 }

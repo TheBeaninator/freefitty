@@ -96,11 +96,17 @@ turn reads the whole prompt again (on the pod on 2026-11-07, 12 of 621 resumes o
 request as the body, writes `<park_dir>/<thread>.kv` (default `<data_dir>/parked`), and the next turn first
 `POST /cache/import`s that file into whichever node it is placed on. A thread is parked at once when it sleeps at
 least `park_after_s` (300) or waits on events with nothing else out, and after `park_after_s` when a tool call is
-out or its turn ended with nothing pending, if no turn ran in between and none is running or waiting for a slot. A shorter sleep is never parked: the node
-still has it. Files are written under a temporary name and renamed; a turn that commits removes its thread's file,
+out or its turn ended with nothing pending, if no turn ran in between and none is running or waiting for a slot.
+A shorter sleep is never parked: the node still has it, and neither is a closed thread. The request the export is
+sent with is rebuilt from the store when the park fires, so a sleeper holds nothing in memory meanwhile, and an
+export that comes back shorter than the thread's last prompt (an older entry) is not kept. Before a restore the
+daemon asks the node how much of the conversation it already holds (strixite `POST /cache/probe`); a node holding
+at least what the file covers is sent nothing (`restore_skipped`), which saves up to gigabytes over the rail when a
+thread wakes on the node it slept on. Files are written under a temporary name and renamed; a turn that commits removes its thread's file,
 deleting a thread removes it, and the oldest files go past `park_max_gib` (64). On because the node's own disk
 tier was measured failing on the pod; a node without cache transfer answers the export with an error and nothing
-is parked. `/health` counts `parked`, `park_missed` (the node held nothing), `restored` and `restore_failed`.
+is parked. `/health` counts `parked`, `park_missed` (the node held nothing), `restored`, `restore_skipped` and
+`restore_failed`.
 
 **Tools.** Each server in `tool_servers` publishes `/.well-known/rap-toolset`; the manifests are read at start and
 every `toolset_refresh_s`, and the last one read is kept for a server that is down. An invocation is posted to the
@@ -115,7 +121,10 @@ however close together. A result for a call the thread no longer waits on is sai
 after the batch's tool messages one user message per result shows them as `image_url` parts, so a strixite node
 with vision on sees them. A remote image URL is named in the text and not sent (a node asked to fetch it could be
 pointed anywhere). Each image counts as 1400 tokens in the estimate, not its base64 bytes, and a request shows only
-the newest `keep_images` (4) as pictures; older ones become a line saying they left the view. The callback body
+the newest `keep_images` (4) as pictures; older ones become a line saying they left the view. The line moves only at
+the view's named events (a cut, a paging batch, a refocus): between them a new image never turns an older one into a
+stub at an old position, so images are shown beyond four until the next event rather than breaking the prefix on
+every image-bearing turn. The callback body
 limit (`max_body_bytes`) bounds what a tool can send, so a tool should downscale before it posts.
 
 **API** (`listen`, loopback by default; a front door with TLS is Caddy's or a wireguard peer's job):
@@ -160,7 +169,12 @@ model's own words; a result whose call left the view gets a stub call so the tem
 every result. The view opens with a `[Paged.]` notice that names the range that left, copies the user messages
 among it in short, and says how to get any of it back: the `recall` tool returns stored messages by index, exactly
 as written, answered from the store within the same slice (a fault costs one more model pass, no tool round trip,
-at most 16 KiB a call). On because it is the guard against the wall and does nothing until a thread reaches it; the
+at most 16 KiB a call). The recalled text is appended to the history as the call's result, never re-inserted at
+its old position, so a fault-in costs no recompute of the prefix: the view stays the bytes the node already holds,
+plus the answer. That, more than anything, is the case for the window and recall over a refocus, which writes new
+head bytes and pays a prefill. A recalled message below the window's start is pinned; at the next cut it becomes
+resident, shown in the notice region (exact text, newest 32, 16 KiB) until the cut after, so a fact recalled
+again and again is held once instead of appended each time. On because it is the guard against the wall and does nothing until a thread reaches it; the
 day it shipped, six live threads were past 150k tokens and three had hit the wall. `window = false`
 turns it off.
 
@@ -198,7 +212,17 @@ text = "The board is /data/pod/kanban.db."
 An expert may also be a persona: `[[steer]] vector = "villain24", scale = 6.0, layer = 24` (layer optional) names
 activation-steering vectors the nodes hold (strixite `steer-dir`). Every request of a thread born from it carries
 them as strixite's `steer`, its freeze reads it steered, and the steering is part of its version, since the nodes
-cache steered state under its own key; a node without the vectors refuses such a turn.
+cache steered state under its own key. The expert is then the bundle of everything two threads must share to share
+cache: prompt bytes, tool list, steering. A node refusing the steering (no such vector) closes the thread at once
+rather than retrying. Refocus runs unsteered: its notes are stored text the thread will believe, so memory stays
+separate from voice and a later freeze of those notes bakes in no persona (the price: that one request reads the
+view without the steered cache). Steering touches every token, tool-call JSON included, so `commission_expert` may
+not steer (`commission_steer`, off) until a steered goldfish has been measured against a plain one for verdict
+agreement and malformed calls; once on, a commission's scale is bounded by `max_steer_scale` (8) and its vector
+names are checked against what a node lists (strixite `GET /steer`). Steering is a composition barrier: experts
+under different steering have different cache keys and cannot be spliced. The vectors are the one durable source
+that is not in the transcript: a reader of the store cannot rebuild a steered view without the steer-dir, so the
+vectors must be kept like the store.
 
 Freezing reads it once on one node and exports that node's state at the end of the acknowledgement (strixite's
 checkpoint at the start of the next user message) into `<data_dir>/experts/<name>@<hash>-<context>.kv`. strixite

@@ -75,6 +75,25 @@ impl Parking {
     }
 }
 
+/// How many tokens a saved state file covers: the last entry's count (a file is one entry, or a base then its
+/// delta, in strixite's prompt cache layout: n at byte 16, state size at 24, state offset at 32 of each header).
+pub fn tokens_in(path: &Path) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let (mut off, mut n) = (0u64, None);
+    while off + 40 <= len {
+        let mut h = [0u8; 40];
+        f.seek(SeekFrom::Start(off)).ok()?;
+        f.read_exact(&mut h).ok()?;
+        if &h[..8] != b"STRXPCCH" { return None; }
+        let u = |a: usize| u64::from_le_bytes(h[a..a + 8].try_into().unwrap());
+        n = Some(u(16));
+        off += u(32) + u(24);
+    }
+    n
+}
+
 /// The temporary name a parked file is written under.
 pub fn part_path(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();

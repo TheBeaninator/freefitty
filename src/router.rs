@@ -60,6 +60,7 @@ pub struct Counts {
     pub park_missed: u64,
     pub restored: u64,
     pub restore_failed: u64,
+    pub restore_skipped: u64,
     pub waited: u64,
     pub broken: u64,
 }
@@ -285,7 +286,14 @@ impl Router {
     /// Copy a thread's cached state from its node into `path` (written beside it and renamed); the bytes
     /// written, or None when the node holds nothing for this conversation.
     pub async fn park_state(&self, from: &str, body: &Value, path: &Path, min_tokens: u64) -> Result<Option<u64>> {
-        let r = self.save_state_covering(from, body, path, min_tokens).await?.map(|(n, _)| n);
+        let mut r = self.save_state_covering(from, body, path, min_tokens).await?;
+        if let Some((_, covered)) = r.filter(|&(_, c)| c < min_tokens) {
+            // a shorter entry (the system prompt's) is not this thread's state: worth nothing parked
+            tracing::info!("{from}: the export covered {covered} of the {min_tokens} tokens wanted; not parked");
+            let _ = tokio::fs::remove_file(path).await;
+            r = None;
+        }
+        let r = r.map(|(n, _)| n);
         let mut c = self.counts.lock().await;
         if r.is_some() { c.parked += 1 } else { c.park_missed += 1 }
         Ok(r)
@@ -338,6 +346,25 @@ impl Router {
         Ok(Some((written?, tokens)))
     }
 
+    /// How many tokens of this request's prompt a node's prompt cache holds (strixite POST /cache/probe); None when
+    /// the node cannot say (an older strixite), so the caller sends the state.
+    async fn probe(&self, url: &str, body: &Value) -> Option<u64> {
+        let r = self.xfer_client.post(format!("{url}/cache/probe")).json(body).timeout(Duration::from_secs(10)).send().await.ok()?;
+        if !r.status().is_success() { return None; }
+        r.json::<Value>().await.ok()?.get("tokens")?.as_u64()
+    }
+
+    /// The steering vectors a node holds (strixite GET /steer): name -> layer; None when it cannot say.
+    pub async fn steer_vectors(&self) -> Option<std::collections::HashMap<String, i64>> {
+        for url in self.up_nodes().await {
+            let Ok(r) = self.client.get(format!("{url}/steer")).timeout(Duration::from_secs(5)).send().await else { continue };
+            if !r.status().is_success() { continue; }
+            let v: Value = r.json().await.ok()?;
+            return Some(v.get("vectors")?.as_array()?.iter().filter_map(|x| Some((x.get("name")?.as_str()?.to_owned(), x.get("layer")?.as_i64()?))).collect());
+        }
+        None
+    }
+
     /// Put saved state (a parked thread's, a frozen expert's) into a node's cache; the bytes sent.
     pub async fn load_state(&self, to: &str, path: &Path) -> Result<u64> {
         use tokio::io::AsyncReadExt;
@@ -378,9 +405,17 @@ impl Router {
                 (nodes[i].url.clone(), from.map(|f| nodes[f].url.clone()))
             };
             if let Some(p) = parked.filter(|_| avoid.is_empty()) {
-                // saved state (a parked thread's, or the frozen expert a new thread is born from) serves on any node
+                // saved state (a parked thread's, or the frozen expert a new thread is born from) serves on any node;
+                // a node that already holds at least as much of this conversation (probe) gets nothing sent
                 let t = Instant::now();
-                match self.load_state(&url, p).await {
+                let have = crate::park::tokens_in(p);
+                let held = match have { Some(_) => self.probe(&url, body).await, None => None };
+                let skip = matches!((held, have), (Some(h), Some(w)) if h >= w);
+                if skip {
+                    let (h, want) = (held.unwrap_or(0), have.unwrap_or(0));
+                    self.counts.lock().await.restore_skipped += 1;
+                    tracing::info!("saved state {} not sent: {url} holds {h} tokens of it already ({want} saved)", p.file_name().and_then(|f| f.to_str()).unwrap_or(""));
+                } else { match self.load_state(&url, p).await {
                     Ok(n) => {
                         self.counts.lock().await.restored += 1;
                         tracing::info!("saved state {} ({:.1} GB) restored into {url} in {:.1}s", p.file_name().and_then(|f| f.to_str()).unwrap_or(""), n as f64 / 1e9, t.elapsed().as_secs_f64());
@@ -389,7 +424,7 @@ impl Router {
                         self.counts.lock().await.restore_failed += 1;
                         tracing::warn!("restoring saved state into {url} failed ({e}); it reads the prompt itself");
                     }
-                }
+                } }
             } else if let Some(f) = &from_url {
                 let t = Instant::now();
                 match self.move_state(f, &url, body).await {

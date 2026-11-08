@@ -31,8 +31,11 @@ pub struct Engine {
     pub scale_hint: std::sync::atomic::AtomicU64,
     /// Where quiet threads' cached state is parked (`park`); None = off.
     pub parking: Option<Arc<crate::park::Parking>>,
-    /// Threads with a slice running (waiting for a slot counts): never parked mid-turn.
-    pub running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Whether a slice of a thread is running (the queue's own record, waiting for a slot included); set once the
+    /// queue exists. A thread is never parked mid-turn.
+    pub inflight: Arc<std::sync::OnceLock<Box<dyn Fn(&str) -> bool + Send + Sync>>>,
+    /// This engine, for tasks that outlive a call (a park firing later); set once the engine is in its Arc.
+    pub me: std::sync::OnceLock<std::sync::Weak<Engine>>,
     pub experts: Arc<crate::experts::Experts>,
     /// Queues an event from outside a slice (a commissioned expert's result); set once the queue exists.
     pub deliver: Arc<std::sync::OnceLock<Box<dyn Fn(Event) + Send + Sync>>>,
@@ -43,14 +46,6 @@ fn text_for_elephant(msgs: &[Value]) -> String {
     msgs.iter().filter(|m| m["role"] == "assistant").filter_map(|m| m["content"].as_str()).map(str::trim).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n")
 }
 
-/// Marks a thread as running for as long as it lives.
-struct Running(Arc<std::sync::Mutex<std::collections::HashSet<String>>>, String);
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        self.0.lock().unwrap().remove(&self.1);
-    }
-}
 
 pub enum Outcome {
     Done,
@@ -120,7 +115,8 @@ pub fn live_view(prefix: &[Value], meta: &ThreadMeta, history: &[Value], pending
         v.push(notes);
     }
     if from > low {
-        v.push(json!({"role": "user", "content": window::notice(history, low, from)}));
+        let resident: Vec<u64> = meta.resident.iter().copied().filter(|&i| (i as usize) < from).collect();
+        v.push(json!({"role": "user", "content": format!("{}{}", window::notice(history, low, from), window::resident_text(history, &resident))}));
         if !stubs.is_empty() { v.push(json!({"role": "assistant", "content": "", "tool_calls": stubs.clone()})); stubs_placed = true; }
     }
     if !stubs.is_empty() && !stubs_placed {
@@ -143,8 +139,6 @@ pub fn live_view(prefix: &[Value], meta: &ThreadMeta, history: &[Value], pending
 
 impl Engine {
     pub async fn slice(&self, thread: &str, batch: &[(u64, Event)]) -> Outcome {
-        self.running.lock().unwrap().insert(thread.to_owned());
-        let _running = Running(self.running.clone(), thread.to_owned());
         match self.run(thread, batch).await {
             Ok(o) => o,
             Err(e) => Outcome::Transient(format!("store: {e:#}")),
@@ -161,6 +155,8 @@ impl Engine {
 
     async fn run(&self, thread: &str, batch: &[(u64, Event)]) -> anyhow::Result<Outcome> {
         let mut meta = self.store.thread(thread)?.unwrap_or_default();
+        // the view's named events: a cut, a paging batch, a refocus (images fade only at one of them)
+        let marks = (meta.window_from, meta.paged_before, meta.compactions.len());
         if let Some(why) = &meta.closed {
             return Ok(Outcome::Fatal(format!("thread is closed: {why}")));
         }
@@ -291,7 +287,10 @@ impl Engine {
         // ---- the model's turn --------------------------------------------------------------------
         let mut messages = view.clone();
         messages.extend(new_messages.iter().cloned());
-        window::fade_images(&mut messages, self.cfg.keep_images);
+        if marks != (meta.window_from, meta.paged_before, meta.compactions.len()) {
+            self.keep_newest_images(&mut meta, &history, &new_messages);
+        }
+        self.fade(&mut messages, &meta, &history);
         let sent_est = tokens(&messages);
         let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "max_tokens": self.cfg.max_output_tokens, "stream": false});
         if let Some(s) = self.steer_of(&meta) { body["steer"] = s; }
@@ -333,7 +332,8 @@ impl Engine {
                             if let Some((v, _)) = self.window_cut(thread, &mut meta, &prefix, &history, &pending_at_start, &new_messages, est).await {
                                 let mut msgs = v;
                                 msgs.extend(new_messages.iter().cloned());
-                                window::fade_images(&mut msgs, self.cfg.keep_images);
+                                self.keep_newest_images(&mut meta, &history, &new_messages);
+                                self.fade(&mut msgs, &meta, &history);
                                 body["messages"] = Value::Array(msgs);
                                 recut = true;
                                 rounds -= 1;
@@ -342,6 +342,10 @@ impl Engine {
                         }
                     }
                     return Ok(Outcome::Fatal(format!("context full: {e}")));
+                }
+                // a node refusing the thread's steering (no such vector, no steer-dir) refuses every retry the same
+                Err(ChatError::Rejected(e)) if body.get("steer").is_some() && e.contains("steer") => {
+                    return Ok(Outcome::Fatal(format!("the node refuses this thread's steering: {e}")));
                 }
                 Err(ChatError::Transient(e)) | Err(ChatError::Rejected(e)) => return Ok(Outcome::Transient(e)),
             };
@@ -518,10 +522,24 @@ impl Engine {
             p.forget(thread);
             // a closed thread (a goldfish that answered) never runs again: nothing to park
             if let (Some(node), Some(delay), false) = (node, park_in, closed) {
-                self.park_later(thread, node, body, delay, covered);
+                self.park_later(thread, node, delay, covered);
             }
         }
         Ok(Outcome::Done)
+    }
+
+    /// At a named event: images before the newest `keep_images` (counting this turn's) fade from now on.
+    fn keep_newest_images(&self, meta: &mut ThreadMeta, history: &[Value], new_messages: &[Value]) {
+        let total = window::count_images(history) + window::count_images(new_messages);
+        meta.images_kept_from = meta.images_kept_from.max(total.saturating_sub(self.cfg.keep_images as u64));
+    }
+
+    /// Stub the images the thread's fade mark says are out of view, in messages whose history part starts at the
+    /// view's start.
+    fn fade(&self, messages: &mut [Value], meta: &ThreadMeta, history: &[Value]) {
+        let low = meta.compactions.last().map(|c| c.from as usize).unwrap_or(0);
+        let from = (meta.window_from as usize).max(low).min(history.len());
+        window::fade_images_before(messages, window::count_images(&history[..from]), meta.images_kept_from);
     }
 
     /// The steering every request of this thread carries: its expert's (a thread born from a steered expert is
@@ -580,6 +598,23 @@ impl Engine {
         let tools: Vec<String> = a.get("tools").and_then(|t| t.as_array()).map(|t| t.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
         let steer: Vec<crate::experts::Steer> = serde_json::from_value(a.get("steer").cloned().unwrap_or(json!([])))
             .map_err(|e| anyhow::anyhow!("steer must be a list of {{vector, scale, layer?}}: {e}"))?;
+        if !steer.is_empty() {
+            if !self.cfg.commission_steer {
+                anyhow::bail!("commissioned experts cannot be steered yet (commission_steer is off until a steered goldfish is measured against a plain one); commission it without steer");
+            }
+            if let Some(s) = steer.iter().find(|s| !s.scale.is_finite() || s.scale.abs() > self.cfg.max_steer_scale) {
+                anyhow::bail!("steer scale {} for {} is over the limit of {}", s.scale, s.vector, self.cfg.max_steer_scale);
+            }
+            // checked now, against what the nodes hold: a wrong name would fail every goldfish of the expert later
+            match self.router.steer_vectors().await {
+                Some(held) => if let Some(s) = steer.iter().find(|s| !held.contains_key(&s.vector)) {
+                    let mut names: Vec<&String> = held.keys().collect();
+                    names.sort();
+                    anyhow::bail!("no node holds a steering vector named {:?}; they hold: {}", s.vector, names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", "));
+                },
+                None => anyhow::bail!("no node lists steering vectors (strixite steer-dir), so a steered expert could not run"),
+            }
+        }
         let e = crate::experts::commission(&self.cfg, name, a.get("description").and_then(|d| d.as_str()).unwrap_or(""), a.get("ack").and_then(|d| d.as_str()), &reads, rap::goldfish_tools(&tools), steer, thread)?;
         let key = self.experts.add(&self.store, &e).await?;
         tracing::info!("{thread}: commissioned expert {key}");
@@ -611,25 +646,24 @@ impl Engine {
                      kind: EventKind::ToolResult { call: g.call, provider_call_id: g.provider_call_id, text: format!("Error: the goldfish failed: {why}"), images: vec![] } })
     }
 
-    /// Park the thread's state `delay_ms` from now unless it has run another turn by then. `body` is its last
-    /// request: the node's entry for it is the newest state it holds for this thread.
-    fn park_later(&self, thread: &str, node: String, body: Value, delay_ms: u64, min_tokens: u64) {
-        let (Some(park), Ok(Some(m))) = (self.parking.clone(), self.store.thread(thread)) else { return };
-        // the store is held weakly while the task sleeps: a daemon that stops releases its database at once
-        let (router, store, thread, stamp, running) = (self.router.clone(), Arc::downgrade(&self.store), thread.to_owned(), m.updated_ms, self.running.clone());
-        // no turn committed since, and none running now (a turn waiting for a slot would never read the copy)
-        let unchanged = move |store: &Store, thread: &str| {
-            !running.lock().unwrap().contains(thread) && matches!(store.thread(thread), Ok(Some(m)) if m.updated_ms == stamp)
-        };
+    /// Park the thread's state `delay_ms` from now unless it has run another turn by then. The request the export
+    /// is sent with is rebuilt then from the store (the view the node cached, as of the last turn), so a sleeper
+    /// holds no messages or images in memory while it waits; the engine is held weakly until then.
+    fn park_later(&self, thread: &str, node: String, delay_ms: u64, min_tokens: u64) {
+        let (Some(park), Ok(Some(m)), Some(me)) = (self.parking.clone(), self.store.thread(thread), self.me.get().cloned()) else { return };
+        let (thread, stamp) = (thread.to_owned(), m.updated_ms);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            let Some(store) = store.upgrade() else { return };
-            if !unchanged(&store, &thread) { return; }
+            let Some(engine) = me.upgrade() else { return };
+            // no turn committed since, and none running now (a turn waiting for a slot would never read the copy)
+            let unchanged = |e: &Engine| !e.inflight.get().is_some_and(|f| f(&thread)) && matches!(e.store.thread(&thread), Ok(Some(m)) if m.updated_ms == stamp);
+            if !unchanged(&engine) { return; }
+            let Some(body) = engine.park_body(&thread).await else { return };
             let path = park.path(&thread);
             let t = std::time::Instant::now();
-            match router.park_state(&node, &body, &path, min_tokens).await {
+            match engine.router.park_state(&node, &body, &path, min_tokens).await {
                 Ok(Some(n)) => {
-                    if unchanged(&store, &thread) {
+                    if unchanged(&engine) {
                         tracing::info!("{thread}: parked its cached state from {node} ({:.1} GB in {:.1}s)", n as f64 / 1e9, t.elapsed().as_secs_f64());
                         park.prune();
                     } else {
@@ -640,6 +674,22 @@ impl Engine {
                 Err(e) => tracing::warn!("{thread}: parking its state from {node} failed: {e:#}"),
             }
         });
+    }
+
+    /// The request a parked thread's state is exported with: its view now (what the node cached for its last
+    /// turn, extended by the reply), with the thread's tools and steering, as a turn would send it.
+    async fn park_body(&self, thread: &str) -> Option<Value> {
+        let meta = self.store.thread(thread).ok()??;
+        let history = self.store.messages(thread).ok()?;
+        let p = prefix(&self.system, &self.store, &meta).ok()?;
+        let mut defs = rap::builtin_defs(self.cfg.compaction, self.cfg.window);
+        defs.extend(self.tools.current().await.defs.iter().cloned());
+        let defs = rap::scope_defs(defs, meta.tools.as_deref());
+        let mut messages = live_view(&p, &meta, &history, &meta.pending, self.page_min());
+        self.fade(&mut messages, &meta, &history);
+        let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "max_tokens": self.cfg.max_output_tokens, "stream": false});
+        if let Some(s) = self.steer_of(&meta) { body["steer"] = s; }
+        Some(body)
     }
 
     /// The paging size threshold, or 0 while paging is off.
@@ -673,6 +723,11 @@ impl Engine {
         if new_from <= from { return None; }
         meta.window_from = new_from as u64;
         meta.window_cuts += 1;
+        // pins below the new start become resident: the notice shows them until the next cut (newest 32)
+        let mut pins: Vec<u64> = meta.pinned.iter().copied().filter(|&i| (i as usize) < new_from).collect();
+        pins.sort_unstable();
+        pins.dedup();
+        meta.resident = pins.split_off(pins.len().saturating_sub(32));
         // the cut costs the cache anyway: page every result the rule allows at the same time
         if self.cfg.page_results_after_turns > 0 {
             let b = window::page_boundary(history, new_from, self.cfg.page_results_after_turns) as u64;
@@ -724,12 +779,14 @@ impl Engine {
         let cut = view.len() - (n - keep_from) as usize;
         let mut messages: Vec<Value> = view[..cut].to_vec();
         messages.push(json!({"role": "user", "content": instruction}));
-        window::fade_images(&mut messages, self.cfg.keep_images);
+        self.fade(&mut messages, meta, history);
         // the same tools as every turn, so the node's cache serves the view; the prompt asks for text only
         // tool_choice none keeps the model from answering the ask with a tool call; a node that does not know
         // the field (400) gets the request again without it
+        // unsteered: the notes are stored text the thread will believe, so memory stays separate from voice (a
+        // persona's steering never colors what a later freeze of these notes bakes in). The cost: the node reads
+        // this view without the steered cache.
         let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "tool_choice": "none", "max_tokens": self.cfg.compact_summary_tokens, "stream": false});
-        if let Some(s) = self.steer_of(meta) { body["steer"] = s; }
         let mut truncated = false;
         let mut summary = String::new();
         for attempt in 0..2 {
@@ -855,6 +912,20 @@ fn until(args: &Value) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resident_pins_show_in_the_notice_region_until_the_next_cut() {
+        let h: Vec<Value> = (0..6).map(|i| json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": format!("message {i}")})).collect();
+        let p = vec![json!({"role": "system", "content": "s"})];
+        let mut meta = ThreadMeta { window_from: 4, pinned: vec![1], ..Default::default() };
+        let v = live_view(&p, &meta, &h, &[], 0);
+        assert!(!v[1]["content"].as_str().unwrap().contains("Kept in view"), "a pin alone moves nothing");
+        meta.resident = vec![1];
+        let v = live_view(&p, &meta, &h, &[], 0);
+        let notice = v[1]["content"].as_str().unwrap();
+        assert!(notice.starts_with("[Paged.") && notice.contains("Kept in view") && notice.contains("#1 assistant: message 1"), "{notice}");
+        assert_eq!(v[2]["content"], "message 4");
+    }
+
     use super::*;
 
     #[test]

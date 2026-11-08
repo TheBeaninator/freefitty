@@ -70,7 +70,8 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
         tracing::info!("parking sleepers' cached state in {} ({} GiB parked now, cap {} GiB)", dir.display(), p.bytes() >> 30, cfg.park_max_gib);
         Some(Arc::new(p))
     } else { None };
-    let engine = Arc::new(engine::Engine { cfg: cfg.clone(), store: store.clone(), router: router.clone(), tools: tools.clone(), system, compact_prompt, callback_url: cfg.callback_url(), scale_hint: std::sync::atomic::AtomicU64::new(0), parking, running: Default::default(), experts: experts.clone(), deliver: Default::default() });
+    let engine = Arc::new(engine::Engine { cfg: cfg.clone(), store: store.clone(), router: router.clone(), tools: tools.clone(), system, compact_prompt, callback_url: cfg.callback_url(), scale_hint: std::sync::atomic::AtomicU64::new(0), parking, inflight: Default::default(), me: Default::default(), experts: experts.clone(), deliver: Default::default() });
+    let _ = engine.me.set(Arc::downgrade(&engine));
     let replies = Arc::new(Notify::new());
 
     // the dispatcher's failures become events; the queue is built after it, so it reaches the queue through a slot
@@ -84,6 +85,8 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
     let d = dispatcher.clone();
     let queue = queue::Queue::new(store.clone(), engine.clone(), replies.clone(), Box::new(move || d.kick()))?;
     let _ = queue_slot.set(Arc::downgrade(&queue));
+    let wq = Arc::downgrade(&queue);
+    let _ = engine.inflight.set(Box::new(move |t| wq.upgrade().is_some_and(|q| q.is_inflight(t))));
     let weak = Arc::downgrade(&queue);
     let _ = engine.deliver.set(Box::new(move |ev| {
         if let Some(q) = weak.upgrade() {

@@ -54,18 +54,33 @@ pub fn text_of(m: &Value) -> String {
 
 /// Only the newest `keep` images stay pictures in a view; older ones become a line saying so. Every image in
 /// view is paid for on every turn, and a thread looking at many frames would otherwise carry them all.
-pub fn fade_images(view: &mut [Value], keep: usize) {
-    let mut seen = 0usize;
-    for m in view.iter_mut().rev() {
+/// Stub every image whose ordinal (the thread's images in history order; `first` is the first image's ordinal in
+/// `view`) is before `kept_from`. The caller moves `kept_from` only at named events (a cut, a paging batch, a
+/// refocus), so between them a new image never turns an older one into a stub at an old position.
+pub fn fade_images_before(view: &mut [Value], first: u64, kept_from: u64) {
+    let mut ord = first;
+    for m in view.iter_mut() {
         let Some(parts) = m.get_mut("content").and_then(|c| c.as_array_mut()) else { continue };
-        for p in parts.iter_mut().rev() {
+        for p in parts.iter_mut() {
             if p.get("type").and_then(|t| t.as_str()) != Some("image_url") { continue; }
-            seen += 1;
-            if seen > keep {
+            if ord < kept_from {
                 *p = json!({"type": "text", "text": "[an image shown earlier is out of view; view it again to see it]"});
             }
+            ord += 1;
         }
     }
+}
+
+/// How many images these messages carry.
+pub fn count_images(msgs: &[Value]) -> u64 {
+    msgs.iter().map(|m| image_urls(m).count() as u64).sum()
+}
+
+/// The resident pins as the notice region shows them: the exact text, newest pins first to fit 16 KiB.
+pub fn resident_text(history: &[Value], resident: &[u64]) -> String {
+    let idx: Vec<usize> = resident.iter().map(|&i| i as usize).filter(|&i| i < history.len()).collect();
+    if idx.is_empty() { return String::new(); }
+    format!("\n\n[Kept in view: messages you recalled, exactly as written; they stay until the next page-out.]\n{}", recall_text(history, &idx))
 }
 
 fn role(m: &Value) -> &str {
@@ -374,15 +389,19 @@ mod tests {
     }
 
     #[test]
-    fn only_the_newest_images_stay_in_view() {
+    fn images_fade_by_ordinal_so_a_new_one_moves_nothing() {
         let img = |n: &str| image_message(n, &[format!("data:image/png;base64,{n}")]);
         let mut v = vec![json!({"role": "user", "content": "hi"}), img("a"), img("b"), img("c")];
-        fade_images(&mut v, 2);
+        assert_eq!(count_images(&v), 3);
+        // the view starts at the thread's image #4; images before #5 are stubs
+        fade_images_before(&mut v, 4, 5);
         let urls: Vec<&str> = v.iter().flat_map(|m| image_urls(m).collect::<Vec<_>>()).collect();
         assert_eq!(urls, vec!["data:image/png;base64,b", "data:image/png;base64,c"]);
         assert!(text_of(&v[1]).contains("out of view"), "{}", text_of(&v[1]));
-        fade_images(&mut v, 0);
-        assert_eq!(v.iter().map(|m| image_urls(m).count()).sum::<usize>(), 0);
+        // a fourth image arriving changes nothing before it while kept_from stays
+        let mut w = vec![json!({"role": "user", "content": "hi"}), img("a"), img("b"), img("c"), img("d")];
+        fade_images_before(&mut w, 4, 5);
+        assert_eq!(w[..4], v[..]);
     }
     use super::*;
 

@@ -47,6 +47,15 @@ pub struct Config {
     /// pending, is parked after this long if nothing came in.
     #[serde(default = "d_park_after")]
     pub park_after_s: u64,
+    /// Whether `commission_expert` may give the expert steering. Off until a steered goldfish is measured against a
+    /// plain one (verdict agreement and malformed tool calls: steering touches every token, tool-call JSON
+    /// included); expert definitions written by hand may steer either way.
+    #[serde(default)]
+    pub commission_steer: bool,
+    /// The largest |scale| a commissioned expert's steering may use (a model should not commission a scale-50
+    /// version of itself; a 4-prompt vector broke the model past 16 on the pod).
+    #[serde(default = "d_steer_scale")]
+    pub max_steer_scale: f64,
     /// The park directory's cap; the oldest files go first.
     #[serde(default = "d_park_gib")]
     pub park_max_gib: u64,
@@ -169,6 +178,7 @@ fn d_spill() -> u64 { 16_384 }
 fn d_true() -> bool { true }
 fn d_park_after() -> u64 { 300 }
 fn d_newcomer_wait() -> u64 { 30 }
+fn d_steer_scale() -> f64 { 8.0 }
 fn d_park_gib() -> u64 { 64 }
 fn d_keep_images() -> usize { 4 }
 fn d_grant_check() -> u64 { 5 }

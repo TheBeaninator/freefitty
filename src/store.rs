@@ -151,6 +151,14 @@ pub struct ThreadMeta {
     /// History indices the model recalled: shown in full however old.
     #[serde(default)]
     pub pinned: Vec<u64>,
+    /// Pinned messages below the window's start, set at each cut and shown in the notice region from then on:
+    /// a pin means resident (until the next cut), not just "never a handle".
+    #[serde(default)]
+    pub resident: Vec<u64>,
+    /// The thread's images in history order: those before this ordinal are shown as stubs. Moved only at a cut,
+    /// a paging batch or a refocus, so fading never breaks the prefix between those named events.
+    #[serde(default)]
+    pub images_kept_from: u64,
     /// What the newest stored message is: user, tool_result, assistant_text, tool_call or assistant_empty.
     /// A watcher reads "stopped talking" here: assistant_empty, or tool_call with nothing pending.
     #[serde(default)]
