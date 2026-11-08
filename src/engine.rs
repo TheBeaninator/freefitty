@@ -33,6 +33,7 @@ pub struct Engine {
     pub parking: Option<Arc<crate::park::Parking>>,
     /// Threads with a slice running (waiting for a slot counts): never parked mid-turn.
     pub running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    pub experts: Arc<crate::experts::Experts>,
 }
 
 /// Marks a thread as running for as long as it lives.
@@ -290,6 +291,18 @@ impl Engine {
         let mut recut = false;
         let mut waits_for_event = false;
         let mut restore = self.parking.as_ref().and_then(|p| p.has(thread));
+        // a thread born from an expert, with no node holding it yet: the expert's frozen state goes into whichever
+        // node takes the turn; not frozen for this context yet, it is frozen now for the next thread
+        if let (None, None, Some(key)) = (&restore, &meta.node, &meta.expert) {
+            let ctx = crate::experts::context(&self.system, &defs);
+            restore = self.experts.state(key, &ctx);
+            if restore.is_none() {
+                let (experts, store, router, system, defs, key, max) = (self.experts.clone(), self.store.clone(), self.router.clone(), self.system.clone(), defs.clone(), key.clone(), self.cfg.max_output_tokens);
+                tokio::spawn(async move {
+                    if let Err(e) = experts.freeze(&key, &store, &router, &system, &defs, max).await { tracing::info!("expert {key}: not frozen: {e:#}"); }
+                });
+            }
+        }
         loop {
             rounds += 1;
             let r = restore.take();
@@ -461,13 +474,15 @@ impl Engine {
     /// request: the node's entry for it is the newest state it holds for this thread.
     fn park_later(&self, thread: &str, node: String, body: Value, delay_ms: u64) {
         let (Some(park), Ok(Some(m))) = (self.parking.clone(), self.store.thread(thread)) else { return };
-        let (router, store, thread, stamp, running) = (self.router.clone(), self.store.clone(), thread.to_owned(), m.updated_ms, self.running.clone());
+        // the store is held weakly while the task sleeps: a daemon that stops releases its database at once
+        let (router, store, thread, stamp, running) = (self.router.clone(), Arc::downgrade(&self.store), thread.to_owned(), m.updated_ms, self.running.clone());
         // no turn committed since, and none running now (a turn waiting for a slot would never read the copy)
         let unchanged = move |store: &Store, thread: &str| {
             !running.lock().unwrap().contains(thread) && matches!(store.thread(thread), Ok(Some(m)) if m.updated_ms == stamp)
         };
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            let Some(store) = store.upgrade() else { return };
             if !unchanged(&store, &thread) { return; }
             let path = park.path(&thread);
             let t = std::time::Instant::now();

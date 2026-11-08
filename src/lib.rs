@@ -61,7 +61,7 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
     let tools = rap::ToolBox::start(cfg.clone(), store.clone(), &mut tasks).await?;
     let system = cfg.system_prompt()?;
     let compact_prompt = cfg.compact_prompt()?;
-    let experts = experts::Experts::new();
+    let experts = experts::Experts::new(Some(cfg.data_dir.join("experts")));
     let loaded = experts.load(&cfg, &store).await?;
     if !loaded.is_empty() { tracing::info!("experts: {}", loaded.join(", ")); }
     let parking = if cfg.park {
@@ -70,7 +70,7 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
         tracing::info!("parking sleepers' cached state in {} ({} GiB parked now, cap {} GiB)", dir.display(), p.bytes() >> 30, cfg.park_max_gib);
         Some(Arc::new(p))
     } else { None };
-    let engine = Arc::new(engine::Engine { cfg: cfg.clone(), store: store.clone(), router: router.clone(), tools: tools.clone(), system, compact_prompt, callback_url: cfg.callback_url(), scale_hint: std::sync::atomic::AtomicU64::new(0), parking, running: Default::default() });
+    let engine = Arc::new(engine::Engine { cfg: cfg.clone(), store: store.clone(), router: router.clone(), tools: tools.clone(), system, compact_prompt, callback_url: cfg.callback_url(), scale_hint: std::sync::atomic::AtomicU64::new(0), parking, running: Default::default(), experts: experts.clone() });
     let replies = Arc::new(Notify::new());
 
     // the dispatcher's failures become events; the queue is built after it, so it reaches the queue through a slot
@@ -87,16 +87,18 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
 
     let app = api::App::new(cfg.clone(), store.clone(), queue.clone(), router.clone(), tools.clone(), replies, engine.clone(), experts.clone());
 
-    // the experts named in warm_on_start are read into every node's cache once a node is up
-    if !cfg.warm_on_start.is_empty() {
+    // once a node is up: every expert without frozen state for this context is frozen, then the experts named in
+    // warm_on_start are put into every node's cache
+    if !experts.current.read().await.is_empty() {
         let (cfg2, store2, router2, tools2, experts2, engine2) = (cfg.clone(), store.clone(), router.clone(), tools.clone(), experts.clone(), engine.clone());
         tasks.push(tokio::spawn(async move {
             while !router2.any_up().await { tokio::time::sleep(std::time::Duration::from_secs(1)).await; }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let mut defs = rap::builtin_defs(cfg2.compaction, cfg2.window);
             defs.extend(tools2.current().await.defs.iter().cloned());
+            experts2.freeze_all(&store2, &router2, &engine2.system, &defs, cfg2.max_output_tokens).await;
             for name in &cfg2.warm_on_start {
-                match experts2.warm(name, &store2, &router2, &engine2.system, &defs).await {
+                match experts2.warm(name, &store2, &router2, &engine2.system, &defs, cfg2.max_output_tokens).await {
                     Ok(r) => tracing::info!("warm {name}: {}", serde_json::to_string(&r).unwrap_or_default()),
                     Err(e) => tracing::warn!("warm {name}: {e:#}"),
                 }

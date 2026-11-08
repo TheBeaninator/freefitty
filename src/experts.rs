@@ -1,6 +1,12 @@
-//! Preloaded experts: a named prefix a thread can be born with. An expert has read documents and
-//! acknowledged them; every thread started from it sends those exact bytes after the shared system prompt,
-//! so a node's prompt cache serves the first turn of each such thread, however much the expert has read.
+//! Experts: the model's cached state after reading, kept as memory with an address, a version and a
+//! residence. An expert has read documents and acknowledged them. Frozen, it is the node's state at the end of
+//! that reading: read once on one node, exported (`POST /cache/export`) into `<data_dir>/experts/<name>@<hash>-
+//! <context>.kv`, and imported (`POST /cache/import`) into whichever node runs the first turn of a thread born
+//! from it, so that turn reads only its own message, on any node, across restarts, however much the expert has
+//! read. The context part of the name is a hash of the system prompt and the tool definitions, which render
+//! before the expert: when either changes, the expert is frozen again for the new context, and a thread born
+//! meanwhile reads the expert itself. The stored messages are the expert's provenance and what it is rebuilt
+//! from; every thread born from it sends those exact bytes after the shared system prompt.
 //!
 //! Defined as `<experts_dir>/<name>.toml`:
 //!
@@ -25,7 +31,8 @@ use crate::store::{now_ms, Expert, Store};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -91,14 +98,92 @@ pub fn from_notes(name: &str, description: &str, thread: &str, notes: &str) -> E
     build(name, description, "I hold this understanding and will continue from it.", &[(Some(format!("notes-of-thread-{thread}")), notes.to_owned())])
 }
 
-/// The experts by name, each at its current version key ("name@hash").
+/// What renders before an expert's messages: the system prompt and the tool definitions.
+pub fn context(system: &str, defs: &[Value]) -> String {
+    rap::short_hash(&format!("{system}\u{0}{}", serde_json::to_string(defs).unwrap_or_default()))
+}
+
+/// The request an expert is read with, and the one its state is exported with. Strixite saves a checkpoint at
+/// the start of the last user message, which here is the end of the expert's acknowledgement; exporting with a
+/// different last message picks that checkpoint, the prefix every thread born from the expert shares.
+fn bodies(e: &Expert, system: &str, defs: &[Value], model: &str, max_tokens: u64) -> (Value, Value) {
+    let with = |last: &str| {
+        let mut messages = vec![json!({"role": "system", "content": system})];
+        messages.extend(e.messages.iter().cloned());
+        messages.push(json!({"role": "user", "content": last}));
+        json!({"model": model, "messages": messages, "tools": defs, "max_tokens": max_tokens, "stream": false})
+    };
+    (with("Say ready."), with("."))
+}
+
+/// The experts by name, each at its current version key ("name@hash"), and where their frozen state lives.
 pub struct Experts {
     pub current: RwLock<HashMap<String, String>>,
+    state_dir: Option<PathBuf>,
+    freezing: std::sync::Mutex<HashSet<PathBuf>>,
 }
 
 impl Experts {
-    pub fn new() -> Arc<Experts> {
-        Arc::new(Experts { current: RwLock::new(HashMap::new()) })
+    pub fn new(state_dir: Option<PathBuf>) -> Arc<Experts> {
+        if let Some(d) = &state_dir {
+            if let Err(e) = std::fs::create_dir_all(d) { tracing::warn!("experts: state directory {}: {e}", d.display()); }
+        }
+        Arc::new(Experts { current: RwLock::new(HashMap::new()), state_dir, freezing: Default::default() })
+    }
+
+    fn state_path(&self, key: &str, ctx: &str) -> Option<PathBuf> {
+        self.state_dir.as_ref().map(|d| d.join(format!("{key}-{ctx}.kv")))
+    }
+
+    /// The frozen state of an expert version in a context, if it has been frozen.
+    pub fn state(&self, key: &str, ctx: &str) -> Option<PathBuf> {
+        self.state_path(key, ctx).filter(|p| p.is_file())
+    }
+
+    /// Freeze an expert version for the current context: read it once on a node and export that node's state.
+    /// A version already frozen is left alone; two freezes of the same one never run at once.
+    pub async fn freeze(&self, key: &str, store: &Store, router: &Router, system: &str, defs: &[Value], max_tokens: u64) -> Result<Value> {
+        let ctx = context(system, defs);
+        let path = self.state_path(key, &ctx).context("no expert state directory")?;
+        if path.is_file() {
+            return Ok(json!({"key": key, "state": path, "bytes": std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0), "frozen_before": true}));
+        }
+        if !self.freezing.lock().unwrap().insert(path.clone()) { bail!("{key} is being frozen already"); }
+        let r = self.freeze_into(key, &path, store, router, system, defs, max_tokens).await;
+        self.freezing.lock().unwrap().remove(&path);
+        if r.is_ok() {
+            // the state of older contexts of this version renders before nothing that is sent any more
+            if let (Some(dir), Some(name)) = (&self.state_dir, path.file_name().and_then(|f| f.to_str())) {
+                for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                    let f = e.file_name().to_string_lossy().into_owned();
+                    if f.starts_with(&format!("{key}-")) && f.ends_with(".kv") && f != name { let _ = std::fs::remove_file(e.path()); }
+                }
+            }
+        }
+        r
+    }
+
+    async fn freeze_into(&self, key: &str, path: &Path, store: &Store, router: &Router, system: &str, defs: &[Value], max_tokens: u64) -> Result<Value> {
+        let e = store.expert(key)?.with_context(|| format!("expert {key} is not stored"))?;
+        let (read, export) = bodies(&e, system, defs, router.model(), max_tokens);
+        let t = std::time::Instant::now();
+        let turn = router.chat(None, &read).await.map_err(|e| anyhow::anyhow!("reading the expert: {e:?}"))?;
+        let read_s = t.elapsed().as_secs_f64();
+        match router.save_state(&turn.node, &export, path).await? {
+            Some(n) => {
+                tracing::info!("expert {key}: frozen on {} ({:?} prompt tokens, {:?} from its cache, read in {read_s:.0} s): {:.2} GB", turn.node, turn.prompt_tokens, turn.cached_tokens, n as f64 / 1e9);
+                Ok(json!({"key": key, "node": turn.node, "prompt_tokens": turn.prompt_tokens, "cached_tokens": turn.cached_tokens, "read_s": read_s, "state": path, "bytes": n}))
+            }
+            None => bail!("{} kept no state for the expert (is cache-xfer on?)", turn.node),
+        }
+    }
+
+    /// Freeze every current expert that has no state for this context; failures are logged.
+    pub async fn freeze_all(&self, store: &Store, router: &Router, system: &str, defs: &[Value], max_tokens: u64) {
+        let keys: Vec<String> = self.current.read().await.values().cloned().collect();
+        for key in keys {
+            if let Err(e) = self.freeze(&key, store, router, system, defs, max_tokens).await { tracing::warn!("expert {key}: not frozen: {e:#}"); }
+        }
     }
 
     /// Read `experts_dir`; the names loaded. A file that fails is reported and skipped, the others load.
@@ -130,16 +215,26 @@ impl Experts {
         self.current.read().await.get(name).cloned()
     }
 
-    /// Read an expert's prefix once on every up node, so each node's cache holds it before any thread
-    /// starts from it. Best effort: a node's cache may evict it later, and the next thread reads it again.
-    pub async fn warm(&self, name: &str, store: &Store, router: &Router, system: &str, defs: &[Value]) -> Result<Vec<Value>> {
+    /// Put an expert into every up node's cache before any thread starts from it: its frozen state, frozen
+    /// first if need be, or, where the nodes cannot take state, a reading on each. Not needed for a thread to be
+    /// born from it on any node; it saves the import on that thread's first turn.
+    pub async fn warm(&self, name: &str, store: &Store, router: &Router, system: &str, defs: &[Value], max_tokens: u64) -> Result<Vec<Value>> {
         let key = self.key(name).await.with_context(|| format!("no expert named {name}"))?;
         let e = store.expert(&key)?.context("expert vanished")?;
-        let mut messages = vec![json!({"role": "system", "content": system})];
-        messages.extend(e.messages.iter().cloned());
-        // a short real answer: a node keeps the entry of a completed turn, not of one cut at a token
-        messages.push(json!({"role": "user", "content": "Say ready."}));
-        let body = json!({"model": router.model(), "messages": messages, "tools": defs, "max_tokens": 16, "stream": false});
+        if let Err(err) = self.freeze(&key, store, router, system, defs, max_tokens).await { tracing::warn!("expert {key}: not frozen: {err:#}"); }
+        if let Some(state) = self.state(&key, &context(system, defs)) {
+            let mut out = Vec::new();
+            for url in router.up_nodes().await {
+                let t = std::time::Instant::now();
+                match router.load_state(&url, &state).await {
+                    Ok(n) => out.push(json!({"url": url, "imported_bytes": n, "seconds": t.elapsed().as_secs_f64()})),
+                    Err(err) => out.push(json!({"url": url, "error": err.to_string()})),
+                }
+            }
+            tracing::info!("expert {name}: frozen state put into {} node(s)", out.len());
+            return Ok(out);
+        }
+        let (body, _) = bodies(&e, system, defs, router.model(), max_tokens);
         let mut out = Vec::new();
         for url in router.up_nodes().await {
             let t = std::time::Instant::now();

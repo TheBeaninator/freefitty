@@ -477,10 +477,11 @@ async fn experts_share_their_prefix_bytes() {
     api.output("ex-plain", 10).await.unwrap();
     let bp = h.model.bodies.lock().unwrap().iter().find(|b| b["messages"].as_array().unwrap().last().unwrap()["content"] == "plain").cloned().unwrap();
     assert_eq!(bp["messages"][0], ba["messages"][0]);
-    // warm on start ran: a 1-token request with the prefix (it waits for the node, then a moment)
+    // warm on start ran: the expert read on the node (it waits for the node, then a moment); this node keeps no
+    // state to export, so the reading is the warm
     let mut warmed = false;
     for _ in 0..40 {
-        warmed = h.model.bodies.lock().unwrap().iter().any(|b| b["max_tokens"] == 16 && b["messages"][2]["content"] == "Read.");
+        warmed = h.model.bodies.lock().unwrap().iter().any(|b| b["messages"].as_array().unwrap().last().unwrap()["content"] == "Say ready." && b["messages"][2]["content"] == "Read.");
         if warmed { break; }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -810,5 +811,52 @@ async fn a_sleeper_is_parked_and_its_state_restored_on_waking() {
     let s = reqwest::Client::new().delete(format!("{}/threads/{t}", api.base)).bearer_auth(&api.token).send().await.unwrap().status();
     assert!(s.is_success(), "{s}");
     assert!(!parked.join(format!("{t}.kv")).exists());
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expert_is_its_frozen_state_and_threads_are_born_into_it() {
+    let mut h = harness().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("railhand.toml"), "description = \"knows the rail\"\nack = \"Read.\"\n[[reads]]\ntext = \"B is .51\"\n").unwrap();
+    h.cfg.experts_dir = Some(dir.path().to_path_buf());
+    *h.model.kv.lock().unwrap() = Some(vec![9u8; 3 << 19]);
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    // frozen once a node is up: read once, its state exported to disk
+    let mut frozen = Value::Null;
+    for _ in 0..40 {
+        frozen = api.get("/experts").await[0]["frozen_bytes"].clone();
+        if !frozen.is_null() { break; }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(frozen, 3 << 19, "the expert's state was frozen");
+    let reads = |m: &FakeModel| m.bodies.lock().unwrap().iter().filter(|b| b["messages"].as_array().unwrap().last().unwrap()["content"] == "Say ready.").count();
+    assert_eq!(reads(&h.model), 1, "read once");
+    // two threads born from it: each first turn gets the frozen state put into its node first, byte for byte
+    for t in ["fz-a", "fz-b"] {
+        api.post("/say", json!({"text": format!("hello {t}"), "thread": t, "expert": "railhand"})).await;
+        assert_eq!(api.output(t, 10).await.unwrap()["text"], format!("hi: hello {t}"));
+    }
+    let imports = h.model.imports.lock().unwrap().clone();
+    assert_eq!(imports.len(), 2);
+    assert!(imports.iter().all(|i| *i == vec![9u8; 3 << 19]));
+    // a later turn of a born thread runs on its node's own cache: no import
+    api.say("again", Some("fz-a")).await;
+    api.output("fz-a", 10).await.unwrap();
+    assert_eq!(h.model.imports.lock().unwrap().len(), 2);
+    // a plain thread is born into nothing
+    api.say("plain", Some("fz-plain")).await;
+    api.output("fz-plain", 10).await.unwrap();
+    assert_eq!(h.model.imports.lock().unwrap().len(), 2);
+    r.shutdown().await;
+    // across a restart the expert is still its state: not read again, and a new thread is born into it
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.post("/say", json!({"text": "hello c", "thread": "fz-c", "expert": "railhand"})).await;
+    assert_eq!(api.output("fz-c", 10).await.unwrap()["text"], "hi: hello c");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(reads(&h.model), 1, "not read again after the restart");
+    assert_eq!(h.model.imports.lock().unwrap().len(), 3);
     r.shutdown().await;
 }

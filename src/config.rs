@@ -152,7 +152,7 @@ pub struct Config {
     /// Directory of `<name>.toml` expert definitions, read at start and on `POST /experts/reload`; empty = none.
     #[serde(default)]
     pub experts_dir: Option<PathBuf>,
-    /// Experts whose prefix is read into every node's cache once the nodes are up.
+    /// Experts whose frozen state is put into every node's cache once the nodes are up (every expert is frozen then).
     #[serde(default)]
     pub warm_on_start: Vec<String>,
 }

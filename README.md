@@ -181,8 +181,9 @@ the model believes and no measurement yet says when a model-written summary beat
 window plus `recall`; on real nodes it also needed `tool_choice = "none"` and a real token budget to produce notes
 at all. `freefitty show THREAD --live` prints what the model sees after one.
 
-**Preloaded experts, off.** An expert is a named prefix a thread can be born with: documents it has read and its
-acknowledgement, after the shared system prompt, defined as `<experts_dir>/<name>.toml`:
+**Experts, off.** An expert is the model's cached state after reading: memory with an address (its name), a
+version (the content hash of what it read) and a residence (a state file on this host). What it reads is
+documents and an acknowledgement, after the shared system prompt, defined as `<experts_dir>/<name>.toml`:
 
 ```toml
 description = "Has read the pod runbook"
@@ -193,13 +194,20 @@ path = "/data/pod/objective/RUNBOOK.md"
 text = "The board is /data/pod/kanban.db."
 ```
 
-Every thread started from it (`freefitty say "..." --expert NAME`) sends those exact bytes first, so a node's cache
-serves the first turn of each such thread however much the expert has read: a 100k-token reading is one prefill,
-then seconds per thread. Versions are stored by content hash and never pruned: a thread keeps the bytes it was born
-with when a file changes. `experts warm NAME` reads the prefix once on every up node; `warm_on_start` does that at
-boot; `experts freeze THREAD NAME` turns a thread's refocus notes into an expert. Off until the experts exist: the
-mechanism is cheap, the practice is the work, and it is a board card (FF-EXPERTS) to grow a small set from the
-kinds of work the pod repeats, measure their cache reuse, and retire what nothing uses.
+Freezing reads it once on one node and exports that node's state at the end of the acknowledgement (strixite's
+checkpoint at the start of the next user message) into `<data_dir>/experts/<name>@<hash>-<context>.kv`. A thread
+born from it (`freefitty say "..." --expert NAME`) gets that state imported into whichever node takes its first
+turn, which then reads only its own message: on any node, after a restart, however much the expert read. The
+context is a hash of the system prompt and the tool definitions, which render before the expert; when either
+changes the expert is frozen again, and a thread born meanwhile reads the expert itself (and triggers the freeze).
+Every current expert without state is frozen once a node is up, after `experts reload`, and after `experts freeze
+THREAD NAME`, which makes a thread's refocus notes what an expert has read. The stored messages stay as its
+provenance: every born thread sends those exact bytes, and the state is rebuilt from them. Versions are never
+pruned: a thread keeps the bytes it was born with when a file changes. `experts warm NAME` puts the frozen state
+into every up node (a reading on each, where nodes cannot take state); `warm_on_start` does that at boot.
+`experts list` shows each expert's frozen bytes. Off until the experts exist: the mechanism is cheap, the practice
+is the work, and it is a board card (FF-EXPERTS) to grow a small set from the kinds of work the pod repeats,
+measure their cache reuse, and retire what nothing uses.
 
 **Paging old tool results, on.** Most of a pod thread is tool output, and most of it is read once. A result the
 model has answered `page_results_after_turns` (4) model turns ago and that is over `page_results_min_bytes` (500)
@@ -276,7 +284,9 @@ twice, double-encoded arguments, an unknown tool, a turn with nothing in it, thr
 and a redrive that keeps the input's id, two threads at once, a restart with a wake-up pending; a refocus from the
 tool and from the operator with the pending call bridged and its late result answered, notes cut off and asked
 again, nothing-to-fold, the token trigger, failed notes; experts sharing their prefix bytes, version pinning across
-a file change, warm on start, and an expert frozen from a thread's notes; the window cutting whole units at the
+a file change, warm on start, and an expert frozen from a thread's notes; an expert frozen once into a state file
+that each born thread's first turn imports byte for byte, a later turn importing nothing, and a restart keeping the
+state without a second reading; the window cutting whole units at the
 budget, the notice carrying the first message, the cut point holding across turns, `recall` returning the exact
 text within the slice, and the replay agreeing with the live run; old results paging out in a batch as handles, an
 error result staying, and a recalled result pinned back in full; a node's count correcting a wrong estimate so

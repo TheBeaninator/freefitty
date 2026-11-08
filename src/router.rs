@@ -281,15 +281,21 @@ impl Router {
     /// Copy a thread's cached state from its node into `path` (written beside it and renamed); the bytes
     /// written, or None when the node holds nothing for this conversation.
     pub async fn park_state(&self, from: &str, body: &Value, path: &Path) -> Result<Option<u64>> {
+        let r = self.save_state(from, body, path).await?;
+        let mut c = self.counts.lock().await;
+        if r.is_some() { c.parked += 1 } else { c.park_missed += 1 }
+        Ok(r)
+    }
+
+    /// The node's best cached entry covering a prefix of `body`'s prompt, written to `path` beside it and
+    /// renamed; None when no entry covers any prefix.
+    pub async fn save_state(&self, from: &str, body: &Value, path: &Path) -> Result<Option<u64>> {
         use futures_util::StreamExt;
         use tokio::io::AsyncWriteExt;
         let exp = self.xfer_client.post(format!("{from}/cache/export")).json(body).send().await?;
         match exp.status().as_u16() {
             200 => {}
-            404 => {
-                self.counts.lock().await.park_missed += 1;
-                return Ok(None);
-            }
+            404 => return Ok(None),
             s => bail!("export answered {s}"),
         }
         let part = crate::park::part_path(path);
@@ -307,13 +313,11 @@ impl Router {
             anyhow::Ok(n)
         }.await;
         if written.is_err() { let _ = tokio::fs::remove_file(&part).await; }
-        let n = written?;
-        self.counts.lock().await.parked += 1;
-        Ok(Some(n))
+        Ok(Some(written?))
     }
 
-    /// Put parked state into a node's cache.
-    async fn restore_state(&self, to: &str, path: &Path) -> Result<u64> {
+    /// Put saved state (a parked thread's, a frozen expert's) into a node's cache; the bytes sent.
+    pub async fn load_state(&self, to: &str, path: &Path) -> Result<u64> {
         use tokio::io::AsyncReadExt;
         let f = tokio::fs::File::open(path).await?;
         let len = f.metadata().await?.len();
@@ -338,7 +342,7 @@ impl Router {
         self.chat_restoring(home, body, None).await
     }
 
-    /// `chat`, first putting the thread's parked state (if any) into the node the turn is placed on.
+    /// `chat`, first putting saved state (if any) into the node the turn is placed on.
     pub async fn chat_restoring(&self, home: Option<&str>, body: &Value, parked: Option<&Path>) -> Result<Turn, ChatError> {
         let tokens = (serde_json::to_vec(body).map(|b| b.len()).unwrap_or(0) / 4) as u64;
         let mut avoid = Vec::new();
@@ -352,16 +356,16 @@ impl Router {
                 (nodes[i].url.clone(), from.map(|f| nodes[f].url.clone()))
             };
             if let Some(p) = parked.filter(|_| avoid.is_empty()) {
-                // the parked copy is what the thread's node had when it went quiet: it serves on any node
+                // saved state (a parked thread's, or the frozen expert a new thread is born from) serves on any node
                 let t = Instant::now();
-                match self.restore_state(&url, p).await {
+                match self.load_state(&url, p).await {
                     Ok(n) => {
                         self.counts.lock().await.restored += 1;
-                        tracing::info!("parked state ({:.1} GB) restored into {url} in {:.1}s", n as f64 / 1e9, t.elapsed().as_secs_f64());
+                        tracing::info!("saved state {} ({:.1} GB) restored into {url} in {:.1}s", p.file_name().and_then(|f| f.to_str()).unwrap_or(""), n as f64 / 1e9, t.elapsed().as_secs_f64());
                     }
                     Err(e) => {
                         self.counts.lock().await.restore_failed += 1;
-                        tracing::warn!("restoring parked state into {url} failed ({e}); it reads the prompt itself");
+                        tracing::warn!("restoring saved state into {url} failed ({e}); it reads the prompt itself");
                     }
                 }
             } else if let Some(f) = &from_url {
