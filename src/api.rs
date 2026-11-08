@@ -67,6 +67,7 @@ pub fn routes(app: Arc<App>) -> AxumRouter {
         .route("/threads/{id}", get(thread).delete(delete_thread))
         .route("/threads/{id}/messages", get(messages).put(import_messages))
         .route("/threads/{id}/compact", post(compact))
+        .route("/threads/{id}/cancel", post(cancel_thread))
         .route("/experts", get(experts_list))
         .route("/experts/reload", post(experts_reload))
         .route("/experts/{name}/warm", post(experts_warm))
@@ -420,9 +421,27 @@ async fn experts_from_thread(State(app): Shared, headers: HeaderMap, Path(id): P
     }
 }
 
-async fn delete_thread(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+/// Stop the thread's running slice now: nothing it was doing is committed and its events run again.
+async fn cancel_thread(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
     if let Err(r) = operator(&app, &headers) { return *r; }
-    if app.queue.is_inflight(&id) { return err(StatusCode::CONFLICT, "a slice of this thread is running; try again when it has committed"); }
+    Json(json!({"thread": id, "cancelled": app.queue.cancel(&id)})).into_response()
+}
+
+#[derive(Deserialize)]
+struct DeleteQ { #[serde(default)] cancel: bool }
+
+async fn delete_thread(State(app): Shared, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<DeleteQ>) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    if q.cancel && app.queue.is_inflight(&id) {
+        // its queued events go first, so the cancelled slice's thread is not picked again before it is deleted
+        app.queue.forget_thread(&id);
+        app.queue.cancel(&id);
+        for _ in 0..300 {
+            if !app.queue.is_inflight(&id) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    if app.queue.is_inflight(&id) { return err(StatusCode::CONFLICT, "a slice of this thread is running; try again when it has committed, or DELETE ?cancel=true"); }
     app.queue.forget_thread(&id);
     if let Some(p) = &app.engine.parking { p.forget(&id); }
     match app.store.delete_thread(&id) {

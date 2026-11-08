@@ -25,6 +25,8 @@ pub struct Queue {
     engine: Arc<Engine>,
     events: Mutex<BTreeMap<u64, Event>>,
     inflight: Mutex<HashSet<String>>,
+    /// The running slices' cancel signals, by thread.
+    cancels: Mutex<std::collections::HashMap<String, Arc<Notify>>>,
     running: AtomicUsize,
     pub notify: Notify,
     /// Replies landed: /output readers wake.
@@ -43,6 +45,7 @@ impl Queue {
             engine,
             events: Mutex::new(events),
             inflight: Mutex::new(HashSet::new()),
+            cancels: Mutex::new(std::collections::HashMap::new()),
             running: AtomicUsize::new(0),
             notify: Notify::new(),
             replies,
@@ -78,6 +81,16 @@ impl Queue {
     /// A slice of this thread is running right now.
     pub fn is_inflight(&self, thread: &str) -> bool {
         self.inflight.lock().unwrap().contains(thread)
+    }
+
+    /// Stop the thread's running slice at its next await (a node request is dropped mid-generation): nothing it
+    /// did is committed, as with a failed slice, and its events stay queued unless `forget_thread` took them
+    /// first. False when no slice of the thread is running.
+    pub fn cancel(&self, thread: &str) -> bool {
+        match self.cancels.lock().unwrap().get(thread) {
+            Some(n) => { n.notify_one(); true }
+            None => false,
+        }
     }
 
     pub fn forget_thread(&self, thread: &str) {
@@ -172,11 +185,14 @@ impl Queue {
         impl Drop for Release<'_> {
             fn drop(&mut self) {
                 self.0.inflight.lock().unwrap().remove(self.1);
+                self.0.cancels.lock().unwrap().remove(self.1);
                 self.0.running.fetch_sub(1, Ordering::Relaxed);
                 self.0.notify.notify_one();
             }
         }
         let _release = Release(self, &thread);
+        let cancel = Arc::new(Notify::new());
+        self.cancels.lock().unwrap().insert(thread.clone(), cancel.clone());
         let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
         let reply_to = batch.iter().rev().find_map(|(_, e)| match e.kind { crate::store::EventKind::User { .. } => Some(e.id.clone()), _ => None });
         // no clock here: `slice_timeout_s` bounds each request to a node (the router's client), and the wait for a
@@ -185,7 +201,21 @@ impl Queue {
         // a panic inside the slice (a poison event, a bug) is a failed attempt like any other: counted, retried, and
         // dead-lettered at max_attempts, instead of the same events being picked and panicking again forever
         let began = std::time::Instant::now();
-        let outcome = match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(self.engine.slice(&thread, &batch))).await {
+        let run = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(self.engine.slice(&thread, &batch)));
+        let ran = tokio::select! {
+            r = run => r,
+            _ = cancel.notified() => {
+                // the slice future is dropped here. The store commit is one synchronous transaction, so the
+                // events are either all committed (a cancel that came after it) or untouched: keep queued only
+                // what the store still holds
+                tracing::warn!("{thread}: slice cancelled by the operator; nothing it was doing is committed");
+                self.engine.metrics.slice("cancelled", began.elapsed().as_secs_f64());
+                let held: HashSet<u64> = self.store.events().map(|v| v.into_iter().map(|(s, _)| s).collect()).unwrap_or_default();
+                self.events.lock().unwrap().retain(|s, _| !seqs.contains(s) || held.contains(s));
+                return;
+            }
+        };
+        let outcome = match ran {
             Ok(o) => o,
             Err(p) => {
                 let why = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "a panic".into());

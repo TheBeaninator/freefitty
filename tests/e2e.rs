@@ -77,6 +77,10 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
             return (axum::http::StatusCode::OK, Json(json!({"choices": [{"message": message}], "usage": {"prompt_tokens": 1}})));
         }
     }
+    if last["role"] == "user" && content.starts_with("slow") {
+        // a generation that takes its time: the operator cancels it
+        tokio::time::sleep(Duration::from_secs(20)).await;
+    }
     if last["role"] == "user" && (content.starts_with("cutoff") || content.starts_with("[FreeFitty] Your reply reached the output limit")) {
         // a write_file call too long for the output limit: cut off twice, then written in parts
         let notes = msgs.iter().filter(|m| m["content"].as_str().is_some_and(|c| c.starts_with("[FreeFitty] Your reply reached"))).count();
@@ -1206,5 +1210,35 @@ async fn a_reply_cut_off_mid_call_goes_on_in_the_same_slice() {
     let out = api.output("thread-cut2", 10).await.expect("a reply");
     assert!(out["text"].as_str().unwrap().ends_with("writing the file (2)"), "{out}");
     assert_eq!(h.model.calls.load(Ordering::Relaxed), 6);
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_slice_is_cancelled_and_its_thread_deleted_at_once() {
+    let h = harness().await;
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let base = format!("{}/threads/thread-slow", api.base);
+    api.say("slow one", Some("thread-slow")).await;
+    let t0 = std::time::Instant::now();
+    while h.model.calls.load(Ordering::Relaxed) == 0 { tokio::time::sleep(Duration::from_millis(50)).await; }
+    // a plain DELETE still refuses a running slice
+    let s = api.c.delete(&base).bearer_auth(&api.token).send().await.unwrap().status();
+    assert_eq!(s.as_u16(), 409);
+    // cancel alone: nothing committed, the event runs again (a second call to the node)
+    let c = api.post("/threads/thread-slow/cancel", json!({})).await;
+    assert_eq!(c["cancelled"], json!(true), "{c}");
+    while h.model.calls.load(Ordering::Relaxed) < 2 { tokio::time::sleep(Duration::from_millis(50)).await; }
+    assert_eq!(api.get("/threads/thread-slow").await["messages"], json!(0));
+    // DELETE ?cancel=true: gone within seconds, and nothing of it runs again
+    let s = api.c.delete(format!("{base}?cancel=true")).bearer_auth(&api.token).send().await.unwrap().status();
+    assert_eq!(s.as_u16(), 200);
+    assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+    let s = api.c.get(&base).bearer_auth(&api.token).send().await.unwrap().status();
+    assert_eq!(s.as_u16(), 404);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(h.model.calls.load(Ordering::Relaxed), 2);
+    // a thread with nothing running: cancel says so
+    assert_eq!(api.post("/threads/thread-none/cancel", json!({})).await["cancelled"], json!(false));
     r.shutdown().await;
 }

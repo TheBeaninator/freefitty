@@ -140,6 +140,8 @@ GET  /threads/{id}        meta: live_tokens, prompt_tokens, window, compaction, 
 GET  /threads/{id}/messages[?view=live][&tail=N]   the store, or what the model sees    operator token
 PUT  /threads/{id}/messages {messages}   a history for a thread that has none           operator token
 POST /threads/{id}/compact {focus?}      DELETE /threads/{id} (409 while a slice runs)  operator token
+POST /threads/{id}/cancel                stop its running slice now; nothing committed  operator token
+DELETE /threads/{id}?cancel=true         cancel the running slice, then delete          operator token
 GET  /dlq                 POST /dlq/redrive, /dlq/drop with {thread?}                  operator token
 GET  /experts             POST /experts/reload, /experts/{name}/warm, /experts/from-thread/{id}
 POST /rap/callback        or /rap/callback/{token}: a tool's result                    callback token
