@@ -508,13 +508,15 @@ impl Engine {
             }
         }
         let node = meta.node.clone();
+        let closed = meta.closed.is_some();
         let covered = meta.prompt_tokens.saturating_sub(64);
         self.store.commit(Commit { thread, meta, messages: new_messages, done, done_ids, replies, events, invocations })?;
         if let Some(p) = &self.parking {
             // the node's cache is newer than any parked copy from here on, including one whose write began
             // before this slice and ended during it
             p.forget(thread);
-            if let (Some(node), Some(delay)) = (node, park_in) {
+            // a closed thread (a goldfish that answered) never runs again: nothing to park
+            if let (Some(node), Some(delay), false) = (node, park_in, closed) {
                 self.park_later(thread, node, body, delay, covered);
             }
         }

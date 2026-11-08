@@ -894,6 +894,9 @@ async fn elephants_find_ask_and_commission_goldfish() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("railhand.toml"), "description = \"knows the rail\"\nack = \"Read.\"\n[[reads]]\ntext = \"B is .51\"\n").unwrap();
     h.cfg.experts_dir = Some(dir.path().to_path_buf());
+    // parking at once and a node with state to export: a finished turn would park, so a closed goldfish shows it is not
+    h.cfg.park_after_s = 0;
+    *h.model.kv.lock().unwrap() = Some(vec![5u8; 1 << 10]);
     let r = freefitty::start(h.cfg.clone()).await.unwrap();
     let api = Api::new(&r);
     // finding: the catalog names each expert, its line and its goldfish's tools
@@ -911,6 +914,7 @@ async fn elephants_find_ask_and_commission_goldfish() {
     let fish: Vec<&Value> = threads.as_array().unwrap().iter().filter(|t| t["thread"].as_str().unwrap().starts_with("el.gf-railhand-")).collect();
     assert_eq!(fish.len(), 1);
     assert_eq!(fish[0]["closed"], "answered its elephant");
+    assert!(!h.cfg.data_dir.join("parked").join(format!("{}.kv", fish[0]["thread"].as_str().unwrap())).exists(), "a closed goldfish is not parked");
     let fish_body = h.model.bodies.lock().unwrap().iter().find(|b| b["messages"].as_array().unwrap().last().unwrap()["content"].as_str().is_some_and(|c| c.ends_with("what is B") && c.starts_with("You are a goldfish"))).cloned().unwrap();
     assert!(fish_body["messages"][1]["content"].as_str().unwrap().contains("B is .51"), "born from the expert");
     // a goldfish cannot ask goldfish, even when it tries: it is told there is no such tool, and says so
@@ -924,7 +928,6 @@ async fn elephants_find_ask_and_commission_goldfish() {
     assert!(out.contains("no expert named \"nobody\"") && out.contains("- railhand:"), "{out}");
     // commissioning: registered at once, frozen, the definition written with its provenance; a goldfish asked
     // for it was granted `goldfish` by the elephant, which no goldfish keeps
-    *h.model.kv.lock().unwrap() = Some(vec![5u8; 1 << 10]);
     api.say("commission rail2", Some("el")).await;
     api.output("el", 10).await.unwrap();
     let out = api.output("el", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
