@@ -144,6 +144,22 @@ async fn metrics(State(app): Shared) -> Response {
         }
     }
     if let Some(p) = &app.engine.parking { gauges.push(("freefitty_parked_bytes".to_owned(), p.bytes() as f64)); }
+    // context pressure (dad 2026-11-08: watch whether threads run out of room before a bigger context per slot is
+    // worth it): the view budget, the largest open thread by the node's own count, how many open threads are past
+    // half and three quarters of the budget, the window cuts so far, and threads closed because the context was full
+    let budget = if app.cfg.window_tokens > 0 { app.cfg.window_tokens } else {
+        app.router.context_length().await.saturating_sub(app.cfg.max_output_tokens + 8192)
+    };
+    let threads = app.store.threads().unwrap_or_default();
+    let open: Vec<_> = threads.iter().filter(|(_, m)| m.closed.is_none()).collect();
+    let over = |f: f64| open.iter().filter(|(_, m)| budget > 0 && m.prompt_tokens as f64 > f * budget as f64).count() as f64;
+    gauges.push(("freefitty_context_budget_tokens".to_owned(), budget as f64));
+    gauges.push(("freefitty_thread_prompt_tokens_max".to_owned(), open.iter().map(|(_, m)| m.prompt_tokens).max().unwrap_or(0) as f64));
+    gauges.push(("freefitty_threads_over_half_budget".to_owned(), over(0.5)));
+    gauges.push(("freefitty_threads_over_three_quarter_budget".to_owned(), over(0.75)));
+    gauges.push(("freefitty_window_cuts".to_owned(), threads.iter().map(|(_, m)| m.window_cuts).sum::<u64>() as f64));
+    gauges.push(("freefitty_threads_closed_for_context".to_owned(),
+                 threads.iter().filter(|(_, m)| m.closed.as_deref().is_some_and(|c| c.contains("context"))).count() as f64));
     ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], app.engine.metrics.render(crate::BUILD, &counters, &gauges)).into_response()
 }
 

@@ -1148,6 +1148,8 @@ async fn metrics_health_and_a_backup_on_demand() {
     assert!(m.contains("freefitty_slices_total{outcome=\"done\"} 1"), "{m}");
     assert!(m.lines().any(|l| l.starts_with("freefitty_node_cached_tokens_total{node=") && l.ends_with(" 90")), "the fake node's 90 cached tokens: {m}");
     assert!(m.contains("freefitty_turn_seconds_count 1") && m.contains("freefitty_queue_queued"), "{m}");
+    assert!(m.contains("freefitty_threads_over_three_quarter_budget 0") && m.contains("freefitty_threads_closed_for_context 0")
+            && m.contains("freefitty_thread_prompt_tokens_max 100"), "context pressure gauges: {m}");
     let b = api.post("/admin/backup", json!({})).await;
     let p = std::path::PathBuf::from(b["backup"].as_str().unwrap_or_else(|| panic!("{b}")));
     assert!(p.exists() && b["bytes"].as_u64().unwrap() > 0, "{b}");
