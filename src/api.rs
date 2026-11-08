@@ -151,7 +151,10 @@ async fn metrics(State(app): Shared) -> Response {
         app.router.context_length().await.saturating_sub(app.cfg.max_output_tokens + 8192)
     };
     let threads = app.store.threads().unwrap_or_default();
-    let open: Vec<_> = threads.iter().filter(|(_, m)| m.closed.is_none()).collect();
+    // Pressure counts threads with a turn in the last 6 h: finished work often leaves its thread open, and a
+    // day-old giant says nothing about whether today's work fits.
+    let since = now_ms().saturating_sub(6 * 3_600_000);
+    let open: Vec<_> = threads.iter().filter(|(_, m)| m.closed.is_none() && m.updated_ms >= since).collect();
     let over = |f: f64| open.iter().filter(|(_, m)| budget > 0 && m.prompt_tokens as f64 > f * budget as f64).count() as f64;
     gauges.push(("freefitty_context_budget_tokens".to_owned(), budget as f64));
     gauges.push(("freefitty_thread_prompt_tokens_max".to_owned(), open.iter().map(|(_, m)| m.prompt_tokens).max().unwrap_or(0) as f64));

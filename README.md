@@ -320,8 +320,8 @@ that panics (a poison event, a bug) is caught and counted as a failed attempt li
 `freefitty_node_prompt_tokens_total` and `freefitty_node_cached_tokens_total` (their ratio is the cache hit rate),
 the router's counters as `freefitty_router_*_total`, the queue and store numbers as gauges, `freefitty_parked_bytes`
 and `freefitty_build_info{version}`. Context pressure: `freefitty_context_budget_tokens` (the view budget),
-`freefitty_thread_prompt_tokens_max` (the largest open thread by the node's own count),
-`freefitty_threads_over_half_budget` / `_over_three_quarter_budget`, `freefitty_window_cuts` (all threads) and
+`freefitty_thread_prompt_tokens_max` (the largest open thread with a turn in the last 6 h, by the node's own count),
+`freefitty_threads_over_half_budget` / `_over_three_quarter_budget` (same threads), `freefitty_window_cuts` (all threads) and
 `freefitty_threads_closed_for_context`: what says whether a bigger context per slot would earn its memory. Counters restart at zero with the daemon. `FREEFITTY_LOG_FORMAT=json` in the
 unit's environment writes one JSON object a line instead of text, for a log shipper.
 
