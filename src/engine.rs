@@ -294,6 +294,7 @@ impl Engine {
         window::fade_images(&mut messages, self.cfg.keep_images);
         let sent_est = tokens(&messages);
         let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "max_tokens": self.cfg.max_output_tokens, "stream": false});
+        if let Some(s) = self.steer_of(&meta) { body["steer"] = s; }
 
         let mut reply_text = String::new();
         let mut events: Vec<Event> = Vec::new();
@@ -523,6 +524,12 @@ impl Engine {
         Ok(Outcome::Done)
     }
 
+    /// The steering every request of this thread carries: its expert's (a thread born from a steered expert is
+    /// that persona on every turn, and the nodes cache its state under the steering's own key).
+    fn steer_of(&self, meta: &ThreadMeta) -> Option<Value> {
+        meta.expert.as_ref().and_then(|k| self.store.expert(k).ok().flatten()).and_then(|e| e.steer)
+    }
+
     /// A goldfish for a `goldfish` call: its thread's meta and first event. Born from the expert, with the
     /// expert's tool list (or the call's), never the tools only an elephant may call.
     async fn goldfish(&self, thread: &str, call: &Call) -> anyhow::Result<(ThreadMeta, Event)> {
@@ -571,7 +578,9 @@ impl Engine {
         let reads: Vec<crate::experts::Read> = serde_json::from_value(a.get("reads").cloned().unwrap_or(json!([])))
             .map_err(|e| anyhow::anyhow!("reads must be a list of {{path}} or {{text}}: {e}"))?;
         let tools: Vec<String> = a.get("tools").and_then(|t| t.as_array()).map(|t| t.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
-        let e = crate::experts::commission(&self.cfg, name, a.get("description").and_then(|d| d.as_str()).unwrap_or(""), a.get("ack").and_then(|d| d.as_str()), &reads, rap::goldfish_tools(&tools), thread)?;
+        let steer: Vec<crate::experts::Steer> = serde_json::from_value(a.get("steer").cloned().unwrap_or(json!([])))
+            .map_err(|e| anyhow::anyhow!("steer must be a list of {{vector, scale, layer?}}: {e}"))?;
+        let e = crate::experts::commission(&self.cfg, name, a.get("description").and_then(|d| d.as_str()).unwrap_or(""), a.get("ack").and_then(|d| d.as_str()), &reads, rap::goldfish_tools(&tools), steer, thread)?;
         let key = self.experts.add(&self.store, &e).await?;
         tracing::info!("{thread}: commissioned expert {key}");
         // frozen in the context its goldfish will see: the plain built-ins and its own tools (from the whole set,
@@ -720,6 +729,7 @@ impl Engine {
         // tool_choice none keeps the model from answering the ask with a tool call; a node that does not know
         // the field (400) gets the request again without it
         let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "tool_choice": "none", "max_tokens": self.cfg.compact_summary_tokens, "stream": false});
+        if let Some(s) = self.steer_of(meta) { body["steer"] = s; }
         let mut truncated = false;
         let mut summary = String::new();
         for attempt in 0..2 {

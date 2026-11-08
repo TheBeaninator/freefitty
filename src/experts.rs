@@ -47,6 +47,23 @@ struct Definition {
     /// The tools a thread born from it may call; unset = every tool (an elephant's expert), [] = none.
     #[serde(default)]
     tools: Option<Vec<String>>,
+    /// Activation steering: `[[steer]] vector = "villain24", scale = 6.0, layer = 24 (optional)`.
+    #[serde(default)]
+    steer: Vec<Steer>,
+}
+
+/// One steering vector of an expert, by its name in the nodes' steer-dir.
+#[derive(Deserialize, serde::Serialize, Clone, Debug)]
+pub struct Steer {
+    pub vector: String,
+    pub scale: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<i64>,
+}
+
+/// The request's `steer` field for these vectors; None when there are none.
+pub fn steer_field(steer: &[Steer]) -> Option<Value> {
+    (!steer.is_empty()).then(|| serde_json::to_value(steer).unwrap_or(Value::Null))
 }
 
 #[derive(Deserialize, serde::Serialize, Clone)]
@@ -67,7 +84,7 @@ pub fn name_ok(n: &str) -> bool {
 
 /// The expert's two messages from its documents: byte-identical for the same documents in the same order. Its
 /// tool list is part of its identity (the definitions render before it), so it is in the hash when set.
-fn build(name: &str, description: &str, ack: &str, docs: &[(Option<String>, String)], tools: Option<Vec<String>>) -> Expert {
+fn build(name: &str, description: &str, ack: &str, docs: &[(Option<String>, String)], tools: Option<Vec<String>>, steer: Option<Value>) -> Expert {
     let mut body = format!("<expert name=\"{name}\">\n");
     for (path, text) in docs {
         match path {
@@ -80,8 +97,9 @@ fn build(name: &str, description: &str, ack: &str, docs: &[(Option<String>, Stri
     let bytes = serde_json::to_vec(&messages).map(|b| b.len()).unwrap_or(0) as u64;
     let mut hashed = serde_json::to_string(&messages).unwrap_or_default();
     if let Some(t) = &tools { hashed.push_str(&format!("\u{0}tools={}", t.join(","))); }
+    if let Some(s) = &steer { hashed.push_str(&format!("\u{0}steer={s}")); }
     let hash = rap::short_hash(&hashed);
-    Expert { name: name.to_owned(), hash, description: description.to_owned(), messages, bytes, loaded_ms: now_ms(), tools }
+    Expert { name: name.to_owned(), hash, description: description.to_owned(), messages, bytes, loaded_ms: now_ms(), tools, steer }
 }
 
 /// Read a definition's documents: (path, text) pairs, each file at most `max_file` bytes.
@@ -103,18 +121,18 @@ pub fn read_docs(reads: &[Read], max_file: usize) -> Result<Vec<(Option<String>,
 
 /// An expert an elephant commissioned; its definition is written to `experts_dir` (when set) so it survives
 /// a restart, with who commissioned it.
-pub fn commission(cfg: &Config, name: &str, description: &str, ack: Option<&str>, reads: &[Read], tools: Vec<String>, by: &str) -> Result<Expert> {
+pub fn commission(cfg: &Config, name: &str, description: &str, ack: Option<&str>, reads: &[Read], tools: Vec<String>, steer: Vec<Steer>, by: &str) -> Result<Expert> {
     if !name_ok(name) { bail!("expert names are 1-64 of [A-Za-z0-9._-]"); }
     if reads.is_empty() { bail!("an expert needs something to read"); }
     let docs = read_docs(reads, 1 << 20)?;
     let ack = ack.map(str::to_owned).unwrap_or_else(default_ack);
-    let e = build(name, description, &ack, &docs, Some(tools.clone()));
+    let e = build(name, description, &ack, &docs, Some(tools.clone()), steer_field(&steer));
     if let Some(dir) = &cfg.experts_dir {
         let path = dir.join(format!("{name}.toml"));
         if path.exists() { bail!("an expert definition named {name} exists already"); }
         #[derive(serde::Serialize)]
-        struct Def<'a> { description: &'a str, ack: &'a str, tools: &'a [String], reads: &'a [Read] }
-        let body = toml::to_string(&Def { description, ack: &ack, tools: &tools, reads })?;
+        struct Def<'a> { description: &'a str, ack: &'a str, tools: &'a [String], reads: &'a [Read], #[serde(skip_serializing_if = "<[Steer]>::is_empty")] steer: &'a [Steer] }
+        let body = toml::to_string(&Def { description, ack: &ack, tools: &tools, reads, steer: &steer })?;
         std::fs::write(&path, format!("# commissioned by thread {by} on {}\n{body}", chrono::Utc::now().to_rfc3339()))
             .with_context(|| format!("writing {}", path.display()))?;
     }
@@ -126,12 +144,12 @@ fn load_file(path: &std::path::Path) -> Result<Expert> {
     if !name_ok(&name) { bail!("{}: expert names are 1-64 of [A-Za-z0-9._-]", path.display()); }
     let def: Definition = toml::from_str(&std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?).with_context(|| format!("parsing {}", path.display()))?;
     let docs = read_docs(&def.reads, usize::MAX).with_context(|| path.display().to_string())?;
-    Ok(build(&name, &def.description, &def.ack, &docs, def.tools))
+    Ok(build(&name, &def.description, &def.ack, &docs, def.tools, steer_field(&def.steer)))
 }
 
 /// An expert whose reading is a thread's focal point: its latest refocus notes.
 pub fn from_notes(name: &str, description: &str, thread: &str, notes: &str) -> Expert {
-    build(name, description, "I hold this understanding and will continue from it.", &[(Some(format!("notes-of-thread-{thread}")), notes.to_owned())], None)
+    build(name, description, "I hold this understanding and will continue from it.", &[(Some(format!("notes-of-thread-{thread}")), notes.to_owned())], None, None)
 }
 
 /// What renders before an expert's messages: the system prompt and the tool definitions.
@@ -147,7 +165,9 @@ fn bodies(e: &Expert, system: &str, defs: &[Value], model: &str, max_tokens: u64
         let mut messages = vec![json!({"role": "system", "content": system})];
         messages.extend(e.messages.iter().cloned());
         messages.push(json!({"role": "user", "content": last}));
-        json!({"model": model, "messages": messages, "tools": defs, "max_tokens": max_tokens, "stream": false})
+        let mut b = json!({"model": model, "messages": messages, "tools": defs, "max_tokens": max_tokens, "stream": false});
+        if let Some(s) = &e.steer { b["steer"] = s.clone(); }
+        b
     };
     (with("Say ready."), with("."))
 }
@@ -258,12 +278,16 @@ impl Experts {
         for (name, key) in cur {
             let e = store.expert(&key).ok().flatten();
             let desc = e.as_ref().map(|e| e.description.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| "(no description)".into());
+            let steer = e.as_ref().and_then(|e| e.steer.as_ref()).and_then(|s| s.as_array()).map(|a| {
+                let v: Vec<String> = a.iter().map(|x| format!("{} x{}", x["vector"].as_str().unwrap_or("?"), x["scale"])).collect();
+                format!("; steered: {}", v.join(", "))
+            }).unwrap_or_default();
             let tools = match e.as_ref().and_then(|e| e.tools.clone()) {
                 Some(t) if t.is_empty() => "no tools".to_owned(),
                 Some(t) => format!("tools: {}", t.join(", ")),
                 None => "no tools as a goldfish".to_owned(),
             };
-            out.push_str(&format!("- {name}: {desc} ({tools})\n"));
+            out.push_str(&format!("- {name}: {desc} ({tools}{steer})\n"));
         }
         out
     }

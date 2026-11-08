@@ -93,7 +93,12 @@ pub fn builtin_defs(compaction: bool, window: bool) -> Vec<Value> {
                     "path": {"type": "string", "description": "A file to read"},
                     "text": {"type": "string", "description": "Or text to read"}}}, "description": "What it reads, in order"},
                 "ack": {"type": "string", "description": "Its one-sentence acknowledgement, in its own voice (a persona goes here)"},
-                "tools": {"type": "array", "items": {"type": "string"}, "description": "Tools its goldfish may use; none by default"}}, "required": ["name", "description", "reads"]}}}),
+                "tools": {"type": "array", "items": {"type": "string"}, "description": "Tools its goldfish may use; none by default"},
+                "steer": {"type": "array", "items": {"type": "object", "properties": {
+                    "vector": {"type": "string", "description": "A steering vector the nodes hold"},
+                    "scale": {"type": "number", "description": "How hard to push along it"},
+                    "layer": {"type": "integer", "description": "The layer it is added after; the vector's own by default"}}},
+                    "description": "Activation steering: a persona the expert is on every turn of its goldfish"}}, "required": ["name", "description", "reads"]}}}),
     ];
     if compaction {
         v.push(json!({"type": "function", "function": {"name": REFOCUS,

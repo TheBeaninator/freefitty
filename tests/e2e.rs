@@ -941,3 +941,47 @@ async fn elephants_find_ask_and_commission_goldfish() {
     assert!(h.model.imports.lock().unwrap().len() >= 1, "the goldfish was born into the frozen expert");
     r.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_steered_expert_steers_every_request_of_its_threads() {
+    let mut h = harness().await;
+    let dir = tempfile::tempdir().unwrap();
+    let def = "description = \"a villain\"\nack = \"Read.\"\n[[reads]]\ntext = \"You scheme.\"\n";
+    std::fs::write(dir.path().join("villain.toml"), format!("{def}[[steer]]\nvector = \"villain24\"\nscale = 6.0\nlayer = 24\n")).unwrap();
+    std::fs::write(dir.path().join("plainvillain.toml"), def).unwrap();
+    h.cfg.experts_dir = Some(dir.path().to_path_buf());
+    *h.model.kv.lock().unwrap() = Some(vec![3u8; 1 << 10]);
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let list = api.get("/experts").await;
+    let of = |n: &str| list.as_array().unwrap().iter().find(|e| e["name"] == n).cloned().unwrap();
+    assert_eq!(of("villain")["steer"], json!([{"vector": "villain24", "scale": 6.0, "layer": 24}]));
+    // the same reading unsteered is another version: the nodes cache steered state under its own key
+    assert_ne!(of("villain")["key"].as_str().unwrap().split('@').nth(1), of("plainvillain")["key"].as_str().unwrap().split('@').nth(1));
+    let steer = json!([{"vector": "villain24", "scale": 6.0, "layer": 24}]);
+    // the freeze read it steered
+    let mut frozen = false;
+    for _ in 0..40 {
+        frozen = h.model.bodies.lock().unwrap().iter().any(|b| b["steer"] == steer && b["messages"].as_array().unwrap().last().unwrap()["content"] == "Say ready.");
+        if frozen { break; }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(frozen, "the expert was read under its steering");
+    // every turn of a thread born from it carries it; a plain thread's carry none
+    api.post("/say", json!({"text": "hello v", "thread": "sv", "expert": "villain"})).await;
+    api.output("sv", 10).await.unwrap();
+    api.say("again v", Some("sv")).await;
+    api.output("sv", 10).await.unwrap();
+    api.say("plain p", Some("sp")).await;
+    api.output("sp", 10).await.unwrap();
+    let bodies = h.model.bodies.lock().unwrap().clone();
+    let by = |t: &str| bodies.iter().find(|b| b["messages"].as_array().unwrap().last().unwrap()["content"] == t).cloned().unwrap();
+    assert_eq!(by("hello v")["steer"], steer);
+    assert_eq!(by("again v")["steer"], steer);
+    assert!(by("plain p").get("steer").is_none());
+    // the catalog says so
+    api.say("catalog", Some("sc")).await;
+    let out = api.output("sc", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.contains("- villain: a villain (no tools as a goldfish; steered: villain24 x6.0)"), "{out}");
+    r.shutdown().await;
+}

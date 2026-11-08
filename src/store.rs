@@ -109,6 +109,10 @@ pub struct Expert {
     /// The tools a thread born from it may call, besides the plain built-ins; None = every tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
+    /// Activation steering every request of a thread born from it carries (strixite `steer`: [{vector, scale,
+    /// layer?}]); None = unsteered. Part of its version: the nodes cache steered state under its own key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

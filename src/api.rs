@@ -315,7 +315,7 @@ async fn experts_list(State(app): Shared, headers: HeaderMap) -> Response {
         let e = all.iter().find(|e| format!("{}@{}", e.name, e.hash) == *key);
         let on_current = threads.iter().filter(|(_, m)| m.expert.as_deref() == Some(key)).count();
         let on_older = threads.iter().filter(|(_, m)| m.expert.as_deref().is_some_and(|k| k.starts_with(&format!("{name}@")) && k != key)).count();
-        json!({"name": name, "key": key, "description": e.map(|e| e.description.clone()), "bytes": e.map(|e| e.bytes), "est_tokens": e.map(|e| e.bytes / 4), "threads": on_current, "threads_on_older_versions": on_older,
+        json!({"name": name, "key": key, "description": e.map(|e| e.description.clone()), "steer": e.and_then(|e| e.steer.clone()), "tools": e.and_then(|e| e.tools.clone()), "bytes": e.map(|e| e.bytes), "est_tokens": e.map(|e| e.bytes / 4), "threads": on_current, "threads_on_older_versions": on_older,
                "frozen_bytes": app.experts.state(key, &ctx).and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len())})
     }).collect();
     Json(out).into_response()

@@ -195,6 +195,11 @@ path = "/data/pod/objective/RUNBOOK.md"
 text = "The board is /data/pod/kanban.db."
 ```
 
+An expert may also be a persona: `[[steer]] vector = "villain24", scale = 6.0, layer = 24` (layer optional) names
+activation-steering vectors the nodes hold (strixite `steer-dir`). Every request of a thread born from it carries
+them as strixite's `steer`, its freeze reads it steered, and the steering is part of its version, since the nodes
+cache steered state under its own key; a node without the vectors refuses such a turn.
+
 Freezing reads it once on one node and exports that node's state at the end of the acknowledgement (strixite's
 checkpoint at the start of the next user message) into `<data_dir>/experts/<name>@<hash>-<context>.kv`. strixite
 answers a turn before it caches the turn's entries, so an export is retried until the entry it returns covers the
@@ -222,7 +227,7 @@ which answer once and are gone. Three built-ins make that general:
   this host, 256 KiB each, 1 MiB together) and the question in its first message, and ends the elephant's turn;
   several in one turn run at once. When the goldfish ends a turn with nothing out, its text returns as the call's
   result and the goldfish is closed; if it fails or dead-letters, the elephant gets the error as the result.
-- `commission_expert {name, description, reads, ack?, tools?}` registers a new expert at once, writes its
+- `commission_expert {name, description, reads, ack?, tools?, steer?}` registers a new expert at once, writes its
   definition to `experts_dir` with the commissioning thread named, and freezes it; the elephant sleeps until the
   freeze ends and wakes to the expert's name and version.
 
@@ -313,7 +318,8 @@ that each born thread's first turn imports byte for byte, a later turn importing
 state without a second reading; an elephant reading the catalog, asking a goldfish born from an expert with only
 the plain built-ins and getting its answer as the call's result, a goldfish that tries to ask a goldfish being
 told there is no such tool, an unknown expert answered with the catalog, and a commissioned expert frozen, its
-definition written, and its goldfish holding the granted tool but never `goldfish`; the window cutting whole units at the
+definition written, and its goldfish holding the granted tool but never `goldfish`; a steered expert read under
+its steering, every turn of its threads carrying it, a plain thread's none, and the steering a version of its own; the window cutting whole units at the
 budget, the notice carrying the first message, the cut point holding across turns, `recall` returning the exact
 text within the slice, and the replay agreeing with the live run; old results paging out in a batch as handles, an
 error result staying, and a recalled result pinned back in full; a node's count correcting a wrong estimate so
