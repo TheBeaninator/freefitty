@@ -195,7 +195,9 @@ text = "The board is /data/pod/kanban.db."
 ```
 
 Freezing reads it once on one node and exports that node's state at the end of the acknowledgement (strixite's
-checkpoint at the start of the next user message) into `<data_dir>/experts/<name>@<hash>-<context>.kv`. A thread
+checkpoint at the start of the next user message) into `<data_dir>/experts/<name>@<hash>-<context>.kv`. strixite
+answers a turn before it caches the turn's entries, so an export is retried until the entry it returns covers the
+reading (about 10 s at most); parking a thread waits for its last prompt's entry the same way. A thread
 born from it (`freefitty say "..." --expert NAME`) gets that state imported into whichever node takes its first
 turn, which then reads only its own message: on any node, after a restart, however much the expert read. The
 context is a hash of the system prompt and the tool definitions, which render before the expert; when either

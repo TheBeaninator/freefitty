@@ -18,6 +18,8 @@ struct FakeModel {
     /// what /cache/export answers (None: 404, nothing cached), and every body /cache/import got
     kv: std::sync::Mutex<Option<Vec<u8>>>,
     imports: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// the next export answers an older, shorter entry, as strixite does while a turn's entries are being saved
+    short_first: AtomicBool,
 }
 
 async fn health(State(m): State<Arc<FakeModel>>) -> Json<Value> {
@@ -119,7 +121,8 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
 async fn export(State(m): State<Arc<FakeModel>>) -> axum::response::Response {
     use axum::response::IntoResponse;
     match m.kv.lock().unwrap().clone() {
-        Some(b) => b.into_response(),
+        // the entry covers the whole prompt the scripted turns report (100 tokens)
+        Some(b) => ([("x-cache-tokens", if m.short_first.swap(false, Ordering::Relaxed) { "10" } else { "100" })], b).into_response(),
         None => axum::http::StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -177,7 +180,7 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
-    let model = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(0), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()) });
+    let model = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(0), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false) });
     let model_url = serve(Router::new().route("/health", get(health)).route("/v1/chat/completions", post(completions)).route("/cache/export", post(export)).route("/cache/import", post(import)).with_state(model.clone())).await;
     let tools = Arc::new(FakeTools { base: String::new(), invocations: AtomicUsize::new(0) });
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -843,6 +846,8 @@ async fn an_expert_is_its_frozen_state_and_threads_are_born_into_it() {
     std::fs::write(dir.path().join("railhand.toml"), "description = \"knows the rail\"\nack = \"Read.\"\n[[reads]]\ntext = \"B is .51\"\n").unwrap();
     h.cfg.experts_dir = Some(dir.path().to_path_buf());
     *h.model.kv.lock().unwrap() = Some(vec![9u8; 3 << 19]);
+    // the export sent right after the reading gets the system prompt's entry; the freeze waits for the real one
+    h.model.short_first.store(true, Ordering::Relaxed);
     let r = freefitty::start(h.cfg.clone()).await.unwrap();
     let api = Api::new(&r);
     // frozen once a node is up: read once, its state exported to disk

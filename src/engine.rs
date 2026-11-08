@@ -508,13 +508,14 @@ impl Engine {
             }
         }
         let node = meta.node.clone();
+        let covered = meta.prompt_tokens.saturating_sub(64);
         self.store.commit(Commit { thread, meta, messages: new_messages, done, done_ids, replies, events, invocations })?;
         if let Some(p) = &self.parking {
             // the node's cache is newer than any parked copy from here on, including one whose write began
             // before this slice and ended during it
             p.forget(thread);
             if let (Some(node), Some(delay)) = (node, park_in) {
-                self.park_later(thread, node, body, delay);
+                self.park_later(thread, node, body, delay, covered);
             }
         }
         Ok(Outcome::Done)
@@ -601,7 +602,7 @@ impl Engine {
 
     /// Park the thread's state `delay_ms` from now unless it has run another turn by then. `body` is its last
     /// request: the node's entry for it is the newest state it holds for this thread.
-    fn park_later(&self, thread: &str, node: String, body: Value, delay_ms: u64) {
+    fn park_later(&self, thread: &str, node: String, body: Value, delay_ms: u64, min_tokens: u64) {
         let (Some(park), Ok(Some(m))) = (self.parking.clone(), self.store.thread(thread)) else { return };
         // the store is held weakly while the task sleeps: a daemon that stops releases its database at once
         let (router, store, thread, stamp, running) = (self.router.clone(), Arc::downgrade(&self.store), thread.to_owned(), m.updated_ms, self.running.clone());
@@ -615,7 +616,7 @@ impl Engine {
             if !unchanged(&store, &thread) { return; }
             let path = park.path(&thread);
             let t = std::time::Instant::now();
-            match router.park_state(&node, &body, &path).await {
+            match router.park_state(&node, &body, &path, min_tokens).await {
                 Ok(Some(n)) => {
                     if unchanged(&store, &thread) {
                         tracing::info!("{thread}: parked its cached state from {node} ({:.1} GB in {:.1}s)", n as f64 / 1e9, t.elapsed().as_secs_f64());

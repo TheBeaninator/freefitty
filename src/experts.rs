@@ -205,8 +205,14 @@ impl Experts {
         let t = std::time::Instant::now();
         let turn = router.chat(None, &read).await.map_err(|e| anyhow::anyhow!("reading the expert: {e:?}"))?;
         let read_s = t.elapsed().as_secs_f64();
-        match router.save_state(&turn.node, &export, path).await? {
-            Some(n) => {
+        // the entry wanted ends where the read's last message (a few tokens) begins
+        let want = turn.prompt_tokens.unwrap_or(0).saturating_sub(64);
+        match router.save_state_covering(&turn.node, &export, path, want).await? {
+            Some((n, covered)) if covered < want => {
+                let _ = std::fs::remove_file(path);
+                bail!("{} exported only {covered} of the expert's ~{want} tokens ({:.2} GB)", turn.node, n as f64 / 1e9)
+            }
+            Some((n, _)) => {
                 tracing::info!("expert {key}: frozen on {} ({:?} prompt tokens, {:?} from its cache, read in {read_s:.0} s): {:.2} GB", turn.node, turn.prompt_tokens, turn.cached_tokens, n as f64 / 1e9);
                 Ok(json!({"key": key, "node": turn.node, "prompt_tokens": turn.prompt_tokens, "cached_tokens": turn.cached_tokens, "read_s": read_s, "state": path, "bytes": n}))
             }

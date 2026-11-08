@@ -280,16 +280,33 @@ impl Router {
 
     /// Copy a thread's cached state from its node into `path` (written beside it and renamed); the bytes
     /// written, or None when the node holds nothing for this conversation.
-    pub async fn park_state(&self, from: &str, body: &Value, path: &Path) -> Result<Option<u64>> {
-        let r = self.save_state(from, body, path).await?;
+    pub async fn park_state(&self, from: &str, body: &Value, path: &Path, min_tokens: u64) -> Result<Option<u64>> {
+        let r = self.save_state_covering(from, body, path, min_tokens).await?.map(|(n, _)| n);
         let mut c = self.counts.lock().await;
         if r.is_some() { c.parked += 1 } else { c.park_missed += 1 }
         Ok(r)
     }
 
+    /// `save_state`, retried until the entry covers at least `min_tokens`: strixite answers a turn first and
+    /// caches its entries after, so an export sent the moment a reply arrives gets an older, shorter entry (the
+    /// system prompt's). After about 10 s the shorter entry is kept. (bytes, tokens covered).
+    pub async fn save_state_covering(&self, from: &str, body: &Value, path: &Path, min_tokens: u64) -> Result<Option<(u64, u64)>> {
+        let mut last = None;
+        for attempt in 0..20 {
+            last = self.save_state(from, body, path).await?;
+            match last {
+                Some((_, t)) if t >= min_tokens => return Ok(last),
+                None if attempt >= 4 => return Ok(None),
+                _ => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+        if let Some((_, t)) = last { tracing::warn!("{from}: the export covers {t} tokens, under the {min_tokens} wanted; kept"); }
+        Ok(last)
+    }
+
     /// The node's best cached entry covering a prefix of `body`'s prompt, written to `path` beside it and
-    /// renamed; None when no entry covers any prefix.
-    pub async fn save_state(&self, from: &str, body: &Value, path: &Path) -> Result<Option<u64>> {
+    /// renamed: (bytes, tokens it covers); None when no entry covers any prefix.
+    pub async fn save_state(&self, from: &str, body: &Value, path: &Path) -> Result<Option<(u64, u64)>> {
         use futures_util::StreamExt;
         use tokio::io::AsyncWriteExt;
         let exp = self.xfer_client.post(format!("{from}/cache/export")).json(body).send().await?;
@@ -298,6 +315,7 @@ impl Router {
             404 => return Ok(None),
             s => bail!("export answered {s}"),
         }
+        let tokens = exp.headers().get("x-cache-tokens").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0u64);
         let part = crate::park::part_path(path);
         let written = async {
             let mut f = tokio::fs::File::create(&part).await?;
@@ -313,7 +331,7 @@ impl Router {
             anyhow::Ok(n)
         }.await;
         if written.is_err() { let _ = tokio::fs::remove_file(&part).await; }
-        Ok(Some(written?))
+        Ok(Some((written?, tokens)))
     }
 
     /// Put saved state (a parked thread's, a frozen expert's) into a node's cache; the bytes sent.
