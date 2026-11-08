@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "freefitty", version, about = "Durable agents on a cluster of Strix Halos")]
+#[command(name = "freefitty", version = freefitty::BUILD, about = "Durable agents on a cluster of Strix Halos")]
 struct Cli {
     /// The config file.
     #[arg(short, long, default_value = "freefitty.toml", global = true)]
@@ -92,6 +92,10 @@ enum Cmd {
     },
     /// The daemon's health: nodes, queue, store.
     Status,
+    /// A consistent snapshot of the store now, into <data_dir>/backups (the daemon keeps running).
+    Backup,
+    /// Put a snapshot back as the store: the daemon must be stopped; the current store is kept beside it.
+    Restore { file: std::path::PathBuf },
     /// Replay stored histories under a budget window (and tool-result paging with --tau) to measure before
     /// turning anything on: cuts, peak view, token-slices saved, and faults (a later call identical to one that
     /// had left the view). --budget/--trim default to the daemon's; --scale auto uses each thread's node count.
@@ -140,7 +144,14 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Serve => {
-            tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).with_target(false).init();
+            // FREEFITTY_LOG_FORMAT=json: one JSON object a line (for a log shipper); text otherwise
+            let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+            if std::env::var("FREEFITTY_LOG_FORMAT").is_ok_and(|f| f == "json") {
+                tracing_subscriber::fmt().json().with_env_filter(filter).with_target(false).init();
+            } else {
+                tracing_subscriber::fmt().with_env_filter(filter).with_target(false).init();
+            }
+            tracing::info!("freefitty {}", freefitty::BUILD);
             let cfg = Config::load(&cli.config)?;
             if cfg.nodes.is_empty() { bail!("no nodes in {}", cli.config.display()); }
             let running = freefitty::start(cfg).await?;
@@ -170,6 +181,28 @@ async fn main() -> Result<()> {
             c.watch(Some(&t)).await
         }
         Cmd::Watch { thread } => Client::new(&cli.config)?.watch(thread.as_deref()).await,
+        Cmd::Backup => {
+            println!("{}", Client::new(&cli.config)?.post("/admin/backup", &json!({})).await?);
+            Ok(())
+        }
+        Cmd::Restore { file } => {
+            let cfg = Config::load(&cli.config)?;
+            let host = if cfg.listen.starts_with("0.0.0.0") { cfg.listen.replacen("0.0.0.0", "127.0.0.1", 1) } else { cfg.listen.clone() };
+            if reqwest::Client::new().get(format!("http://{host}/health")).timeout(std::time::Duration::from_secs(3)).send().await.is_ok() {
+                bail!("the daemon answers on {host}: stop it first (systemctl --user stop freefitty)");
+            }
+            let schema = freefitty::store::Store::schema_of(&file)?;
+            if schema > freefitty::store::SCHEMA { bail!("{} has schema {schema}; this binary reads up to {}", file.display(), freefitty::store::SCHEMA); }
+            let live = cfg.data_dir.join("freefitty.redb");
+            if live.exists() {
+                let kept = cfg.data_dir.join(format!("freefitty.redb.before-restore-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ")));
+                std::fs::rename(&live, &kept)?;
+                println!("kept the current store as {}", kept.display());
+            }
+            std::fs::copy(&file, &live)?;
+            println!("restored {} as {} (schema {schema}); start the daemon", file.display(), live.display());
+            Ok(())
+        }
         Cmd::Threads => {
             let v = Client::new(&cli.config)?.get("/threads").await?;
             println!("{:<18} {:>5} {:>9} {:>4}  {:<15} {:<24} closed", "thread", "msgs", "bytes", "pend", "last", "node");

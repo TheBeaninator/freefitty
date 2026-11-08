@@ -60,6 +60,15 @@ pub struct Config {
     #[doc(hidden)]
     #[serde(default)]
     pub test_panic_on: String,
+    /// Give back redb's free space when the daemon starts (redb never shrinks its file on its own).
+    #[serde(default = "d_true")]
+    pub compact_on_start: bool,
+    /// A consistent snapshot of the store into `<data_dir>/backups/` this often (hours; 0 = never) ...
+    #[serde(default = "d_backup_every")]
+    pub backup_every_h: u64,
+    /// ... keeping the newest this many.
+    #[serde(default = "d_backup_keep")]
+    pub backup_keep: usize,
     /// The park directory's cap; the oldest files go first.
     #[serde(default = "d_park_gib")]
     pub park_max_gib: u64,
@@ -182,6 +191,8 @@ fn d_spill() -> u64 { 16_384 }
 fn d_true() -> bool { true }
 fn d_park_after() -> u64 { 300 }
 fn d_newcomer_wait() -> u64 { 30 }
+fn d_backup_every() -> u64 { 24 }
+fn d_backup_keep() -> usize { 7 }
 fn d_steer_scale() -> f64 { 8.0 }
 fn d_park_gib() -> u64 { 64 }
 fn d_keep_images() -> usize { 4 }

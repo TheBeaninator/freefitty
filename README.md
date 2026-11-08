@@ -115,6 +115,9 @@ wait (30 s to 10 min) and, after twelve tries or a 4xx, becomes an error result 
 On start the daemon resumes invocations a crash left unacknowledged. Results come back to
 `<callback_base>/rap/callback/<callback_token>` (or with the token as a bearer); a result posted twice queues once,
 however close together. A result for a call the thread no longer waits on is said to the model in the user role.
+Delivery to a tool server is **at least once**: a crash between posting an invocation and recording its
+acknowledgement, or a lost acknowledgement, posts it again with the same `call_id`. A tool whose action must not
+happen twice (a payment, a deploy, a message) dedupes on `call_id`; reads and idempotent writes need nothing.
 
 **Images.** A result may carry images beside its text: MCP `{"type": "image", "data", "mimeType"}` parts or
 `image_url` parts with a `data:image/...` URL, up to four per result. The tool message says how many follow, and
@@ -140,7 +143,9 @@ POST /threads/{id}/compact {focus?}      DELETE /threads/{id} (409 while a slice
 GET  /dlq                 POST /dlq/redrive, /dlq/drop with {thread?}                  operator token
 GET  /experts             POST /experts/reload, /experts/{name}/warm, /experts/from-thread/{id}
 POST /rap/callback        or /rap/callback/{token}: a tool's result                    callback token
-GET  /health              nodes (context_length, load, waiting), router counts, queue (oldest_runnable_s, oldest_due_s), store
+GET  /health              build, nodes (context_length, load, waiting), router counts, queue (oldest_runnable_s, oldest_due_s), store
+GET  /metrics             Prometheus text: slices by outcome, slice/turn/slot-wait histograms, per-node turns and cached tokens
+POST /admin/backup        a consistent snapshot of the store into <data_dir>/backups                    operator token
 ```
 
 A reply carries `metadata.thread`, `metadata.reply_to` (the id `/say` returned for the message it answers),
@@ -178,7 +183,9 @@ again and again is held once instead of appended each time. On because it is the
 day it shipped, six live threads were past 150k tokens and three had hit the wall. `window = false`
 turns it off.
 
-The estimate behind it is bytes / 4 scaled up by how the node counted: the thread's own ratio after its first turn,
+The estimate behind it is bytes / 4 scaled up by how the node counted (the daemon holds no tokenizer, so this is the
+weak point for code-heavy threads, whose bytes run denser than prose until the node has counted one turn): the
+thread's own ratio after its first turn,
 else the latest ratio any thread saw, else `est_scale_default` (1.3; measured 1.26 to 1.61 on pod traffic). A node
 that still answers 400 with its count recalibrates the thread, cuts, and sends once more within the slice; only a
 thread with nothing left to cut is closed. `GET /threads/{id}` reports `window.from`, `window.cuts`, `prompt_tokens`
@@ -301,7 +308,38 @@ old binary as `freefitty.bak-<stamp>`. Reading the daemon: the journal has one l
 from its cache) in R s, after S s waiting for a slot`), one per cut, one per failed slice; `freefitty status` shows the nodes and
 counts; `freefitty threads` the threads with their last message kind, so a watcher sees one that stopped talking
 (`assistant_empty`, or `tool_call` with nothing pending). Dead letters are read with `freefitty dlq` and put back
-with `dlq redrive`, which also reopens a thread the context had closed, now that the window can shorten it.
+with `dlq redrive`, which also reopens a thread the context had closed, now that the window can shorten it. A slice
+that panics (a poison event, a bug) is caught and counted as a failed attempt like any other, so it dead-letters at
+`max_attempts` instead of looping.
+
+**Metrics and logs.** `GET /metrics` (no token, like `/health`; the daemon listens on loopback) is Prometheus text:
+`freefitty_slices_total{outcome}` (done, transient, fatal, panic), the histograms `freefitty_slice_seconds`,
+`freefitty_turn_seconds` and `freefitty_slot_wait_seconds`, per node `freefitty_node_turns_total`,
+`freefitty_node_prompt_tokens_total` and `freefitty_node_cached_tokens_total` (their ratio is the cache hit rate),
+the router's counters as `freefitty_router_*_total`, the queue and store numbers as gauges, `freefitty_parked_bytes`
+and `freefitty_build_info{version}`. Counters restart at zero with the daemon. `FREEFITTY_LOG_FORMAT=json` in the
+unit's environment writes one JSON object a line instead of text, for a log shipper.
+
+**The store's lifecycle.** One redb file, `<data_dir>/freefitty.redb`. Its layout version is the meta key `schema`
+(1 today): a binary refuses a store written by a newer layout, and a change of layout ships its migration in
+`Store::open`. redb never shrinks its file; `compact_on_start` (on) gives the free space back each start, which takes
+seconds. A consistent snapshot of every table is written to `<data_dir>/backups/freefitty-<utc>.redb` every
+`backup_every_h` (24) hours and on start when the newest is older, keeping `backup_keep` (7); `freefitty backup` takes
+one now while the daemon runs. Restoring: `systemctl --user stop freefitty`, `freefitty restore <snapshot>` (it
+refuses while the daemon answers and keeps the current store as `freefitty.redb.before-restore-<utc>`), start. Parked
+state and frozen experts are files beside it and are derived: losing them costs prefills, not data.
+
+**Provenance.** Every binary carries the commit it was built from: `freefitty --version`, `/health` `build` and
+`freefitty_build_info` say `0.1.0 (<sha>)`, with `-dirty` when the tree had uncommitted changes, so the binary on
+pod-control can be told from any other build. CI (`.github/workflows/ci.yml`) runs the tests and `cargo deny`
+(advisories, licenses from `deny.toml`, banned and unknown sources) on every push; a `v*` tag builds the release on
+Ubuntu 22.04 and publishes the binary with its CycloneDX SBOM, `SHA256SUMS` and `VERSION`. A deployed binary is
+checked with `sha256sum ~/.local/bin/freefitty` against the release's `SHA256SUMS`; a binary built by hand carries its
+commit but no published checksum.
+
+**Secrets.** The operator and callback tokens live in `freefitty.toml` (0600) and the pod's `.env` for pod-ff and
+pod-hands. Rotating one is: write the new token in both places, restart the daemon, restart the tool servers that
+call back; nothing reloads tokens at runtime, by design, so a rotation is one visible restart.
 
 ## Lessons carried over from running freefinity
 
@@ -351,7 +389,10 @@ error result staying, and a recalled result pinned back in full; a node's count 
 the turn runs; a full context closing a thread that has nothing to cut; a wait for a node slot longer than the
 slice timeout that is not a failure; a tool's images reaching the model; and a sleeper parked and its exact bytes
 restored into the node when it wakes, nothing parked when the node holds nothing, and its file removed with the
-thread. `FREEFITTY_NODES=http://a:5300,http://b:5300
+thread; a slice that panics counted as a failed attempt and dead-lettered; `/metrics` after a turn (outcome, cached
+tokens per node, histograms) and a snapshot on demand that reopens with its schema; a store from a newer schema
+refused; overdue newcomers leaving one slot where two threads wait for their home; an unreachable node named when a
+persona's vector is checked. `FREEFITTY_NODES=http://a:5300,http://b:5300
 cargo test --test real_nodes -- --ignored` proves the cache move on two real strixite nodes.
 
 ## License

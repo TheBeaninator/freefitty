@@ -29,6 +29,10 @@ const TOOLSETS: TableDefinition<&str, &[u8]> = TableDefinition::new("toolsets");
 const EXPERTS: TableDefinition<&str, &[u8]> = TableDefinition::new("experts");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
+/// The layout of the tables above. Stored under meta "schema": a store written by a newer layout is refused, an older
+/// one is migrated step by step in `Store::open` (none needed yet: 1 is the layout every store so far has had).
+pub const SCHEMA: u64 = 1;
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
@@ -247,9 +251,12 @@ fn dec<T: DeserializeOwned>(b: &[u8]) -> Result<T> {
 }
 
 impl Store {
-    pub fn open(dir: &Path) -> Result<Store> {
+    /// Open (or create) the store in `dir`; with `compact`, give back the free space redb keeps (it never shrinks
+    /// its file on its own) before anything else uses it.
+    pub fn open(dir: &Path, compact: bool) -> Result<Store> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let db = Database::create(dir.join("freefitty.redb")).context("opening the data file")?;
+        let file = dir.join("freefitty.redb");
+        let mut db = Database::create(&file).context("opening the data file")?;
         let w = db.begin_write()?;
         {
             w.open_table(THREADS)?;
@@ -261,10 +268,55 @@ impl Store {
             w.open_table(INVOCATIONS)?;
             w.open_table(TOOLSETS)?;
             w.open_table(EXPERTS)?;
-            w.open_table(META)?;
+            let mut meta = w.open_table(META)?;
+            let schema = meta.get("schema")?.map(|v| v.value());
+            match schema {
+                // a store from before the key (all of them had layout 1), or a new one
+                None => { meta.insert("schema", SCHEMA)?; }
+                Some(v) if v > SCHEMA => bail!("{} was written by a newer freefitty (schema {v}); this binary reads up to {SCHEMA}", file.display()),
+                Some(v) if v < SCHEMA => bail!("{} has schema {v} and no migration to {SCHEMA} exists", file.display()),
+                Some(_) => {}
+            }
         }
         w.commit()?;
+        if compact {
+            let before = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+            let t = std::time::Instant::now();
+            db.compact().context("compacting the data file")?;
+            let after = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+            tracing::info!("store compacted: {:.1} -> {:.1} MB in {:.1}s", before as f64 / 1e6, after as f64 / 1e6, t.elapsed().as_secs_f64());
+        }
         Ok(Store { db })
+    }
+
+    /// A consistent snapshot of every table into a new redb file at `to` (written beside it and renamed), taken
+    /// inside one read transaction, so the daemon keeps running. The bytes written.
+    pub fn backup(&self, to: &Path) -> Result<u64> {
+        let part = to.with_extension("redb.part");
+        let _ = std::fs::remove_file(&part);
+        {
+            let out = Database::create(&part).with_context(|| format!("creating {}", part.display()))?;
+            let r = self.db.begin_read()?;
+            let w = out.begin_write()?;
+            macro_rules! copy {
+                ($($t:ident),*) => {$({
+                    let src = r.open_table($t)?;
+                    let mut dst = w.open_table($t)?;
+                    for e in src.iter()? { let (k, v) = e?; dst.insert(k.value(), v.value())?; }
+                })*};
+            }
+            copy!(THREADS, MESSAGES, EVENTS, PROCESSED, DLQ, REPLIES, INVOCATIONS, TOOLSETS, EXPERTS, META);
+            w.commit()?;
+        }
+        std::fs::rename(&part, to).with_context(|| format!("renaming to {}", to.display()))?;
+        Ok(std::fs::metadata(to).map(|m| m.len()).unwrap_or(0))
+    }
+
+    /// Check that a file is a store this binary can open (its schema), without opening it for writing.
+    pub fn schema_of(file: &Path) -> Result<u64> {
+        let db = Database::open(file).with_context(|| format!("opening {}", file.display()))?;
+        let r = db.begin_read()?;
+        Ok(r.open_table(META)?.get("schema")?.map(|v| v.value()).unwrap_or(1))
     }
 
     fn next_seq(meta: &mut redb::Table<&str, u64>) -> Result<u64> {
@@ -750,5 +802,30 @@ impl Store {
             "replies": r.open_table(REPLIES)?.len()?,
             "invocations": r.open_table(INVOCATIONS)?.len()?,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_store_from_a_newer_schema_is_refused_and_a_backup_reopens() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let s = Store::open(d.path(), true).unwrap();
+            let ev = Event { id: "e1".into(), thread: "t1".into(), due_ms: 0, created_ms: 0, attempts: 0, kind: EventKind::User { text: "hi".into(), metadata: Value::Null } };
+            s.push(ev).unwrap();
+            let b = d.path().join("snap.redb");
+            assert!(s.backup(&b).unwrap() > 0);
+            assert_eq!(Store::schema_of(&b).unwrap(), SCHEMA);
+            let back = Database::open(&b).unwrap();
+            assert!(back.begin_read().unwrap().open_table(THREADS).unwrap().get("t1").unwrap().is_some(), "the snapshot holds the thread");
+            let w = s.db.begin_write().unwrap();
+            w.open_table(META).unwrap().insert("schema", SCHEMA + 1).unwrap();
+            w.commit().unwrap();
+        }
+        let e = Store::open(d.path(), false).err().expect("refused");
+        assert!(e.to_string().contains("newer freefitty"), "{e}");
     }
 }

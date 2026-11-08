@@ -59,6 +59,8 @@ const MAX_TEXT: usize = 256 << 10;
 pub fn routes(app: Arc<App>) -> AxumRouter {
     AxumRouter::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
+        .route("/admin/backup", post(admin_backup))
         .route("/say", post(say))
         .route("/output", get(output))
         .route("/threads", get(threads))
@@ -105,6 +107,7 @@ fn thread_id_ok(t: &str) -> bool {
 async fn health(State(app): Shared) -> Json<Value> {
     Json(json!({
         "status": "ok",
+        "build": crate::BUILD,
         "uptime_s": now_ms().saturating_sub(app.started_ms) / 1000,
         "model": app.cfg.model,
         "nodes": app.router.view().await,
@@ -113,6 +116,35 @@ async fn health(State(app): Shared) -> Json<Value> {
         "store": app.store.counts().unwrap_or(Value::Null),
         "tools": app.tools.current().await.defs.len(),
     }))
+}
+
+/// A store snapshot now, into <data_dir>/backups (newest backup_keep kept).
+async fn admin_backup(State(app): Shared, headers: HeaderMap) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    let (store, dir, keep) = (app.store.clone(), app.cfg.data_dir.join("backups"), app.cfg.backup_keep.max(1));
+    match tokio::task::spawn_blocking(move || crate::backup_now(&store, &dir, keep)).await {
+        Ok(Ok((p, n))) => Json(json!({"backup": p, "bytes": n})).into_response(),
+        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Prometheus text: the engine's counters and histograms, then the router, queue and store numbers read now.
+async fn metrics(State(app): Shared) -> Response {
+    let mut counters = Vec::new();
+    if let Ok(Value::Object(m)) = serde_json::to_value(app.router.counts()) {
+        for (k, v) in m { if let Some(n) = v.as_f64() { counters.push((format!("freefitty_router_{k}_total"), n)); } }
+    }
+    let mut gauges = vec![("freefitty_uptime_seconds".to_owned(), (now_ms().saturating_sub(app.started_ms) / 1000) as f64),
+                          ("freefitty_tools".to_owned(), app.tools.current().await.defs.len() as f64),
+                          ("freefitty_nodes_up".to_owned(), app.router.up_nodes().await.len() as f64)];
+    for (prefix, v) in [("queue", app.queue.stats()), ("store", app.store.counts().unwrap_or(Value::Null))] {
+        if let Value::Object(m) = v {
+            for (k, v) in m { if let Some(n) = v.as_f64() { gauges.push((format!("freefitty_{prefix}_{k}"), n)); } }
+        }
+    }
+    if let Some(p) = &app.engine.parking { gauges.push(("freefitty_parked_bytes".to_owned(), p.bytes() as f64)); }
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], app.engine.metrics.render(crate::BUILD, &counters, &gauges)).into_response()
 }
 
 #[derive(Deserialize)]

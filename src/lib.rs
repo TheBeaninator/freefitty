@@ -7,9 +7,13 @@
 
 pub mod api;
 pub mod config;
+/// The version and the commit this binary was built from ("-dirty" when the tree had changes).
+pub const BUILD: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("FREEFITTY_COMMIT"), ")");
+
 pub mod engine;
 pub mod park;
 pub mod experts;
+pub mod metrics;
 pub mod queue;
 pub mod rap;
 pub mod router;
@@ -51,7 +55,7 @@ impl Running {
 pub async fn start(cfg: config::Config) -> Result<Running> {
     cfg.check()?;
     let mut tasks = Vec::new();
-    let store = Arc::new(store::Store::open(&cfg.data_dir)?);
+    let store = Arc::new(store::Store::open(&cfg.data_dir, cfg.compact_on_start)?);
     // bound first: with no callback_base the tool servers call back to the port actually taken
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await.with_context(|| format!("binding {}", cfg.listen))?;
     let addr = listener.local_addr()?;
@@ -70,7 +74,7 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
         tracing::info!("parking sleepers' cached state in {} ({} GiB parked now, cap {} GiB)", dir.display(), p.bytes() >> 30, cfg.park_max_gib);
         Some(Arc::new(p))
     } else { None };
-    let engine = Arc::new(engine::Engine { cfg: cfg.clone(), store: store.clone(), router: router.clone(), tools: tools.clone(), system, compact_prompt, callback_url: cfg.callback_url(), scale_hint: std::sync::atomic::AtomicU64::new(0), parking, inflight: Default::default(), me: Default::default(), experts: experts.clone(), deliver: Default::default() });
+    let engine = Arc::new(engine::Engine { cfg: cfg.clone(), store: store.clone(), router: router.clone(), tools: tools.clone(), system, compact_prompt, callback_url: cfg.callback_url(), scale_hint: std::sync::atomic::AtomicU64::new(0), parking, inflight: Default::default(), me: Default::default(), experts: experts.clone(), deliver: Default::default(), metrics: Default::default() });
     let _ = engine.me.set(Arc::downgrade(&engine));
     let replies = Arc::new(Notify::new());
 
@@ -131,6 +135,23 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
         f.notify_one();
     }));
 
+    // snapshots of the store, newest backup_keep kept: one at start when the newest is older than the interval
+    if cfg.backup_every_h > 0 {
+        let (s, dir, every, keep) = (store.clone(), cfg.data_dir.join("backups"), cfg.backup_every_h * 3600, cfg.backup_keep.max(1));
+        tasks.push(tokio::spawn(async move {
+            loop {
+                let newest = newest_backup_age(&dir);
+                if newest.is_none_or(|age| age >= every) {
+                    match backup_now(&s, &dir, keep) {
+                        Ok((p, n)) => tracing::info!("store snapshot {} ({:.1} MB)", p.display(), n as f64 / 1e6),
+                        Err(e) => tracing::warn!("store snapshot failed: {e:#}"),
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        }));
+    }
+
     // replies nobody collected expire
     let s = store.clone();
     let days = cfg.reply_retention_days;
@@ -153,4 +174,26 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
 
     tracing::info!("freefitty serving on {addr}; {} node(s), data in {}", cfg.nodes.len(), cfg.data_dir.display());
     Ok(Running { app, addr, tasks, server, stop, fault })
+}
+
+/// Seconds since the newest snapshot in `dir` was written, if there is one.
+fn newest_backup_age(dir: &std::path::Path) -> Option<u64> {
+    std::fs::read_dir(dir).ok()?.flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".redb"))
+        .filter_map(|e| e.metadata().ok()?.modified().ok()?.elapsed().ok())
+        .min().map(|d| d.as_secs())
+}
+
+/// Take a snapshot now into `dir` (freefitty-<utc>.redb) and keep the newest `keep`: its path and size.
+pub fn backup_now(store: &store::Store, dir: &std::path::Path, keep: usize) -> Result<(std::path::PathBuf, u64)> {
+    // one at a time (the start-of-day snapshot and an operator's can coincide), each under its own name
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(format!("freefitty-{}.redb", chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ")));
+    let n = store.backup(&path)?;
+    let mut all: Vec<_> = std::fs::read_dir(dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "redb")).collect();
+    all.sort();
+    for old in all.iter().take(all.len().saturating_sub(keep)) { let _ = std::fs::remove_file(old); }
+    Ok((path, n))
 }

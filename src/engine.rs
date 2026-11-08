@@ -37,6 +37,7 @@ pub struct Engine {
     /// This engine, for tasks that outlive a call (a park firing later); set once the engine is in its Arc.
     pub me: std::sync::OnceLock<std::sync::Weak<Engine>>,
     pub experts: Arc<crate::experts::Experts>,
+    pub metrics: Arc<crate::metrics::Metrics>,
     /// Queues an event from outside a slice (a commissioned expert's result); set once the queue exists.
     pub deliver: Arc<std::sync::OnceLock<Box<dyn Fn(Event) + Send + Sync>>>,
 }
@@ -353,6 +354,7 @@ impl Engine {
                 Err(ChatError::Transient(e)) | Err(ChatError::Rejected(e)) => return Ok(Outcome::Transient(e)),
             };
             meta.node = Some(turn.node.clone());
+            self.metrics.turn(&turn.node, turn.prompt_tokens, turn.cached_tokens, turn.ran_ms, turn.waited_ms);
             // the parenthesis closes right after the cache count: harvesters match "(N prompt tokens, M from its cache)"
             let timing = format!(" in {:.0} s{}", turn.ran_ms as f64 / 1000.0,
                                  if turn.waited_ms >= 1000 { format!(", after {} s waiting for a slot", turn.waited_ms / 1000) } else { String::new() });

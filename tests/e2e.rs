@@ -1134,3 +1134,23 @@ async fn a_slice_that_panics_is_a_counted_failure_and_dead_letters() {
     assert_eq!(api.output("ok1", 10).await.unwrap()["text"], "hi: hello");
     r.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_health_and_a_backup_on_demand() {
+    let h = harness().await;
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.say("hello", Some("m1")).await;
+    api.output("m1", 10).await.unwrap();
+    assert!(api.get("/health").await["build"].as_str().unwrap().starts_with(env!("CARGO_PKG_VERSION")));
+    let m = reqwest::get(format!("{}/metrics", api.base)).await.unwrap().text().await.unwrap();
+    assert!(m.contains("freefitty_build_info{version="), "{m}");
+    assert!(m.contains("freefitty_slices_total{outcome=\"done\"} 1"), "{m}");
+    assert!(m.lines().any(|l| l.starts_with("freefitty_node_cached_tokens_total{node=") && l.ends_with(" 90")), "the fake node's 90 cached tokens: {m}");
+    assert!(m.contains("freefitty_turn_seconds_count 1") && m.contains("freefitty_queue_queued"), "{m}");
+    let b = api.post("/admin/backup", json!({})).await;
+    let p = std::path::PathBuf::from(b["backup"].as_str().unwrap_or_else(|| panic!("{b}")));
+    assert!(p.exists() && b["bytes"].as_u64().unwrap() > 0, "{b}");
+    assert_eq!(freefitty::store::Store::schema_of(&p).unwrap(), freefitty::store::SCHEMA);
+    r.shutdown().await;
+}
