@@ -50,6 +50,9 @@ fn text_for_elephant(msgs: &[Value]) -> String {
 
 pub enum Outcome {
     Done,
+    /// Nothing ran (the daemon is stopping and the turn never reached a node): the events stay as they were, no
+    /// attempt counted, and run after the restart.
+    Requeue,
     /// Nothing was committed; the events run again after `retry_after_s`, and dead-letter past `max_attempts`.
     Transient(String),
     /// Nothing was committed and no retry can help; the events dead-letter now and the thread is closed.
@@ -253,6 +256,7 @@ impl Engine {
                     if refocus.is_some() { tracing::info!("{thread}: refocus asked for, nothing to fold yet"); }
                 }
                 Refocused::Failed(why) => return Ok(Outcome::Transient(why)),
+                Refocused::Stopping => return Ok(Outcome::Requeue),
             }
         }
         if new_messages.is_empty() {
@@ -351,6 +355,7 @@ impl Engine {
                 Err(ChatError::Rejected(e)) if body.get("steer").is_some() && e.contains("steer") => {
                     return Ok(Outcome::Fatal(format!("the node refuses this thread's steering: {e}")));
                 }
+                Err(ChatError::Stopping) => return Ok(Outcome::Requeue),
                 Err(ChatError::Transient(e)) | Err(ChatError::Rejected(e)) => return Ok(Outcome::Transient(e)),
             };
             meta.node = Some(turn.node.clone());
@@ -797,6 +802,7 @@ impl Engine {
         for attempt in 0..2 {
             let turn = match self.router.chat(meta.node.as_deref(), &body).await {
                 Ok(t) => t,
+                Err(ChatError::Stopping) => return Ok(Refocused::Stopping),
                 Err(ChatError::Transient(e)) => return Ok(Refocused::Failed(format!("refocus: {e}"))),
                 Err(ChatError::Rejected(_)) if body.get("tool_choice").is_some() => {
                     body.as_object_mut().unwrap().remove("tool_choice");
@@ -833,6 +839,8 @@ enum Refocused {
     Done(Compaction),
     Nothing,
     Failed(String),
+    /// The daemon is stopping before the notes' request reached a node.
+    Stopping,
 }
 
 #[derive(Debug, Clone)]

@@ -72,6 +72,9 @@ pub struct Router {
     nodes: Mutex<Vec<NodeState>>,
     counts: Mutex<Counts>,
     notify: Notify,
+    /// Set when the daemon stops: a turn still waiting for a slot gives up (ChatError::Stopping) instead of holding
+    /// the stop for up to slice_timeout_s; a turn already sent to a node finishes.
+    stopping: std::sync::atomic::AtomicBool,
 }
 
 pub struct Turn {
@@ -92,10 +95,15 @@ pub enum ChatError {
     Transient(String),
     /// The node rejected the request itself (400): retrying the same prompt cannot help.
     Rejected(String),
+    /// The daemon is stopping and the turn never reached a node: nothing ran, the slice re-queues as it was.
+    Stopping,
 }
 impl std::fmt::Display for ChatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { ChatError::Transient(s) | ChatError::Rejected(s) => f.write_str(s) }
+        match self {
+            ChatError::Transient(s) | ChatError::Rejected(s) => f.write_str(s),
+            ChatError::Stopping => f.write_str("the daemon is stopping"),
+        }
     }
 }
 
@@ -113,6 +121,7 @@ impl Router {
             nodes: Mutex::new(nodes),
             counts: Mutex::new(Counts::default()),
             notify: Notify::new(),
+            stopping: Default::default(),
         });
         for i in 0..cfg.nodes.len() {
             let r = r.clone();
@@ -215,6 +224,7 @@ impl Router {
             {
                 let mut nodes = self.nodes.lock().await;
                 if let Some(w) = waiting_on.take() { nodes[w].wanted -= 1; }
+                if self.is_stopping() { bail!("the daemon is stopping"); }
                 let up: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].up && !avoid.contains(&i)).collect();
                 if up.is_empty() {
                     if started.elapsed() >= Duration::from_secs(self.cfg.node_down_wait_s) {
@@ -256,6 +266,16 @@ impl Router {
             waited = true;
             let _ = tokio::time::timeout(POLL, notified).await;
         }
+    }
+
+    /// The daemon is stopping: turns waiting for a slot give up now (see `stopping`).
+    pub fn stop(&self) {
+        self.stopping.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     async fn done(&self, i: usize) {
@@ -424,7 +444,8 @@ impl Router {
         let total = self.cfg.nodes.len();
         let placed_at = Instant::now();
         loop {
-            let (i, from) = self.place(home, tokens, &avoid).await.map_err(|e| ChatError::Transient(e.to_string()))?;
+            let (i, from) = self.place(home, tokens, &avoid).await
+                .map_err(|e| if self.is_stopping() { ChatError::Stopping } else { ChatError::Transient(e.to_string()) })?;
             let (waited, sent_at) = (placed_at.elapsed(), Instant::now());
             let (url, from_url) = {
                 let nodes = self.nodes.lock().await;
@@ -552,7 +573,7 @@ mod tests {
 
     fn router(nodes: Vec<NodeState>, move_threads: bool) -> Router {
         let cfg = Config { move_threads, spill_tokens: 1000, ..Config::default() };
-        Router { cfg, client: reqwest::Client::new(), xfer_client: reqwest::Client::new(), nodes: Mutex::new(nodes), counts: Mutex::new(Counts::default()), notify: Notify::new() }
+        Router { cfg, client: reqwest::Client::new(), xfer_client: reqwest::Client::new(), nodes: Mutex::new(nodes), counts: Mutex::new(Counts::default()), notify: Notify::new(), stopping: Default::default() }
     }
 
     fn node(url: &str, held: bool, xfer: bool) -> NodeState {

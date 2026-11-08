@@ -1154,3 +1154,27 @@ async fn metrics_health_and_a_backup_on_demand() {
     assert_eq!(freefitty::store::Store::schema_of(&p).unwrap(), freefitty::store::SCHEMA);
     r.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_does_not_wait_for_turns_still_queued_for_a_slot() {
+    let mut h = harness().await;
+    h.cfg.slice_timeout_s = 60;
+    h.model.busy.store(2, Ordering::Relaxed);
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.say("hello", Some("st1")).await;
+    assert!(api.output("st1", 2).await.is_none(), "the node is full: the turn waits for a slot");
+    let t = std::time::Instant::now();
+    r.shutdown().await;
+    assert!(t.elapsed() < Duration::from_secs(10), "the stop took {:?}: a waiting turn held it", t.elapsed());
+    assert_eq!(h.model.calls.load(Ordering::Relaxed), 0, "nothing reached the node");
+    // after a restart with a free slot, the turn runs, and nothing counted as a failed attempt
+    h.model.busy.store(0, Ordering::Relaxed);
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    assert_eq!(api.output("st1", 10).await.expect("the re-queued turn runs")["text"], "hi: hello");
+    assert!(api.get("/dlq").await.as_array().unwrap().is_empty());
+    let m = reqwest::get(format!("{}/metrics", api.base)).await.unwrap().text().await.unwrap();
+    assert!(!m.contains("outcome=\"transient\""), "a stop is not a failure: {m}");
+    r.shutdown().await;
+}

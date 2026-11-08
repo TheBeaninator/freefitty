@@ -303,7 +303,9 @@ to that directory. pod-ff reads thread sizes and last turns from `/threads` and 
 director rounds run on the same daemon under thread ids starting `isk-`.
 
 Upgrading: build on a machine with the pod's glibc or older, copy the binary over, `install` it, and
-`systemctl --user restart freefitty`; running slices finish first, and a turn that was waiting re-queues. Keep the
+`systemctl --user restart freefitty`; turns already at a node finish first, and a turn still waiting for a slot
+gives up at once and re-queues as it was (no attempt counted), so a stop takes as long as the longest running turn,
+not the slice timeout. A kill is safe too: a slice commits all or nothing, so an interrupted one just runs again. Keep the
 old binary as `freefitty.bak-<stamp>`. Reading the daemon: the journal has one line per turn (`(N prompt tokens, M
 from its cache) in R s, after S s waiting for a slot`), one per cut, one per failed slice; `freefitty status` shows the nodes and
 counts; `freefitty threads` the threads with their last message kind, so a watcher sees one that stopped talking
@@ -391,7 +393,7 @@ slice timeout that is not a failure; a tool's images reaching the model; and a s
 restored into the node when it wakes, nothing parked when the node holds nothing, and its file removed with the
 thread; a slice that panics counted as a failed attempt and dead-lettered; `/metrics` after a turn (outcome, cached
 tokens per node, histograms) and a snapshot on demand that reopens with its schema; a store from a newer schema
-refused; overdue newcomers leaving one slot where two threads wait for their home; an unreachable node named when a
+refused; a stop that does not wait for a turn still queued for a slot, which runs after the restart uncounted; overdue newcomers leaving one slot where two threads wait for their home; an unreachable node named when a
 persona's vector is checked. `FREEFITTY_NODES=http://a:5300,http://b:5300
 cargo test --test real_nodes -- --ignored` proves the cache move on two real strixite nodes.
 

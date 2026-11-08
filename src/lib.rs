@@ -39,6 +39,8 @@ impl Running {
     /// Stop taking work, let running slices finish (they commit atomically), then stop serving.
     pub async fn shutdown(self) {
         self.app.queue.stop();
+        // turns still waiting for a slot give up now and re-queue; only turns already at a node are waited for
+        self.app.router.stop();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(self.app.cfg.slice_timeout_s + 5);
         while self.app.queue.running() > 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;

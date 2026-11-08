@@ -194,7 +194,7 @@ impl Queue {
                 Outcome::Transient(format!("panic: {why}"))
             }
         };
-        let kind = match &outcome { Outcome::Done => "done", Outcome::Transient(w) if w.starts_with("panic: ") => "", Outcome::Transient(_) => "transient", Outcome::Fatal(_) => "fatal" };
+        let kind = match &outcome { Outcome::Done => "done", Outcome::Requeue => "requeued", Outcome::Transient(w) if w.starts_with("panic: ") => "", Outcome::Transient(_) => "transient", Outcome::Fatal(_) => "fatal" };
         if !kind.is_empty() { self.engine.metrics.slice(kind, began.elapsed().as_secs_f64()); }
         let result = match outcome {
             Outcome::Done => {
@@ -224,6 +224,11 @@ impl Queue {
                     }
                     Err(e) => Err(e),
                 }
+            }
+            Outcome::Requeue => {
+                // nothing ran: the stored events are untouched (no attempt counted) and the next start runs them
+                tracing::info!("{thread}: stopping before the turn reached a node; it runs after the restart");
+                Ok(())
             }
             Outcome::Fatal(why) => {
                 tracing::error!("{thread}: {why}; its events are set aside and the thread is closed");
