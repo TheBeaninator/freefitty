@@ -198,7 +198,7 @@ fn d_park_gib() -> u64 { 64 }
 fn d_keep_images() -> usize { 4 }
 fn d_grant_check() -> u64 { 5 }
 fn d_toolset_refresh() -> u64 { 300 }
-fn d_max_output() -> u64 { 4096 }
+fn d_max_output() -> u64 { 16384 }
 fn d_slice_timeout() -> u64 { 900 }
 fn d_attempts() -> u32 { 3 }
 fn d_retry() -> u64 { 15 }

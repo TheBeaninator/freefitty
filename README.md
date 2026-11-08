@@ -167,7 +167,7 @@ numbers, not from a reflex either way.
 
 **The budget window, on.** A node's context is finite and a pod thread is not: a card's thread runs for days and
 its tool results pile up. When a thread's next view would pass `window_tokens` (default: the nodes' context length
-minus `max_output_tokens` and an 8k margin, 249,856 on today's nodes), its oldest whole units leave the view until
+minus `max_output_tokens` and an 8k margin, 237,568 on today's nodes with the 16k default), its oldest whole units leave the view until
 it is under `window_trim_tokens` (default five eighths of the budget), and the cut then holds until the budget is
 crossed again. A unit starts at an input, a person's message or a tool result, so the view never opens with the
 model's own words; a result whose call left the view gets a stub call so the template still sees a call before
