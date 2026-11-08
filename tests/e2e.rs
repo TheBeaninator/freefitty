@@ -1078,3 +1078,29 @@ async fn a_node_refusing_a_threads_steering_closes_it_at_once() {
     assert!(api.get("/dlq").await.as_array().unwrap().iter().all(|e| e["thread"] != "rv" || e["attempts"].as_u64().unwrap() <= 1), "not retried");
     r.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persona_needs_its_vector_on_every_node() {
+    let mut h = harness().await;
+    let dir = tempfile::tempdir().unwrap();
+    h.cfg.experts_dir = Some(dir.path().to_path_buf());
+    h.cfg.commission_steer = true;
+    *h.model.steer_list.lock().unwrap() = Some(json!({"vectors": [{"name": "villain24", "layer": 24}]}));
+    // a second node that holds no vectors: villain24 is not on every node
+    let other = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(2), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false), probe_tokens: std::sync::atomic::AtomicU64::new(u64::MAX), steer_list: std::sync::Mutex::new(Some(json!({"vectors": []}))), refuse_steer: AtomicBool::new(false) });
+    let other_url = serve(Router::new().route("/health", get(health)).route("/steer", get(steer_list)).with_state(other.clone())).await;
+    h.cfg.nodes.push(other_url);
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.say("commission persona2", Some("cv")).await;
+    let out = api.output("cv", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.contains("not every node holds a steering vector named \"villain24\""), "{out}");
+    assert!(!dir.path().join("persona2.toml").exists());
+    // the other node gains it: the commission goes through
+    *other.steer_list.lock().unwrap() = Some(json!({"vectors": [{"name": "villain24", "layer": 24}]}));
+    api.say("commission persona3", Some("cv")).await;
+    assert!(api.output("cv", 10).await.unwrap()["text"].as_str().unwrap().contains("[Tool Call: commission_expert"));
+    let out = api.output("cv", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.contains("persona3@") && dir.path().join("persona3.toml").exists(), "{out}");
+    r.shutdown().await;
+}

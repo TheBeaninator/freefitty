@@ -354,15 +354,24 @@ impl Router {
         r.json::<Value>().await.ok()?.get("tokens")?.as_u64()
     }
 
-    /// The steering vectors a node holds (strixite GET /steer): name -> layer; None when it cannot say.
+    /// The steering vectors EVERY up node holds (strixite GET /steer): name -> layer. A thread may be placed on any
+    /// node, so a vector one node lacks would fail there: the intersection, and a node that cannot list counts as
+    /// holding none. None when no node is up.
     pub async fn steer_vectors(&self) -> Option<std::collections::HashMap<String, i64>> {
+        let mut all: Option<std::collections::HashMap<String, i64>> = None;
         for url in self.up_nodes().await {
-            let Ok(r) = self.client.get(format!("{url}/steer")).timeout(Duration::from_secs(5)).send().await else { continue };
-            if !r.status().is_success() { continue; }
-            let v: Value = r.json().await.ok()?;
-            return Some(v.get("vectors")?.as_array()?.iter().filter_map(|x| Some((x.get("name")?.as_str()?.to_owned(), x.get("layer")?.as_i64()?))).collect());
+            let held: std::collections::HashMap<String, i64> = async {
+                let r = self.client.get(format!("{url}/steer")).timeout(Duration::from_secs(5)).send().await.ok()?;
+                if !r.status().is_success() { return None; }
+                let v: Value = r.json().await.ok()?;
+                Some(v.get("vectors")?.as_array()?.iter().filter_map(|x| Some((x.get("name")?.as_str()?.to_owned(), x.get("layer")?.as_i64()?))).collect())
+            }.await.unwrap_or_default();
+            all = Some(match all {
+                None => held,
+                Some(mut a) => { a.retain(|k, l| held.get(k) == Some(l)); a }
+            });
         }
-        None
+        all
     }
 
     /// Put saved state (a parked thread's, a frozen expert's) into a node's cache; the bytes sent.

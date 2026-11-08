@@ -219,7 +219,8 @@ separate from voice and a later freeze of those notes bakes in no persona (the p
 view without the steered cache). Steering touches every token, tool-call JSON included, so `commission_expert` may
 not steer (`commission_steer`, off) until a steered goldfish has been measured against a plain one for verdict
 agreement and malformed calls; once on, a commission's scale is bounded by `max_steer_scale` (8) and its vector
-names are checked against what a node lists (strixite `GET /steer`). Steering is a composition barrier: experts
+names are checked against what every up node lists (strixite `GET /steer`; the intersection, since a thread may
+run on any node, and a node that cannot list counts as holding none). Steering is a composition barrier: experts
 under different steering have different cache keys and cannot be spliced. The vectors are the one durable source
 that is not in the transcript: a reader of the store cannot rebuild a steered view without the steer-dir, so the
 vectors must be kept like the store.

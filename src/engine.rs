@@ -610,9 +610,9 @@ impl Engine {
                 Some(held) => if let Some(s) = steer.iter().find(|s| !held.contains_key(&s.vector)) {
                     let mut names: Vec<&String> = held.keys().collect();
                     names.sort();
-                    anyhow::bail!("no node holds a steering vector named {:?}; they hold: {}", s.vector, names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", "));
+                    anyhow::bail!("not every node holds a steering vector named {:?} (a thread may run on any of them); all of them hold: {}", s.vector, if names.is_empty() { "none".to_owned() } else { names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ") });
                 },
-                None => anyhow::bail!("no node lists steering vectors (strixite steer-dir), so a steered expert could not run"),
+                None => anyhow::bail!("no node is up to list steering vectors, so a steered expert could not be checked"),
             }
         }
         let e = crate::experts::commission(&self.cfg, name, a.get("description").and_then(|d| d.as_str()).unwrap_or(""), a.get("ack").and_then(|d| d.as_str()), &reads, rap::goldfish_tools(&tools), steer, thread)?;
