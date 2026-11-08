@@ -205,6 +205,9 @@ impl Router {
     /// up to `node_down_wait_s` while none is up.
     async fn place(&self, home: Option<&str>, tokens: u64, avoid: &[usize]) -> Result<(usize, Option<usize>)> {
         let started = Instant::now();
+        // a newcomer's patience is newcomer_wait_s plus up to half again, so newcomers born together (several
+        // goldfish of one turn) do not all turn overdue in the same second
+        let patience = Duration::from_millis(self.cfg.newcomer_wait_s * 1000 + rand::random_range(0..=self.cfg.newcomer_wait_s * 500));
         let mut waiting_on: Option<usize> = None;
         let mut waited = false;
         loop {
@@ -222,8 +225,11 @@ impl Router {
                     // a slot freeing on a node goes to the threads waiting for that node (their cache is there)
                     // before a newcomer; past newcomer_wait_s a newcomer stops yielding, or under steady load new
                     // threads (goldfish, expert freezes) would never be placed (pod, 2026-11-08: 31 min)
-                    let overdue = home.is_none() && started.elapsed() >= Duration::from_secs(self.cfg.newcomer_wait_s);
-                    let mut free: Vec<usize> = up.iter().copied().filter(|&i| !nodes[i].held && nodes[i].free() - if overdue { 0 } else { nodes[i].wanted as i64 } > 0).collect();
+                    let overdue = home.is_none() && started.elapsed() >= patience;
+                    // overdue, a newcomer may take a slot home-waiters want, but where two or more of them wait it leaves
+                    // them one (a burst of overdue newcomers never takes a node's every slot from its own threads)
+                    let reserve = |w: u32| if overdue { (w as i64 - 1).max(0) } else { w as i64 };
+                    let mut free: Vec<usize> = up.iter().copied().filter(|&i| !nodes[i].held && nodes[i].free() - reserve(nodes[i].wanted) > 0).collect();
                     // a node a thread can later leave with its cache first; then the least loaded
                     free.sort_by_key(|&i| (nodes[i].xfer == Some(false), nodes[i].wanted as i64 - nodes[i].free(), nodes[i].load(), i));
                     let choice = match h {
@@ -355,23 +361,34 @@ impl Router {
     }
 
     /// The steering vectors EVERY up node holds (strixite GET /steer): name -> layer. A thread may be placed on any
-    /// node, so a vector one node lacks would fail there: the intersection, and a node that cannot list counts as
-    /// holding none. None when no node is up.
-    pub async fn steer_vectors(&self) -> Option<std::collections::HashMap<String, i64>> {
+    /// node, so a vector one node lacks would fail there: the intersection. A node that answers 404 (no steer-dir)
+    /// holds none; one that cannot be reached is tried three times and then named in the error, so a blip is not
+    /// mistaken for a missing vector. Err when no node is up or one stays unreachable.
+    pub async fn steer_vectors(&self) -> Result<std::collections::HashMap<String, i64>, String> {
         let mut all: Option<std::collections::HashMap<String, i64>> = None;
         for url in self.up_nodes().await {
-            let held: std::collections::HashMap<String, i64> = async {
-                let r = self.client.get(format!("{url}/steer")).timeout(Duration::from_secs(5)).send().await.ok()?;
-                if !r.status().is_success() { return None; }
-                let v: Value = r.json().await.ok()?;
-                Some(v.get("vectors")?.as_array()?.iter().filter_map(|x| Some((x.get("name")?.as_str()?.to_owned(), x.get("layer")?.as_i64()?))).collect())
-            }.await.unwrap_or_default();
+            let mut held = None;
+            for attempt in 0..3 {
+                match self.client.get(format!("{url}/steer")).timeout(Duration::from_secs(5)).send().await {
+                    Ok(r) if r.status().as_u16() == 404 => { held = Some(Default::default()); break; }
+                    Ok(r) if r.status().is_success() => {
+                        let v: Value = r.json().await.unwrap_or(Value::Null);
+                        held = Some(v.get("vectors").and_then(|a| a.as_array()).into_iter().flatten()
+                            .filter_map(|x| Some((x.get("name")?.as_str()?.to_owned(), x.get("layer")?.as_i64()?))).collect());
+                        break;
+                    }
+                    _ => if attempt < 2 { tokio::time::sleep(Duration::from_millis(500)).await },
+                }
+            }
+            let Some(held): Option<std::collections::HashMap<String, i64>> = held else {
+                return Err(format!("{url} did not answer GET /steer (three tries); try again"));
+            };
             all = Some(match all {
                 None => held,
                 Some(mut a) => { a.retain(|k, l| held.get(k) == Some(l)); a }
             });
         }
-        all
+        all.ok_or_else(|| "no node is up to list steering vectors".to_owned())
     }
 
     /// Put saved state (a parked thread's, a frozen expert's) into a node's cache; the bytes sent.
@@ -576,6 +593,18 @@ mod tests {
         assert_eq!(r.place(None, 10, &[]).await.unwrap(), (0, None));
         assert!(t.elapsed() >= Duration::from_secs(1), "it waited its turn first");
         assert_eq!(r.counts().new, 1);
+    }
+
+    #[tokio::test]
+    async fn overdue_newcomers_leave_one_slot_where_two_threads_wait_for_home() {
+        let mut a = node("a", false, true);
+        a.mine = 1;
+        a.wanted = 2;  // two threads wait for a's last free slot
+        let mut r = router(vec![a], true);
+        r.cfg.newcomer_wait_s = 0;
+        r.cfg.node_down_wait_s = 30;
+        let placed = tokio::time::timeout(Duration::from_millis(2500), r.place(None, 10, &[])).await;
+        assert!(placed.is_err(), "the last slot stays with the threads waiting for their home");
     }
 
     #[tokio::test]

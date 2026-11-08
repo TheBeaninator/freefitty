@@ -205,8 +205,13 @@ impl Experts {
             return Ok(json!({"key": key, "state": path, "bytes": std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0), "frozen_before": true}));
         }
         if !self.freezing.lock().unwrap().insert(path.clone()) { bail!("{key} is being frozen already"); }
+        // released however the freeze ends: an error, a panic, or the task being dropped at an await
+        struct Unmark<'a>(&'a std::sync::Mutex<HashSet<PathBuf>>, PathBuf);
+        impl Drop for Unmark<'_> {
+            fn drop(&mut self) { self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.1); }
+        }
+        let _unmark = Unmark(&self.freezing, path.clone());
         let r = self.freeze_into(key, &path, store, router, system, defs, max_tokens).await;
-        self.freezing.lock().unwrap().remove(&path);
         // other contexts of this version stay: a goldfish (scoped tools) and a thread born with every tool are
         // two live contexts of the same expert
         r

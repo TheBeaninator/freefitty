@@ -185,6 +185,9 @@ impl Engine {
         let mut image_messages: Vec<Value> = Vec::new();
         for (_, ev) in &live {
             match &ev.kind {
+                EventKind::User { text, .. } if !self.cfg.test_panic_on.is_empty() && *text == self.cfg.test_panic_on => {
+                    panic!("test_panic_on: {text}");
+                }
                 EventKind::User { text, .. } => {
                     // a person may speak while tool calls are outstanding: the calls stay pending and their
                     // results land later as tool messages (the templates render that)
@@ -607,12 +610,12 @@ impl Engine {
             }
             // checked now, against what the nodes hold: a wrong name would fail every goldfish of the expert later
             match self.router.steer_vectors().await {
-                Some(held) => if let Some(s) = steer.iter().find(|s| !held.contains_key(&s.vector)) {
+                Ok(held) => if let Some(s) = steer.iter().find(|s| !held.contains_key(&s.vector)) {
                     let mut names: Vec<&String> = held.keys().collect();
                     names.sort();
                     anyhow::bail!("not every node holds a steering vector named {:?} (a thread may run on any of them); all of them hold: {}", s.vector, if names.is_empty() { "none".to_owned() } else { names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ") });
                 },
-                None => anyhow::bail!("no node is up to list steering vectors, so a steered expert could not be checked"),
+                Err(e) => anyhow::bail!("the steering could not be checked: {e}"),
             }
         }
         let e = crate::experts::commission(&self.cfg, name, a.get("description").and_then(|d| d.as_str()).unwrap_or(""), a.get("ack").and_then(|d| d.as_str()), &reads, rap::goldfish_tools(&tools), steer, thread)?;

@@ -25,6 +25,8 @@ struct FakeModel {
     probe_tokens: std::sync::atomic::AtomicU64,
     steer_list: std::sync::Mutex<Option<Value>>,
     refuse_steer: AtomicBool,
+    /// GET /steer answers 500 (a node in trouble, not one without vectors)
+    steer_fail: AtomicBool,
 }
 
 async fn health(State(m): State<Arc<FakeModel>>) -> Json<Value> {
@@ -145,6 +147,7 @@ async fn probe(State(m): State<Arc<FakeModel>>) -> axum::response::Response {
 
 async fn steer_list(State(m): State<Arc<FakeModel>>) -> axum::response::Response {
     use axum::response::IntoResponse;
+    if m.steer_fail.load(Ordering::Relaxed) { return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
     match m.steer_list.lock().unwrap().clone() {
         Some(v) => Json(v).into_response(),
         None => axum::http::StatusCode::NOT_FOUND.into_response(),
@@ -218,7 +221,7 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
-    let model = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(0), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false), probe_tokens: std::sync::atomic::AtomicU64::new(u64::MAX), steer_list: std::sync::Mutex::new(None), refuse_steer: AtomicBool::new(false) });
+    let model = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(0), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false), probe_tokens: std::sync::atomic::AtomicU64::new(u64::MAX), steer_list: std::sync::Mutex::new(None), refuse_steer: AtomicBool::new(false), steer_fail: AtomicBool::new(false) });
     let model_url = serve(Router::new().route("/health", get(health)).route("/v1/chat/completions", post(completions)).route("/cache/export", post(export)).route("/cache/import", post(import)).route("/cache/probe", post(probe)).route("/steer", get(steer_list)).with_state(model.clone())).await;
     let tools = Arc::new(FakeTools { base: String::new(), invocations: AtomicUsize::new(0) });
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1087,7 +1090,7 @@ async fn a_persona_needs_its_vector_on_every_node() {
     h.cfg.commission_steer = true;
     *h.model.steer_list.lock().unwrap() = Some(json!({"vectors": [{"name": "villain24", "layer": 24}]}));
     // a second node that holds no vectors: villain24 is not on every node
-    let other = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(2), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false), probe_tokens: std::sync::atomic::AtomicU64::new(u64::MAX), steer_list: std::sync::Mutex::new(Some(json!({"vectors": []}))), refuse_steer: AtomicBool::new(false) });
+    let other = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(2), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false), probe_tokens: std::sync::atomic::AtomicU64::new(u64::MAX), steer_list: std::sync::Mutex::new(Some(json!({"vectors": []}))), refuse_steer: AtomicBool::new(false), steer_fail: AtomicBool::new(false) });
     let other_url = serve(Router::new().route("/health", get(health)).route("/steer", get(steer_list)).with_state(other.clone())).await;
     h.cfg.nodes.push(other_url);
     let r = freefitty::start(h.cfg.clone()).await.unwrap();
@@ -1096,11 +1099,38 @@ async fn a_persona_needs_its_vector_on_every_node() {
     let out = api.output("cv", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
     assert!(out.contains("not every node holds a steering vector named \"villain24\""), "{out}");
     assert!(!dir.path().join("persona2.toml").exists());
+    // a node in trouble is named, not taken for one without the vector
+    other.steer_fail.store(true, Ordering::Relaxed);
+    api.say("commission persona4", Some("cv")).await;
+    let out = api.output("cv", 15).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.contains("did not answer GET /steer"), "{out}");
+    other.steer_fail.store(false, Ordering::Relaxed);
     // the other node gains it: the commission goes through
     *other.steer_list.lock().unwrap() = Some(json!({"vectors": [{"name": "villain24", "layer": 24}]}));
     api.say("commission persona3", Some("cv")).await;
     assert!(api.output("cv", 10).await.unwrap()["text"].as_str().unwrap().contains("[Tool Call: commission_expert"));
     let out = api.output("cv", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
     assert!(out.contains("persona3@") && dir.path().join("persona3.toml").exists(), "{out}");
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slice_that_panics_is_a_counted_failure_and_dead_letters() {
+    let mut h = harness().await;
+    h.cfg.test_panic_on = "poison".into();
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.say("poison", Some("pz")).await;
+    // three attempts (retry_after_s 1), then the dead-letter queue; the daemon and other threads carry on
+    let mut dead = Value::Null;
+    for _ in 0..80 {
+        dead = api.get("/dlq").await;
+        if dead.as_array().is_some_and(|d| d.iter().any(|e| e["thread"] == "pz")) { break; }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let e = dead.as_array().unwrap().iter().find(|e| e["thread"] == "pz").cloned().expect("dead-lettered");
+    assert_eq!(e["attempts"], 3, "{e}");
+    api.say("hello", Some("ok1")).await;
+    assert_eq!(api.output("ok1", 10).await.unwrap()["text"], "hi: hello");
     r.shutdown().await;
 }

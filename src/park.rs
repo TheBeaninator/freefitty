@@ -22,7 +22,7 @@ pub struct Parking {
 impl Parking {
     pub fn new(dir: PathBuf, max_gib: u64) -> std::io::Result<Parking> {
         std::fs::create_dir_all(&dir)?;
-        let p = Parking { dir, max_bytes: max_gib << 30 };
+        let p = Parking { dir, max_bytes: max_gib.saturating_mul(1 << 30) };
         // a write cut short by a stop leaves its temporary file
         if let Ok(rd) = std::fs::read_dir(&p.dir) {
             for e in rd.flatten() {

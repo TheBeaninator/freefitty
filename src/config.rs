@@ -56,6 +56,10 @@ pub struct Config {
     /// version of itself; a 4-prompt vector broke the model past 16 on the pod).
     #[serde(default = "d_steer_scale")]
     pub max_steer_scale: f64,
+    /// Tests only: a slice whose user message is exactly this text panics (the panic path's test). Empty = never.
+    #[doc(hidden)]
+    #[serde(default)]
+    pub test_panic_on: String,
     /// The park directory's cap; the oldest files go first.
     #[serde(default = "d_park_gib")]
     pub park_max_gib: u64,

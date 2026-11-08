@@ -182,7 +182,16 @@ impl Queue {
         // no clock here: `slice_timeout_s` bounds each request to a node (the router's client), and the wait for a
         // free slot is not the thread's fault. Before 2026-11-07 a slice that queued behind long prompts for 15 min
         // failed "slice timed out" three times and dead-lettered; `/health` oldest_due_s is where the wait shows.
-        let outcome = self.engine.slice(&thread, &batch).await;
+        // a panic inside the slice (a poison event, a bug) is a failed attempt like any other: counted, retried, and
+        // dead-lettered at max_attempts, instead of the same events being picked and panicking again forever
+        let outcome = match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(self.engine.slice(&thread, &batch))).await {
+            Ok(o) => o,
+            Err(p) => {
+                let why = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "a panic".into());
+                tracing::error!("{thread}: the slice panicked ({why}); counted as a failed attempt");
+                Outcome::Transient(format!("panic: {why}"))
+            }
+        };
         let result = match outcome {
             Outcome::Done => {
                 let mut ev = self.events.lock().unwrap();
