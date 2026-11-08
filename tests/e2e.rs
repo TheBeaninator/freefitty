@@ -644,7 +644,7 @@ async fn a_full_context_closes_the_thread_at_once() {
     let th = api.get("/threads/thread-full").await;
     assert!(th["closed"].as_str().unwrap().contains("context full"), "{th}");
     assert_eq!(api.get("/dlq").await.as_array().unwrap().len(), 1);
-    assert!(th["prompt_tokens"].as_u64().unwrap() > 0 && th["prompt_est"].as_u64().unwrap() > 0, "{th}");
+    assert!(th["prompt_tokens"].as_u64().unwrap() > 0, "{th}");
     assert_eq!(th["window"]["cuts"], json!(0), "{th}");
     r.shutdown().await;
 }

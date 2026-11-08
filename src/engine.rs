@@ -73,6 +73,17 @@ pub fn calibrated(est: u64, scale: f64) -> u64 {
     if scale <= 1.0 { est } else { (est as f64 * scale) as u64 }
 }
 
+/// The bytes / 4 of a request's tool definitions: counted by the node, left out of the messages' estimate. On a
+/// short thread they are most of the prompt (4,258 tokens over a 450-token estimate on 2026-11-08), and that ratio,
+/// as the shared hint, closed a new goldfish as "context full" at ten times its size.
+pub fn overhead_tokens(body: &Value) -> u64 {
+    body.get("tools").map(|t| serde_json::to_vec(t).map(|b| b.len()).unwrap_or(0) as u64 / 4).unwrap_or(0)
+}
+
+/// The most the latest ratio of some other thread can scale a thread that has no count of its own yet. Qwen runs
+/// about 1.3 over bytes / 4; a thread's own count, or the node's overflow count, still scales past this.
+pub const HINT_SCALE_MAX: f64 = 2.0;
+
 /// A thread's own node-count-over-estimate ratio from its last turn, if it has one and it is over 1.
 pub fn own_scale(meta: &ThreadMeta) -> Option<f64> {
     (meta.prompt_est > 0 && meta.prompt_tokens > meta.prompt_est).then(|| meta.prompt_tokens as f64 / meta.prompt_est as f64)
@@ -373,7 +384,9 @@ impl Engine {
             }
             if let Some(p) = turn.prompt_tokens.filter(|&p| p > 0) {
                 meta.prompt_tokens = p;
-                meta.prompt_est = tokens(body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[])).max(1);
+                // the node's count includes the tool definitions and the template, which the estimate leaves out:
+                // learn a ratio only when the messages outweigh them, else a short thread's ratio runs to 10
+                meta.prompt_est = if overhead_tokens(&body) * 4 <= sent_est { sent_est.max(1) } else { 0 };
                 if let Some(r) = own_scale(&meta) { self.scale_hint.store((r * 1000.0) as u64, std::sync::atomic::Ordering::Relaxed); }
             }
             let (assistant, calls) = normalize(&turn.message);
@@ -729,7 +742,7 @@ impl Engine {
     fn scale(&self, meta: &ThreadMeta) -> f64 {
         own_scale(meta).unwrap_or_else(|| {
             let hint = self.scale_hint.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
-            if hint > 1.0 { hint } else { self.cfg.est_scale_default }
+            if hint > 1.0 { hint.min(HINT_SCALE_MAX) } else { self.cfg.est_scale_default }
         })
     }
 
@@ -969,6 +982,8 @@ mod tests {
         assert_eq!(calibrated(2000, 0.5), 2000);
         assert_eq!(overflow_count("400 Bad Request: {\"error\":{\"message\":\"the prompt is 265526 tokens; the context holds 262144\"}}"), Some(265526));
         assert_eq!(overflow_count("maximum context length is 262144 tokens"), None);
+        let defs = json!([{"type": "function", "function": {"name": "read_file", "description": "x".repeat(4000)}}]);
+        assert!(overhead_tokens(&json!({"tools": defs})) > 1000);
     }
 
     #[test]
