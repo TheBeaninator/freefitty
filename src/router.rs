@@ -234,8 +234,10 @@ impl Router {
                     let h = home.and_then(|h| up.iter().copied().find(|&i| nodes[i].url == h));
                     // a slot freeing on a node goes to the threads waiting for that node (their cache is there)
                     // before a newcomer; past newcomer_wait_s a newcomer stops yielding, or under steady load new
-                    // threads (goldfish, expert freezes) would never be placed (pod, 2026-11-08: 31 min)
-                    let overdue = home.is_none() && started.elapsed() >= patience;
+                    // threads (goldfish, expert freezes) would never be placed (pod, 2026-11-08: 31 min). A thread
+                    // whose home is down or held has no home to wait for and is a newcomer too (pod, 2026-11-09:
+                    // threads of a down node waited 2.6 h for it to come back)
+                    let overdue = h.is_none_or(|h| nodes[h].held) && started.elapsed() >= patience;
                     // overdue, a newcomer may take a slot home-waiters want, but where two or more of them wait it leaves
                     // them one (a burst of overdue newcomers never takes a node's every slot from its own threads)
                     let reserve = |w: u32| if overdue { (w as i64 - 1).max(0) } else { w as i64 };
@@ -652,6 +654,23 @@ mod tests {
         r.cfg.node_down_wait_s = 30;
         let placed = tokio::time::timeout(Duration::from_millis(2500), r.place(None, 10, &[])).await;
         assert!(placed.is_err(), "the last slot stays with the threads waiting for their home");
+    }
+
+    #[tokio::test]
+    async fn a_thread_whose_home_is_down_or_held_turns_overdue_like_a_newcomer() {
+        for held in [false, true] {
+            let mut a = node("a", held, true);
+            a.up = held;  // down, or up and held
+            let mut b = node("b", false, true);
+            b.mine = 1;
+            b.wanted = 1;  // a thread waits for b's last free slot
+            let mut r = router(vec![a, b], true);
+            r.cfg.newcomer_wait_s = 1;
+            r.cfg.node_down_wait_s = 30;
+            r.cfg.spill_tokens = 100_000;
+            let placed = tokio::time::timeout(Duration::from_secs(5), r.place(Some("a"), 50_000, &[])).await;
+            assert_eq!(placed.expect("it is placed once overdue, not when its home returns").unwrap().0, 1);
+        }
     }
 
     #[tokio::test]
