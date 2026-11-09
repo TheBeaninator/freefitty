@@ -290,7 +290,8 @@ debugs. Paging advances in batches of `page_results_batch` (32) results, or all 
 because every advance changes the view at an old position and costs the node a recompute of everything after it,
 about as much work as a dozen turns' worth of the attention it saves; between advances the view is stable and the
 cache serves it, and a cut, which pays that recompute anyway, pages everything it can. On because the replay below measured it on the pod's
-own threads first; `page_results_after_turns = 0` turns it off. `GET /threads/{id}` reports `paging.before` (the
+own threads first; `page_results_after_turns = 0` turns it off. A goldfish never pages: it lives a few turns on its
+expert's frozen state, and a paging batch would only break the cache it was born to reuse. `GET /threads/{id}` reports `paging.before` (the
 index below which results are handles) and `paging.pinned`.
 
 **Measuring before deciding.** `freefitty replay` runs the window's cut and the paging rule over the stored

@@ -113,6 +113,13 @@ pub fn prefix(system: &str, store: &Store, meta: &ThreadMeta) -> anyhow::Result<
     Ok(p)
 }
 
+/// The paging rule's `page_results_after_turns` for this thread: 0 (never advances) for a goldfish. A goldfish
+/// lives a few turns on its expert's frozen state, so a paging batch only breaks the cache it was born to reuse;
+/// an elephant lives long enough to need the room (dad 2026-11-09). Handles already shown stay.
+pub fn page_after(after_turns: u64, meta: &ThreadMeta) -> u64 {
+    if meta.goldfish_of.is_some() { 0 } else { after_turns }
+}
+
 /// What the model sees: the prefix, then (after a refocus) the bridge and notes, then (after a window cut) the
 /// `[Paged.]` notice, then history from the window's start. A result whose call is not in the shown tail gets a
 /// stub call on the notes or notice side so the template sees a call before every result. `pending` is the
@@ -279,10 +286,11 @@ impl Engine {
         }
 
         // ---- paging of old tool results ------------------------------------------------------------
-        if self.cfg.page_results_after_turns > 0 {
+        let after = page_after(self.cfg.page_results_after_turns, &meta);
+        if after > 0 {
             let low = meta.compactions.last().map(|c| c.from as usize).unwrap_or(0);
             let from = (meta.window_from as usize).max(low).min(history.len());
-            let boundary = window::page_boundary(&history, from, self.cfg.page_results_after_turns);
+            let boundary = window::page_boundary(&history, from, after);
             if let Some(to) = window::page_advance(&history, from, meta.paged_before as usize, boundary, self.cfg.page_results_min_bytes, self.cfg.page_results_batch, &meta.pinned) {
                 let n = (from.max(meta.paged_before as usize)..to).filter(|&i| window::pageable(&history, i, self.cfg.page_results_min_bytes, &meta.pinned)).count();
                 meta.paged_before = to as u64;
@@ -778,8 +786,9 @@ impl Engine {
         pins.dedup();
         meta.resident = pins.split_off(pins.len().saturating_sub(32));
         // the cut costs the cache anyway: page every result the rule allows at the same time
-        if self.cfg.page_results_after_turns > 0 {
-            let b = window::page_boundary(history, new_from, self.cfg.page_results_after_turns) as u64;
+        let after = page_after(self.cfg.page_results_after_turns, meta);
+        if after > 0 {
+            let b = window::page_boundary(history, new_from, after) as u64;
             meta.paged_before = meta.paged_before.max(b);
         }
         let view = live_view(prefix, meta, history, pending, self.page_min());
@@ -984,6 +993,15 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn goldfish_never_page() {
+        let elephant = ThreadMeta::default();
+        let goldfish = ThreadMeta { goldfish_of: Some(GoldfishOf { thread: "e".into(), call: "c".into(), provider_call_id: None }), ..Default::default() };
+        assert_eq!(page_after(4, &elephant), 4);
+        assert_eq!(page_after(4, &goldfish), 0);
+        assert_eq!(page_after(0, &elephant), 0);
+    }
 
     #[test]
     fn estimates_scale_up_only() {
