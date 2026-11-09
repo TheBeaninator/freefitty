@@ -314,7 +314,7 @@ impl Engine {
         self.fade(&mut messages, &meta, &history);
         let sent_est = tokens(&messages);
         let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "max_tokens": self.cfg.max_output_tokens, "stream": false});
-        if let Some(s) = self.steer_of(&meta) { body["steer"] = s; }
+        self.steer_into(&mut body, &meta);
 
         let mut reply_text = String::new();
         let mut events: Vec<Event> = Vec::new();
@@ -584,8 +584,8 @@ impl Engine {
 
     /// The steering every request of this thread carries: its expert's (a thread born from a steered expert is
     /// that persona on every turn, and the nodes cache its state under the steering's own key).
-    fn steer_of(&self, meta: &ThreadMeta) -> Option<Value> {
-        meta.expert.as_ref().and_then(|k| self.store.expert(k).ok().flatten()).and_then(|e| e.steer)
+    fn steer_into(&self, body: &mut Value, meta: &ThreadMeta) {
+        if let Some(e) = meta.expert.as_ref().and_then(|k| self.store.expert(k).ok().flatten()) { crate::experts::steer_into(body, &e); }
     }
 
     /// A goldfish for a `goldfish` call: its thread's meta and first event. Born from the expert, with the
@@ -638,6 +638,8 @@ impl Engine {
         let tools: Vec<String> = a.get("tools").and_then(|t| t.as_array()).map(|t| t.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
         let steer: Vec<crate::experts::Steer> = serde_json::from_value(a.get("steer").cloned().unwrap_or(json!([])))
             .map_err(|e| anyhow::anyhow!("steer must be a list of {{vector, scale, layer?}}: {e}"))?;
+        let steer_scope = a.get("steer_scope").and_then(|s| s.as_str());
+        crate::experts::steer_scope_of(steer_scope, &steer)?;
         if !steer.is_empty() {
             if !self.cfg.commission_steer {
                 anyhow::bail!("commissioned experts cannot be steered yet (commission_steer is off until a steered goldfish is measured against a plain one); commission it without steer");
@@ -654,8 +656,15 @@ impl Engine {
                 },
                 Err(e) => anyhow::bail!("the steering could not be checked: {e}"),
             }
+            if steer_scope == Some("prefix") {
+                match self.router.steer_scope_everywhere().await {
+                    Ok(true) => {}
+                    Ok(false) => anyhow::bail!("steer_scope \"prefix\" needs every node to take steer_scope; one does not (commission with scope \"all\", or not at all)"),
+                    Err(e) => anyhow::bail!("steer_scope could not be checked: {e}"),
+                }
+            }
         }
-        let e = crate::experts::commission(&self.cfg, name, a.get("description").and_then(|d| d.as_str()).unwrap_or(""), a.get("ack").and_then(|d| d.as_str()), &reads, rap::goldfish_tools(&tools), steer, thread)?;
+        let e = crate::experts::commission(&self.cfg, name, a.get("description").and_then(|d| d.as_str()).unwrap_or(""), a.get("ack").and_then(|d| d.as_str()), &reads, rap::goldfish_tools(&tools), steer, steer_scope, thread)?;
         let key = self.experts.add(&self.store, &e).await?;
         tracing::info!("{thread}: commissioned expert {key}");
         // frozen in the context its goldfish will see: the plain built-ins and its own tools (from the whole set,
@@ -728,7 +737,7 @@ impl Engine {
         let mut messages = live_view(&p, &meta, &history, &meta.pending, self.page_min());
         self.fade(&mut messages, &meta, &history);
         let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "max_tokens": self.cfg.max_output_tokens, "stream": false});
-        if let Some(s) = self.steer_of(&meta) { body["steer"] = s; }
+        self.steer_into(&mut body, &meta);
         Some(body)
     }
 
@@ -827,6 +836,11 @@ impl Engine {
         // persona's steering never colors what a later freeze of these notes bakes in). The cost: the node reads
         // this view without the steered cache.
         let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "tool_choice": "none", "max_tokens": self.cfg.compact_summary_tokens, "stream": false});
+        // under scope "prefix" the generation is plain by construction, so the refocus keeps the steering fields and
+        // the node serves the view from the expert's cached (steered) reading instead of reading it again
+        if let Some(e) = meta.expert.as_ref().and_then(|k| self.store.expert(k).ok().flatten()) {
+            if e.steer_scope.as_deref() == Some("prefix") { crate::experts::steer_into(&mut body, &e); }
+        }
         let mut truncated = false;
         let mut summary = String::new();
         for attempt in 0..2 {

@@ -117,6 +117,12 @@ pub struct Expert {
     /// layer?}]); None = unsteered. Part of its version: the nodes cache steered state under its own key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steer: Option<Value>,
+    /// Where the steering applies: None/"all" = every row of every request (the reading and every generated
+    /// token); "prefix" = the reading only - the nodes steer the prompt rendered from the shared prefix (system
+    /// prompt + the expert's messages) and leave the thread's own turns and the model's generation plain
+    /// (strixite `steer_scope` {"messages": k}). Part of its version: the two scopes cache under different keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

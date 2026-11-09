@@ -1041,6 +1041,86 @@ async fn a_steered_expert_steers_every_request_of_its_threads() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_prefix_scoped_expert_steers_its_reading_only() {
+    let mut h = harness().await;
+    let dir = tempfile::tempdir().unwrap();
+    let def = "description = \"a villain\"\nack = \"Read.\"\n[[reads]]\ntext = \"You scheme.\"\n[[steer]]\nvector = \"villain24\"\nscale = 6.0\nlayer = 24\n";
+    std::fs::write(dir.path().join("villain.toml"), def).unwrap();
+    std::fs::write(dir.path().join("readvillain.toml"), format!("steer_scope = \"prefix\"\n{def}")).unwrap();
+    // the nodes take steer_scope
+    *h.model.steer_list.lock().unwrap() = Some(json!({"vectors": [{"name": "villain24", "layer": 24, "values": 8, "hash": "0"}], "scope": true}));
+    h.cfg.experts_dir = Some(dir.path().to_path_buf());
+    *h.model.kv.lock().unwrap() = Some(vec![3u8; 1 << 10]);
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let list = api.get("/experts").await;
+    let of = |n: &str| list.as_array().unwrap().iter().find(|e| e["name"] == n).cloned().unwrap();
+    assert_eq!(of("readvillain")["steer_scope"], "prefix");
+    assert!(of("villain")["steer_scope"].is_null());
+    // the scope is part of the version: the nodes cache the two readings under different keys
+    assert_ne!(of("villain")["key"].as_str().unwrap().split('@').nth(1), of("readvillain")["key"].as_str().unwrap().split('@').nth(1));
+    let steer = json!([{"vector": "villain24", "scale": 6.0, "layer": 24}]);
+    let scope = json!({"messages": 3}); // the system prompt, the reading, the acknowledgement
+    let is_read = |b: &Value, name: &str| b["messages"][1]["content"].as_str().is_some_and(|c| c.contains(&format!("<expert name=\"{name}\">")));
+    // both freezes read steered; only the scoped one names the span
+    let mut frozen = (false, false);
+    for _ in 0..40 {
+        let bodies = h.model.bodies.lock().unwrap().clone();
+        let read = |name: &str| bodies.iter().find(|b| is_read(b, name) && b["messages"].as_array().unwrap().last().unwrap()["content"] == "Say ready.").cloned();
+        frozen = (read("villain").is_some_and(|b| b["steer"] == steer && b.get("steer_scope").is_none()),
+                  read("readvillain").is_some_and(|b| b["steer"] == steer && b["steer_scope"] == scope));
+        if frozen == (true, true) { break; }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(frozen, (true, true), "the whole-thread expert was read steered, the scoped one steered over its reading");
+    // every turn of a thread born from the scoped expert carries the vectors and the span
+    api.post("/say", json!({"text": "hello r", "thread": "sr", "expert": "readvillain"})).await;
+    api.output("sr", 10).await.unwrap();
+    api.say("again r", Some("sr")).await;
+    api.output("sr", 10).await.unwrap();
+    let bodies = h.model.bodies.lock().unwrap().clone();
+    let by = |t: &str| bodies.iter().find(|b| b["messages"].as_array().unwrap().last().unwrap()["content"] == t).cloned().unwrap();
+    assert_eq!(by("hello r")["steer"], steer);
+    assert_eq!(by("hello r")["steer_scope"], scope);
+    assert_eq!(by("again r")["steer_scope"], scope);
+    // the catalog says so
+    api.say("catalog", Some("sc")).await;
+    let out = api.output("sc", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.contains("- readvillain: a villain (no tools as a goldfish; steered: villain24 x6.0 on its reading only)"), "{out}");
+    assert!(out.contains("- villain: a villain (no tools as a goldfish; steered: villain24 x6.0)"), "{out}");
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prefix_scoped_expert_is_not_frozen_on_nodes_without_steer_scope() {
+    let mut h = harness().await;
+    let dir = tempfile::tempdir().unwrap();
+    let def = "description = \"a villain\"\nack = \"Read.\"\n[[reads]]\ntext = \"You scheme.\"\n[[steer]]\nvector = \"villain24\"\nscale = 6.0\nlayer = 24\n";
+    std::fs::write(dir.path().join("villain.toml"), def).unwrap();
+    std::fs::write(dir.path().join("readvillain.toml"), format!("steer_scope = \"prefix\"\n{def}")).unwrap();
+    // a node that lists vectors but does not know steer_scope would steer the whole thread: the freeze refuses
+    *h.model.steer_list.lock().unwrap() = Some(json!({"vectors": [{"name": "villain24", "layer": 24, "values": 8, "hash": "0"}]}));
+    h.cfg.experts_dir = Some(dir.path().to_path_buf());
+    *h.model.kv.lock().unwrap() = Some(vec![3u8; 1 << 10]);
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let mut villain_frozen = false;
+    for _ in 0..40 {
+        let list = api.get("/experts").await;
+        villain_frozen = list.as_array().unwrap().iter().any(|e| e["name"] == "villain" && !e["frozen_bytes"].is_null());
+        if villain_frozen { break; }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(villain_frozen, "the whole-thread expert froze");
+    let list = api.get("/experts").await;
+    let scoped = list.as_array().unwrap().iter().find(|e| e["name"] == "readvillain").cloned().unwrap();
+    assert!(scoped["frozen_bytes"].is_null(), "the scoped expert must not be frozen on such nodes: {scoped}");
+    let scoped_read = h.model.bodies.lock().unwrap().iter().any(|b| b.get("steer_scope").is_some());
+    assert!(!scoped_read, "no request with steer_scope reached a node that does not take it");
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_node_that_holds_the_state_is_not_sent_it_again() {
     let mut h = harness().await;
     h.cfg.park_after_s = 0;

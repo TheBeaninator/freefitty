@@ -234,6 +234,15 @@ under different steering have different cache keys and cannot be spliced. The ve
 that is not in the transcript: a reader of the store cannot rebuild a steered view without the steer-dir, so the
 vectors must be kept like the store.
 
+`steer_scope = "prefix"` steers the reading only: every request still carries the vectors, with strixite's
+`steer_scope` naming the shared prefix (system prompt + the expert's messages) as the steered span, so the nodes steer
+what the expert read and nothing after it - the thread's turns and every generated token are the model's own. The
+cached expert is the steered reading; the goldfish that attends to it answers plain. It is its own version (another
+cache key), its refocus keeps the fields (the generation is plain anyway, so the view serves from cache), and a freeze
+or commission of one refuses unless every up node answers `GET /steer` with `"scope": true` - an older node would
+ignore the field and steer the whole thread. Measured on the pod reviewer: whole-thread steering past scale 2 made it
+answer without reading the card; the prefix scope exists to test whether the reading alone carries the direction.
+
 Freezing reads it once on one node and exports that node's state at the end of the acknowledgement (strixite's
 checkpoint at the start of the next user message) into `<data_dir>/experts/<name>@<hash>-<context>.kv`. strixite
 answers a turn before it caches the turn's entries, so an export is retried until the entry it returns covers the

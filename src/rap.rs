@@ -98,7 +98,8 @@ pub fn builtin_defs(compaction: bool, window: bool) -> Vec<Value> {
                     "vector": {"type": "string", "description": "A steering vector the nodes hold"},
                     "scale": {"type": "number", "description": "How hard to push along it"},
                     "layer": {"type": "integer", "description": "The layer it is added after; the vector's own by default"}}},
-                    "description": "Activation steering: a persona the expert is on every turn of its goldfish"}}, "required": ["name", "description", "reads"]}}}),
+                    "description": "Activation steering: a persona the expert is on every turn of its goldfish"},
+                "steer_scope": {"type": "string", "enum": ["all", "prefix"], "description": "Where the steering applies: all (every turn, the default) or prefix (its reading only; the goldfish answers unsteered)"}}, "required": ["name", "description", "reads"]}}}),
     ];
     if compaction {
         v.push(json!({"type": "function", "function": {"name": REFOCUS,

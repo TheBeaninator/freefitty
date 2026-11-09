@@ -384,6 +384,32 @@ impl Router {
     /// node, so a vector one node lacks would fail there: the intersection. A node that answers 404 (no steer-dir)
     /// holds none; one that cannot be reached is tried three times and then named in the error, so a blip is not
     /// mistaken for a missing vector. Err when no node is up or one stays unreachable.
+    /// Whether every up node takes `steer_scope` (GET /steer answers "scope": true). Err when no node is up or one
+    /// stays unreachable; a node without vectors (404) does not take it.
+    pub async fn steer_scope_everywhere(&self) -> Result<bool, String> {
+        let mut any = false;
+        for url in self.up_nodes().await {
+            let mut got = None;
+            for attempt in 0..3 {
+                match self.client.get(format!("{url}/steer")).timeout(Duration::from_secs(5)).send().await {
+                    Ok(r) if r.status().as_u16() == 404 => { got = Some(false); break; }
+                    Ok(r) if r.status().is_success() => {
+                        let v: Value = r.json().await.unwrap_or(Value::Null);
+                        got = Some(v.get("scope").and_then(|s| s.as_bool()) == Some(true));
+                        break;
+                    }
+                    _ => if attempt < 2 { tokio::time::sleep(Duration::from_millis(500)).await },
+                }
+            }
+            match got {
+                Some(true) => any = true,
+                Some(false) => return Ok(false),
+                None => return Err(format!("{url} did not answer GET /steer (three tries); try again")),
+            }
+        }
+        if any { Ok(true) } else { Err("no node is up to check steer_scope".to_owned()) }
+    }
+
     pub async fn steer_vectors(&self) -> Result<std::collections::HashMap<String, i64>, String> {
         let mut all: Option<std::collections::HashMap<String, i64>> = None;
         for url in self.up_nodes().await {

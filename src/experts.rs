@@ -50,6 +50,31 @@ struct Definition {
     /// Activation steering: `[[steer]] vector = "villain24", scale = 6.0, layer = 24 (optional)`.
     #[serde(default)]
     steer: Vec<Steer>,
+    /// `steer_scope = "prefix"`: steer the expert's reading only, not the thread's turns or the generation
+    /// (strixite `steer_scope`); unset or "all" = every row.
+    #[serde(default)]
+    steer_scope: Option<String>,
+}
+
+/// A definition's `steer_scope`, checked: None (= "all") or Some("prefix").
+pub fn steer_scope_of(scope: Option<&str>, steer: &[Steer]) -> Result<Option<String>> {
+    match scope {
+        None | Some("all") => Ok(None),
+        Some("prefix") if steer.is_empty() => bail!("steer_scope = \"prefix\" needs [[steer]] vectors to scope"),
+        Some("prefix") => Ok(Some("prefix".to_owned())),
+        Some(other) => bail!("steer_scope {other:?}: \"all\" or \"prefix\""),
+    }
+}
+
+/// The steering fields of a request for a thread of this expert: strixite's `steer`, and under scope "prefix"
+/// its `steer_scope` {"messages": k} with k the shared prefix's message count (the system prompt and the expert's
+/// messages, which every request of the thread starts with). The nodes steer the prompt those k messages render to
+/// and nothing after it.
+pub fn steer_into(body: &mut Value, e: &Expert) {
+    if let Some(s) = &e.steer {
+        body["steer"] = s.clone();
+        if e.steer_scope.as_deref() == Some("prefix") { body["steer_scope"] = json!({"messages": 1 + e.messages.len()}); }
+    }
 }
 
 /// One steering vector of an expert, by its name in the nodes' steer-dir.
@@ -84,7 +109,7 @@ pub fn name_ok(n: &str) -> bool {
 
 /// The expert's two messages from its documents: byte-identical for the same documents in the same order. Its
 /// tool list is part of its identity (the definitions render before it), so it is in the hash when set.
-fn build(name: &str, description: &str, ack: &str, docs: &[(Option<String>, String)], tools: Option<Vec<String>>, steer: Option<Value>) -> Expert {
+fn build(name: &str, description: &str, ack: &str, docs: &[(Option<String>, String)], tools: Option<Vec<String>>, steer: Option<Value>, steer_scope: Option<String>) -> Expert {
     let mut body = format!("<expert name=\"{name}\">\n");
     for (path, text) in docs {
         match path {
@@ -98,8 +123,9 @@ fn build(name: &str, description: &str, ack: &str, docs: &[(Option<String>, Stri
     let mut hashed = serde_json::to_string(&messages).unwrap_or_default();
     if let Some(t) = &tools { hashed.push_str(&format!("\u{0}tools={}", t.join(","))); }
     if let Some(s) = &steer { hashed.push_str(&format!("\u{0}steer={s}")); }
+    if let Some(sc) = &steer_scope { hashed.push_str(&format!("\u{0}steer_scope={sc}")); }
     let hash = rap::short_hash(&hashed);
-    Expert { name: name.to_owned(), hash, description: description.to_owned(), messages, bytes, loaded_ms: now_ms(), tools, steer }
+    Expert { name: name.to_owned(), hash, description: description.to_owned(), messages, bytes, loaded_ms: now_ms(), tools, steer, steer_scope }
 }
 
 /// Read a definition's documents: (path, text) pairs, each file at most `max_file` bytes.
@@ -121,18 +147,19 @@ pub fn read_docs(reads: &[Read], max_file: usize) -> Result<Vec<(Option<String>,
 
 /// An expert an elephant commissioned; its definition is written to `experts_dir` (when set) so it survives
 /// a restart, with who commissioned it.
-pub fn commission(cfg: &Config, name: &str, description: &str, ack: Option<&str>, reads: &[Read], tools: Vec<String>, steer: Vec<Steer>, by: &str) -> Result<Expert> {
+pub fn commission(cfg: &Config, name: &str, description: &str, ack: Option<&str>, reads: &[Read], tools: Vec<String>, steer: Vec<Steer>, steer_scope: Option<&str>, by: &str) -> Result<Expert> {
     if !name_ok(name) { bail!("expert names are 1-64 of [A-Za-z0-9._-]"); }
     if reads.is_empty() { bail!("an expert needs something to read"); }
     let docs = read_docs(reads, 1 << 20)?;
     let ack = ack.map(str::to_owned).unwrap_or_else(default_ack);
-    let e = build(name, description, &ack, &docs, Some(tools.clone()), steer_field(&steer));
+    let scope = steer_scope_of(steer_scope, &steer)?;
+    let e = build(name, description, &ack, &docs, Some(tools.clone()), steer_field(&steer), scope.clone());
     if let Some(dir) = &cfg.experts_dir {
         let path = dir.join(format!("{name}.toml"));
         if path.exists() { bail!("an expert definition named {name} exists already"); }
         #[derive(serde::Serialize)]
-        struct Def<'a> { description: &'a str, ack: &'a str, tools: &'a [String], reads: &'a [Read], #[serde(skip_serializing_if = "<[Steer]>::is_empty")] steer: &'a [Steer] }
-        let body = toml::to_string(&Def { description, ack: &ack, tools: &tools, reads, steer: &steer })?;
+        struct Def<'a> { description: &'a str, ack: &'a str, tools: &'a [String], reads: &'a [Read], #[serde(skip_serializing_if = "<[Steer]>::is_empty")] steer: &'a [Steer], #[serde(skip_serializing_if = "Option::is_none")] steer_scope: Option<&'a str> }
+        let body = toml::to_string(&Def { description, ack: &ack, tools: &tools, reads, steer: &steer, steer_scope: scope.as_deref() })?;
         std::fs::write(&path, format!("# commissioned by thread {by} on {}\n{body}", chrono::Utc::now().to_rfc3339()))
             .with_context(|| format!("writing {}", path.display()))?;
     }
@@ -144,12 +171,13 @@ fn load_file(path: &std::path::Path) -> Result<Expert> {
     if !name_ok(&name) { bail!("{}: expert names are 1-64 of [A-Za-z0-9._-]", path.display()); }
     let def: Definition = toml::from_str(&std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?).with_context(|| format!("parsing {}", path.display()))?;
     let docs = read_docs(&def.reads, usize::MAX).with_context(|| path.display().to_string())?;
-    Ok(build(&name, &def.description, &def.ack, &docs, def.tools, steer_field(&def.steer)))
+    let scope = steer_scope_of(def.steer_scope.as_deref(), &def.steer).with_context(|| path.display().to_string())?;
+    Ok(build(&name, &def.description, &def.ack, &docs, def.tools, steer_field(&def.steer), scope))
 }
 
 /// An expert whose reading is a thread's focal point: its latest refocus notes.
 pub fn from_notes(name: &str, description: &str, thread: &str, notes: &str) -> Expert {
-    build(name, description, "I hold this understanding and will continue from it.", &[(Some(format!("notes-of-thread-{thread}")), notes.to_owned())], None, None)
+    build(name, description, "I hold this understanding and will continue from it.", &[(Some(format!("notes-of-thread-{thread}")), notes.to_owned())], None, None, None)
 }
 
 /// What renders before an expert's messages: the system prompt and the tool definitions.
@@ -166,7 +194,7 @@ fn bodies(e: &Expert, system: &str, defs: &[Value], model: &str, max_tokens: u64
         messages.extend(e.messages.iter().cloned());
         messages.push(json!({"role": "user", "content": last}));
         let mut b = json!({"model": model, "messages": messages, "tools": defs, "max_tokens": max_tokens, "stream": false});
-        if let Some(s) = &e.steer { b["steer"] = s.clone(); }
+        steer_into(&mut b, e);
         b
     };
     (with("Say ready."), with("."))
@@ -219,6 +247,14 @@ impl Experts {
 
     async fn freeze_into(&self, key: &str, path: &Path, store: &Store, router: &Router, system: &str, defs: &[Value], max_tokens: u64) -> Result<Value> {
         let e = store.expert(key)?.with_context(|| format!("expert {key} is not stored"))?;
+        if e.steer_scope.as_deref() == Some("prefix") {
+            // a node that does not know steer_scope would ignore it and steer the whole thread: never freeze there
+            match router.steer_scope_everywhere().await {
+                Ok(true) => {}
+                Ok(false) => bail!("steer_scope = \"prefix\" needs every up node to take steer_scope (GET /steer \"scope\": true); one does not"),
+                Err(why) => bail!("steer_scope could not be checked: {why}"),
+            }
+        }
         let (read, export) = bodies(&e, system, defs, router.model(), max_tokens);
         let t = std::time::Instant::now();
         let turn = router.chat(None, &read).await.map_err(|e| anyhow::anyhow!("reading the expert: {e:?}"))?;
@@ -283,9 +319,10 @@ impl Experts {
         for (name, key) in cur {
             let e = store.expert(&key).ok().flatten();
             let desc = e.as_ref().map(|e| e.description.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| "(no description)".into());
+            let prefix_only = e.as_ref().is_some_and(|e| e.steer_scope.as_deref() == Some("prefix"));
             let steer = e.as_ref().and_then(|e| e.steer.as_ref()).and_then(|s| s.as_array()).map(|a| {
                 let v: Vec<String> = a.iter().map(|x| format!("{} x{}", x["vector"].as_str().unwrap_or("?"), x["scale"])).collect();
-                format!("; steered: {}", v.join(", "))
+                format!("; steered: {}{}", v.join(", "), if prefix_only { " on its reading only" } else { "" })
             }).unwrap_or_default();
             let tools = match e.as_ref().and_then(|e| e.tools.clone()) {
                 Some(t) if t.is_empty() => "no tools".to_owned(),
