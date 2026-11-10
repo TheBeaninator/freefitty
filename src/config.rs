@@ -25,7 +25,9 @@ pub struct Config {
     pub nodes: Vec<String>,
     /// What a node's /health does not say, by node URL: `[node_meta."http://10.42.0.50:18080"]` with `model`
     /// (the model it serves; a turn runs only on nodes serving its request's model), `context_length`, `slots`,
-    /// and `grant = false` (not under `grant_cmd`: a node that is not a strixite worker lease, the StrixFold pair).
+    /// `grant = false` (not under `grant_cmd`: a node that is not a strixite worker lease, the StrixFold pair), and
+    /// `down_wait_s` (how long a turn of its model waits while every node serving that model is down; default
+    /// `node_down_wait_s`: the StrixFold pair goes down on purpose for card windows and takes minutes to load).
     #[serde(default)]
     pub node_meta: std::collections::HashMap<String, NodeMeta>,
     /// Slots a node is assumed to have while its /health does not say.
@@ -229,9 +231,17 @@ pub struct NodeMeta {
     pub slots: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub down_wait_s: Option<u64>,
 }
 
 impl Config {
+    /// How long a turn of `model` waits while no node serving it is up: the longest `down_wait_s` among its nodes,
+    /// else `node_down_wait_s`.
+    pub fn down_wait_s(&self, model: &str) -> u64 {
+        self.nodes.iter().filter(|u| self.node_model(u) == model).filter_map(|u| self.node_meta.get(u).and_then(|m| m.down_wait_s)).max().unwrap_or(self.node_down_wait_s)
+    }
+
     /// The model a node serves: its `node_meta` model, else `model`.
     pub fn node_model(&self, url: &str) -> &str {
         self.node_meta.get(url).and_then(|m| m.model.as_deref()).unwrap_or(&self.model)
@@ -341,4 +351,18 @@ pub fn id() -> String {
     let mut b = [0u8; 8];
     rand::rng().fill_bytes(&mut b);
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_model_waits_as_long_as_its_slowest_node_allows() {
+        let mut c = Config { node_down_wait_s: 120, nodes: vec!["http://a:1".into(), "http://f:2".into()], ..Config::default() };
+        c.node_meta.insert("http://f:2".into(), NodeMeta { model: Some("dsv41".into()), down_wait_s: Some(900), ..Default::default() });
+        assert_eq!(c.down_wait_s("dsv41"), 900);
+        assert_eq!(c.down_wait_s(&c.model.clone()), 120, "the default model keeps node_down_wait_s");
+        assert_eq!(c.down_wait_s("other"), 120);
+    }
 }

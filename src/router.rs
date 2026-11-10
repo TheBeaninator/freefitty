@@ -271,7 +271,7 @@ impl Router {
                 if self.is_stopping() { bail!("the daemon is stopping"); }
                 let up: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].up && nodes[i].serves == model && !avoid.contains(&i)).collect();
                 if up.is_empty() {
-                    if started.elapsed() >= Duration::from_secs(self.cfg.node_down_wait_s) {
+                    if started.elapsed() >= Duration::from_secs(self.cfg.down_wait_s(model)) {
                         bail!("no node serving {model} is up");
                     }
                 } else {
