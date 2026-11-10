@@ -996,6 +996,45 @@ async fn elephants_find_ask_and_commission_goldfish() {
     r.shutdown().await;
 }
 
+async fn strixfold_health(State(m): State<Arc<FakeModel>>) -> Json<Value> {
+    Json(json!({"status": "ok", "model": "dsv41", "max_batch_size": 1, "warming": false, "live": {"connections": m.busy.load(Ordering::Relaxed), "waiting": 0}}))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_goldfish_of_a_model_expert_runs_only_on_nodes_serving_that_model() {
+    let mut h = harness().await;
+    // a second node the way StrixFold answers: its own /health shape, no cache routes, another model
+    let sf = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(0), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false), probe_tokens: std::sync::atomic::AtomicU64::new(u64::MAX), steer_list: std::sync::Mutex::new(None), refuse_steer: AtomicBool::new(false), steer_fail: AtomicBool::new(false) });
+    let sf_url = serve(Router::new().route("/health", get(strixfold_health)).route("/v1/chat/completions", post(completions)).with_state(sf.clone())).await;
+    h.cfg.nodes.push(sf_url.clone());
+    h.cfg.node_meta.insert(sf_url.clone(), freefitty::config::NodeMeta { model: Some("dsv41".into()), context_length: Some(131072), grant: Some(false), ..Default::default() });
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("railhand.toml"), "description = \"knows the rail\"\nack = \"Read.\"\nmodel = \"dsv41\"\n[[reads]]\ntext = \"B is .51\"\n").unwrap();
+    h.cfg.experts_dir = Some(dir.path().to_path_buf());
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.say("catalog", Some("el")).await;
+    let out = api.output("el", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.contains("- railhand: knows the rail (no tools as a goldfish; runs on dsv41)"), "{out}");
+    api.say("ask what is B", Some("el")).await;
+    assert!(api.output("el", 10).await.unwrap()["text"].as_str().unwrap().contains("[Tool Call: goldfish"));
+    let out = api.output("el", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.ends_with("): what is B"), "{out}");
+    // the goldfish's every request went to the StrixFold node with its model; the elephant's never did
+    let sf_bodies = sf.bodies.lock().unwrap().clone();
+    assert!(!sf_bodies.is_empty(), "the goldfish ran on the dsv41 node");
+    assert!(sf_bodies.iter().all(|b| b["model"] == "dsv41"), "only dsv41 requests reach it");
+    assert!(sf_bodies.iter().any(|b| b["messages"][1]["content"].as_str().is_some_and(|c| c.contains("B is .51"))), "born from the expert there");
+    let main_bodies = h.model.bodies.lock().unwrap().clone();
+    assert!(main_bodies.iter().all(|b| b["model"] != "dsv41"), "no dsv41 request reached the default node");
+    assert!(main_bodies.iter().any(|b| b["messages"].as_array().unwrap().last().unwrap()["content"].as_str().is_some_and(|c| c.starts_with("ask what is B"))), "the elephant ran on the default node");
+    // the health view names what each node serves, and the StrixFold node's slots come from max_batch_size
+    let health = api.get("/health").await;
+    let n = health["nodes"].as_array().unwrap().iter().find(|n| n["url"] == sf_url.as_str()).unwrap().clone();
+    assert_eq!((n["serves"].as_str(), n["slots"].as_u64(), n["context_length"].as_u64(), n["up"].as_bool()), (Some("dsv41"), Some(1), Some(131072), Some(true)), "{n}");
+    r.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_steered_expert_steers_every_request_of_its_threads() {
     let mut h = harness().await;

@@ -19,6 +19,10 @@
 //! text = "The board is /data/pod/kanban.db."
 //! ```
 //!
+//! `model = "dsv41"` puts the expert and every thread born from it on the nodes serving that model (the StrixFold
+//! pair); unset = the config's `model`. A node that cannot export state (StrixFold today) is not frozen on: the
+//! thread reads the expert there, and the node's own prompt cache serves the next thread born from it.
+//!
 //! Or frozen from a thread's focal point: its latest refocus notes become what the expert has read.
 //! Versions are stored by content hash and never pruned: a thread keeps the bytes it was born with when a
 //! file changes. The system prompt is not part of the stored expert, so a prompt edit changes every thread
@@ -54,6 +58,9 @@ struct Definition {
     /// (strixite `steer_scope`); unset or "all" = every row.
     #[serde(default)]
     steer_scope: Option<String>,
+    /// The model the expert and its threads run on; unset = the config's `model`.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// A definition's `steer_scope`, checked: None (= "all") or Some("prefix").
@@ -109,7 +116,8 @@ pub fn name_ok(n: &str) -> bool {
 
 /// The expert's two messages from its documents: byte-identical for the same documents in the same order. Its
 /// tool list is part of its identity (the definitions render before it), so it is in the hash when set.
-fn build(name: &str, description: &str, ack: &str, docs: &[(Option<String>, String)], tools: Option<Vec<String>>, steer: Option<Value>, steer_scope: Option<String>) -> Expert {
+#[allow(clippy::too_many_arguments)]
+fn build(name: &str, description: &str, ack: &str, docs: &[(Option<String>, String)], tools: Option<Vec<String>>, steer: Option<Value>, steer_scope: Option<String>, model: Option<String>) -> Expert {
     let mut body = format!("<expert name=\"{name}\">\n");
     for (path, text) in docs {
         match path {
@@ -124,8 +132,9 @@ fn build(name: &str, description: &str, ack: &str, docs: &[(Option<String>, Stri
     if let Some(t) = &tools { hashed.push_str(&format!("\u{0}tools={}", t.join(","))); }
     if let Some(s) = &steer { hashed.push_str(&format!("\u{0}steer={s}")); }
     if let Some(sc) = &steer_scope { hashed.push_str(&format!("\u{0}steer_scope={sc}")); }
+    if let Some(m) = &model { hashed.push_str(&format!("\u{0}model={m}")); }
     let hash = rap::short_hash(&hashed);
-    Expert { name: name.to_owned(), hash, description: description.to_owned(), messages, bytes, loaded_ms: now_ms(), tools, steer, steer_scope }
+    Expert { name: name.to_owned(), hash, description: description.to_owned(), messages, bytes, loaded_ms: now_ms(), tools, steer, steer_scope, model }
 }
 
 /// Read a definition's documents: (path, text) pairs, each file at most `max_file` bytes.
@@ -153,7 +162,7 @@ pub fn commission(cfg: &Config, name: &str, description: &str, ack: Option<&str>
     let docs = read_docs(reads, 1 << 20)?;
     let ack = ack.map(str::to_owned).unwrap_or_else(default_ack);
     let scope = steer_scope_of(steer_scope, &steer)?;
-    let e = build(name, description, &ack, &docs, Some(tools.clone()), steer_field(&steer), scope.clone());
+    let e = build(name, description, &ack, &docs, Some(tools.clone()), steer_field(&steer), scope.clone(), None);
     if let Some(dir) = &cfg.experts_dir {
         let path = dir.join(format!("{name}.toml"));
         if path.exists() { bail!("an expert definition named {name} exists already"); }
@@ -172,12 +181,12 @@ fn load_file(path: &std::path::Path) -> Result<Expert> {
     let def: Definition = toml::from_str(&std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?).with_context(|| format!("parsing {}", path.display()))?;
     let docs = read_docs(&def.reads, usize::MAX).with_context(|| path.display().to_string())?;
     let scope = steer_scope_of(def.steer_scope.as_deref(), &def.steer).with_context(|| path.display().to_string())?;
-    Ok(build(&name, &def.description, &def.ack, &docs, def.tools, steer_field(&def.steer), scope))
+    Ok(build(&name, &def.description, &def.ack, &docs, def.tools, steer_field(&def.steer), scope, def.model))
 }
 
 /// An expert whose reading is a thread's focal point: its latest refocus notes.
 pub fn from_notes(name: &str, description: &str, thread: &str, notes: &str) -> Expert {
-    build(name, description, "I hold this understanding and will continue from it.", &[(Some(format!("notes-of-thread-{thread}")), notes.to_owned())], None, None, None)
+    build(name, description, "I hold this understanding and will continue from it.", &[(Some(format!("notes-of-thread-{thread}")), notes.to_owned())], None, None, None, None)
 }
 
 /// What renders before an expert's messages: the system prompt and the tool definitions.
@@ -255,7 +264,7 @@ impl Experts {
                 Err(why) => bail!("steer_scope could not be checked: {why}"),
             }
         }
-        let (read, export) = bodies(&e, system, defs, router.model(), max_tokens);
+        let (read, export) = bodies(&e, system, defs, e.model.as_deref().unwrap_or(router.model()), max_tokens);
         let t = std::time::Instant::now();
         let turn = router.chat(None, None, &read).await.map_err(|e| anyhow::anyhow!("reading the expert: {e:?}"))?;
         let read_s = t.elapsed().as_secs_f64();
@@ -329,7 +338,8 @@ impl Experts {
                 Some(t) => format!("tools: {}", t.join(", ")),
                 None => "no tools as a goldfish".to_owned(),
             };
-            out.push_str(&format!("- {name}: {desc} ({tools}{steer})\n"));
+            let on = e.as_ref().and_then(|e| e.model.as_deref()).map(|m| format!("; runs on {m}")).unwrap_or_default();
+            out.push_str(&format!("- {name}: {desc} ({tools}{steer}{on})\n"));
         }
         out
     }
@@ -347,7 +357,7 @@ impl Experts {
         if let Err(err) = self.freeze(&key, store, router, system, defs, max_tokens).await { tracing::warn!("expert {key}: not frozen: {err:#}"); }
         if let Some(state) = self.state(&key, &context(system, defs)) {
             let mut out = Vec::new();
-            for url in router.up_nodes().await {
+            for url in router.up_nodes_for(e.model.as_deref().unwrap_or(router.model())).await {
                 let t = std::time::Instant::now();
                 match router.load_state(&url, &state).await {
                     Ok(n) => out.push(json!({"url": url, "imported_bytes": n, "seconds": t.elapsed().as_secs_f64()})),
@@ -357,9 +367,10 @@ impl Experts {
             tracing::info!("expert {name}: frozen state put into {} node(s)", out.len());
             return Ok(out);
         }
-        let (body, _) = bodies(&e, system, defs, router.model(), max_tokens);
+        let model = e.model.clone().unwrap_or_else(|| router.model().to_owned());
+        let (body, _) = bodies(&e, system, defs, &model, max_tokens);
         let mut out = Vec::new();
-        for url in router.up_nodes().await {
+        for url in router.up_nodes_for(&model).await {
             let t = std::time::Instant::now();
             match router.chat_on(&url, &body).await {
                 Ok(turn) => out.push(json!({"url": url, "prompt_tokens": turn.prompt_tokens, "cached_tokens": turn.cached_tokens, "seconds": t.elapsed().as_secs_f64()})),

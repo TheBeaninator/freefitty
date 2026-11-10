@@ -15,13 +15,19 @@ pub struct Config {
     /// One redb file lives here: threads, conversations, the event queue, replies, dead letters.
     #[serde(default = "d_data_dir")]
     pub data_dir: PathBuf,
-    /// The model id every node serves.
+    /// The model id a thread runs on unless its expert names another, and the one every node serves unless
+    /// `node_meta` says otherwise.
     #[serde(default = "d_model")]
     pub model: String,
     /// The strixite nodes, http://host:port (the rail addresses on the pod). A thread stays on the node that
     /// holds its prompt cache; a full node's long thread moves with its cache when `move_threads` is on.
     #[serde(default)]
     pub nodes: Vec<String>,
+    /// What a node's /health does not say, by node URL: `[node_meta."http://10.42.0.50:18080"]` with `model`
+    /// (the model it serves; a turn runs only on nodes serving its request's model), `context_length`, `slots`,
+    /// and `grant = false` (not under `grant_cmd`: a node that is not a strixite worker lease, the StrixFold pair).
+    #[serde(default)]
+    pub node_meta: std::collections::HashMap<String, NodeMeta>,
     /// Slots a node is assumed to have while its /health does not say.
     #[serde(default = "d_slots")]
     pub node_slots: u32,
@@ -212,6 +218,26 @@ fn d_page_turns() -> u64 { 4 }
 fn d_page_min() -> u64 { 500 }
 fn d_page_batch() -> u64 { 32 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<bool>,
+}
+
+impl Config {
+    /// The model a node serves: its `node_meta` model, else `model`.
+    pub fn node_model(&self, url: &str) -> &str {
+        self.node_meta.get(url).and_then(|m| m.model.as_deref()).unwrap_or(&self.model)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         toml::from_str("").expect("every field has a default")
@@ -234,6 +260,9 @@ impl Config {
         }
         if self.operator_token == self.callback_token {
             bail!("operator_token and callback_token must differ");
+        }
+        for u in self.node_meta.keys() {
+            if !self.nodes.contains(u) { bail!("node_meta names {u:?}, which is not in nodes"); }
         }
         for n in &self.nodes {
             if !(n.starts_with("http://") || n.starts_with("https://")) || n.ends_with('/') {

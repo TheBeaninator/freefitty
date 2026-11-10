@@ -11,6 +11,11 @@
 //! requests, so a node shared with other work counts as busy); between polls the router adds what it started
 //! or finished itself. A node that stops answering is down until it answers again; a turn that never reached
 //! it goes to another. While no node is up a turn waits `node_down_wait_s` before it fails.
+//!
+//! Nodes may serve different models (`node_meta` model; default `model`): a turn runs only on a node serving its
+//! request's `model`, so a thread born from a DeepSeek expert lands on the StrixFold pair and every other thread
+//! stays on strixite. StrixFold's /health says `max_batch_size` and `live` {connections, waiting} where strixite
+//! says `slots`, `busy_slots` and `queued`; both are read.
 
 use crate::config::Config;
 use anyhow::{bail, Result};
@@ -35,6 +40,8 @@ struct NodeState {
     xfer: Option<bool>,
     context_length: u64,
     model: Option<String>,
+    /// The model this node serves for placement (`node_meta` model, else the config's `model`).
+    serves: String,
 }
 
 impl NodeState {
@@ -79,14 +86,18 @@ pub struct Router {
     /// one of their turns waits for a slot, no other turn takes one. After the 2026-11-09 rail loss the StrixFold
     /// cards' rounds sat behind 33 others for B/C/D's six slots while F+A waited for those rounds (dad 2026-11-10).
     priority: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// Priority turns waiting for a slot now.
-    priority_waiting: std::sync::atomic::AtomicUsize,
+    /// Priority turns waiting for a slot now, by model: a priority turn holds back only turns that could take
+    /// the slots it waits for (one waiting for strixite never holds a DeepSeek turn off the StrixFold pair).
+    priority_waiting: std::sync::Mutex<std::collections::HashMap<String, usize>>,
 }
 
 /// Counts a priority turn as waiting until it is placed, fails or is dropped (a cancelled slice).
-struct PriorityWait<'a>(&'a std::sync::atomic::AtomicUsize);
+struct PriorityWait<'a>(&'a std::sync::Mutex<std::collections::HashMap<String, usize>>, String);
 impl Drop for PriorityWait<'_> {
-    fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); }
+    fn drop(&mut self) {
+        let mut w = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = w.get_mut(&self.1) { *n = n.saturating_sub(1); if *n == 0 { w.remove(&self.1); } }
+    }
 }
 
 pub struct Turn {
@@ -124,7 +135,11 @@ impl Router {
         let nodes = cfg
             .nodes
             .iter()
-            .map(|u| NodeState { url: u.clone(), up: false, slots: cfg.node_slots, busy: None, mine: 0, mine_at_poll: 0, wanted: 0, held: false, xfer: None, context_length: 0, model: None })
+            .map(|u| {
+                let m = cfg.node_meta.get(u);
+                NodeState { url: u.clone(), up: false, slots: m.and_then(|m| m.slots).unwrap_or(cfg.node_slots), busy: None, mine: 0, mine_at_poll: 0, wanted: 0, held: false, xfer: None,
+                            context_length: m.and_then(|m| m.context_length).unwrap_or(0), model: None, serves: cfg.node_model(u).to_owned() }
+            })
             .collect();
         let r = Arc::new(Router {
             cfg: cfg.clone(),
@@ -166,9 +181,14 @@ impl Router {
         self.nodes.lock().await.iter().any(|n| n.up)
     }
 
-    /// The smallest context length the up nodes report, or 0 while none says.
+    /// The smallest context length the up nodes serving the default model report, or 0 while none says.
     pub async fn context_length(&self) -> u64 {
-        self.nodes.lock().await.iter().filter(|n| n.up && n.context_length > 0).map(|n| n.context_length).min().unwrap_or(0)
+        self.context_length_for(&self.cfg.model).await
+    }
+
+    /// The smallest context length the up nodes serving `model` report (or `node_meta` gives), 0 while none says.
+    pub async fn context_length_for(&self, model: &str) -> u64 {
+        self.nodes.lock().await.iter().filter(|n| n.up && n.serves == model && n.context_length > 0).map(|n| n.context_length).min().unwrap_or(0)
     }
 
     pub async fn view(&self) -> Vec<Value> {
@@ -176,7 +196,7 @@ impl Router {
             .lock()
             .await
             .iter()
-            .map(|n| serde_json::json!({"url": n.url, "up": n.up, "slots": n.slots, "load": n.load(), "mine": n.mine, "waiting": n.wanted, "held": n.held, "xfer": n.xfer, "model": n.model, "context_length": n.context_length}))
+            .map(|n| serde_json::json!({"url": n.url, "up": n.up, "slots": n.slots, "load": n.load(), "mine": n.mine, "waiting": n.wanted, "held": n.held, "xfer": n.xfer, "model": n.model, "serves": n.serves, "context_length": n.context_length}))
             .collect()
     }
 
@@ -185,7 +205,8 @@ impl Router {
         let url = self.cfg.nodes[i].clone();
         let mut granted_at: Option<Instant> = None;
         loop {
-            if !self.cfg.grant_cmd.is_empty() && granted_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(self.cfg.grant_check_s)) {
+            let granted = self.cfg.node_meta.get(&url).and_then(|m| m.grant) != Some(false);
+            if granted && !self.cfg.grant_cmd.is_empty() && granted_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(self.cfg.grant_check_s)) {
                 granted_at = Some(Instant::now());
                 let held = grant_held(&self.cfg.grant_cmd, &url).await;
                 let was = std::mem::replace(&mut self.nodes.lock().await[i].held, held);
@@ -208,14 +229,7 @@ impl Router {
                 let mut nodes = self.nodes.lock().await;
                 let n = &mut nodes[i];
                 was_up = n.up;
-                n.up = up && parsed.get("status").and_then(|s| s.as_str()).is_none_or(|s| s == "ok");
-                if let Some(s) = parsed.get("slots").and_then(|v| v.as_u64()) { n.slots = s.max(1) as u32; }
-                let busy = parsed.get("busy_slots").and_then(|v| v.as_u64()).or_else(|| parsed.get("busy").and_then(|b| b.as_bool()).map(|b| if b { n.slots as u64 } else { 0 }));
-                let queued = parsed.get("queued").and_then(|v| v.as_u64()).unwrap_or(0);
-                n.busy = busy.map(|b| (b + queued) as u32);
-                n.mine_at_poll = n.mine;
-                if let Some(c) = parsed.get("context_length").and_then(|v| v.as_u64()) { n.context_length = c; }
-                if let Some(m) = parsed.get("model").and_then(|v| v.as_str()) { n.model = Some(m.to_owned()); }
+                read_health(n, up, &parsed);
                 if n.up && n.xfer.is_none() { xfer_unknown = true; }
                 if !n.up { n.xfer = None; }
             }
@@ -240,7 +254,7 @@ impl Router {
     /// Pick the node for a turn of `thread` (None: not a thread's, an expert being read) last served by `home`,
     /// carrying about `tokens` prompt tokens. Returns (node index, node to move the cached state from). Waits while
     /// the usable nodes are full, and up to `node_down_wait_s` while none is up.
-    async fn place(&self, thread: Option<&str>, home: Option<&str>, tokens: u64, avoid: &[usize]) -> Result<(usize, Option<usize>)> {
+    async fn place(&self, model: &str, thread: Option<&str>, home: Option<&str>, tokens: u64, avoid: &[usize]) -> Result<(usize, Option<usize>)> {
         let started = Instant::now();
         let prio = thread.is_some_and(|t| self.priority.lock().unwrap().contains(t));
         let mut _prio_wait: Option<PriorityWait> = None;
@@ -255,10 +269,10 @@ impl Router {
                 let mut nodes = self.nodes.lock().await;
                 if let Some(w) = waiting_on.take() { nodes[w].wanted -= 1; }
                 if self.is_stopping() { bail!("the daemon is stopping"); }
-                let up: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].up && !avoid.contains(&i)).collect();
+                let up: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].up && nodes[i].serves == model && !avoid.contains(&i)).collect();
                 if up.is_empty() {
                     if started.elapsed() >= Duration::from_secs(self.cfg.node_down_wait_s) {
-                        bail!("no model node is up");
+                        bail!("no node serving {model} is up");
                     }
                 } else {
                     let h = home.and_then(|h| up.iter().copied().find(|&i| nodes[i].url == h));
@@ -275,7 +289,7 @@ impl Router {
                     let mut free: Vec<usize> = up.iter().copied().filter(|&i| !nodes[i].held && nodes[i].free() - reserve(nodes[i].wanted) > 0).collect();
                     // a node a thread can later leave with its cache first; then the least loaded
                     free.sort_by_key(|&i| (nodes[i].xfer == Some(false), nodes[i].wanted as i64 - nodes[i].free(), nodes[i].load(), i));
-                    let yield_to_priority = !prio && self.priority_waiting.load(std::sync::atomic::Ordering::Relaxed) > 0;
+                    let yield_to_priority = !prio && self.priority_waiting.lock().unwrap().get(model).is_some_and(|&n| n > 0);
                     let choice = if yield_to_priority { None } else { match h {
                         Some(h) if !nodes[h].held && nodes[h].free() > 0 => Some((h, None, "kept")),
                         None if !free.is_empty() => Some((free[0], None, "new")),
@@ -296,8 +310,8 @@ impl Router {
                     }
                     if let Some(h) = h.filter(|&h| !nodes[h].held) { nodes[h].wanted += 1; waiting_on = Some(h); }
                     if prio && _prio_wait.is_none() {
-                        self.priority_waiting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        _prio_wait = Some(PriorityWait(&self.priority_waiting));
+                        *self.priority_waiting.lock().unwrap().entry(model.to_owned()).or_default() += 1;
+                        _prio_wait = Some(PriorityWait(&self.priority_waiting, model.to_owned()));
                     }
                 }
             }
@@ -504,11 +518,12 @@ impl Router {
     /// `chat`, first putting saved state (if any) into the node the turn is placed on.
     pub async fn chat_restoring(&self, thread: Option<&str>, home: Option<&str>, body: &Value, parked: Option<&Path>) -> Result<Turn, ChatError> {
         let tokens = (serde_json::to_vec(body).map(|b| b.len()).unwrap_or(0) / 4) as u64;
+        let model = body.get("model").and_then(|m| m.as_str()).unwrap_or(&self.cfg.model).to_owned();
         let mut avoid = Vec::new();
         let total = self.cfg.nodes.len();
         let placed_at = Instant::now();
         loop {
-            let (i, from) = self.place(thread, home, tokens, &avoid).await
+            let (i, from) = self.place(&model, thread, home, tokens, &avoid).await
                 .map_err(|e| if self.is_stopping() { ChatError::Stopping } else { ChatError::Transient(e.to_string()) })?;
             let (waited, sent_at) = (placed_at.elapsed(), Instant::now());
             let (url, from_url) = {
@@ -587,9 +602,14 @@ impl Router {
         }
     }
 
-    /// The up nodes' URLs.
+    /// The up nodes' URLs among those serving the default model (steering lives on strixite only).
     pub async fn up_nodes(&self) -> Vec<String> {
-        self.nodes.lock().await.iter().filter(|n| n.up).map(|n| n.url.clone()).collect()
+        self.up_nodes_for(&self.cfg.model).await
+    }
+
+    /// The up nodes serving `model`.
+    pub async fn up_nodes_for(&self, model: &str) -> Vec<String> {
+        self.nodes.lock().await.iter().filter(|n| n.up && n.serves == model).map(|n| n.url.clone()).collect()
     }
 
     /// One completion on one named node, outside placement (warming an expert's prefix into its cache).
@@ -607,6 +627,22 @@ impl Router {
     pub fn model(&self) -> &str {
         &self.cfg.model
     }
+}
+
+/// Apply one /health answer (`up`: it answered) to a node: strixite's `slots`/`busy_slots`/`queued`, or
+/// StrixFold's `max_batch_size` and `live` {connections, waiting}. A field the answer lacks keeps its value.
+fn read_health(n: &mut NodeState, up: bool, h: &Value) {
+    n.up = up && h.get("status").and_then(|s| s.as_str()).is_none_or(|s| s == "ok");
+    if let Some(s) = h.get("slots").or_else(|| h.get("max_batch_size")).and_then(|v| v.as_u64()) { n.slots = s.max(1) as u32; }
+    let live = h.get("live");
+    let busy = h.get("busy_slots").and_then(|v| v.as_u64())
+        .or_else(|| h.get("busy").and_then(|b| b.as_bool()).map(|b| if b { n.slots as u64 } else { 0 }))
+        .or_else(|| live.and_then(|l| l.get("connections")).and_then(|v| v.as_u64()));
+    let queued = h.get("queued").or_else(|| live.and_then(|l| l.get("waiting"))).and_then(|v| v.as_u64()).unwrap_or(0);
+    n.busy = busy.map(|b| (b + queued) as u32);
+    n.mine_at_poll = n.mine;
+    if let Some(c) = h.get("context_length").and_then(|v| v.as_u64()) { n.context_length = c; }
+    if let Some(m) = h.get("model").and_then(|v| v.as_str()) { n.model = Some(m.to_owned()); }
 }
 
 /// Run the grant command for `node`: exit 1 = held. A command that cannot run counts as free, so a missing
@@ -635,34 +671,84 @@ fn parse_turn(v: &Value, url: String) -> Result<Turn, String> {
 mod tests {
     use super::*;
 
+    const M: &str = "qwen3.8-flash-next";
+
+    fn serving(mut n: NodeState, model: &str) -> NodeState { n.serves = model.into(); n }
+
+    #[tokio::test]
+    async fn a_turn_runs_only_on_nodes_serving_its_model() {
+        // a (the default model) is the less loaded node, yet a DeepSeek turn goes to b and a default turn to a
+        let mut b = serving(node("b", false, false), "dsv41");
+        b.busy = Some(1);
+        let r = router(vec![node("a", false, true), b], true);
+        assert_eq!(r.place("dsv41", None, None, 10, &[]).await.unwrap(), (1, None));
+        assert_eq!(r.place(M, None, None, 10, &[]).await.unwrap(), (0, None));
+        // a full node of the right model is waited for, never traded for a free node of another model
+        let r = router(vec![node("a", false, true), { let mut b = serving(node("b", false, false), "dsv41"); b.busy = Some(2); b }], true);
+        assert!(tokio::time::timeout(Duration::from_millis(1500), r.place("dsv41", None, None, 10, &[])).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_priority_turn_holds_back_only_turns_of_its_own_model() {
+        // the only default-model node is full: a priority default turn waits there, and a DeepSeek newcomer
+        // still takes the StrixFold node's free slot
+        let mut a = node("a", false, true);
+        a.busy = Some(2);
+        let r = Arc::new(router(vec![a, serving(node("b", false, false), "dsv41")], true));
+        r.set_priority("p", true);
+        let rp = r.clone();
+        let _prio = tokio::spawn(async move { rp.place(M, Some("p"), None, 10, &[]).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(r.priority_waiting.lock().unwrap().get(M).copied(), Some(1));
+        let other = tokio::time::timeout(Duration::from_secs(3), r.place("dsv41", Some("o"), None, 10, &[])).await;
+        assert_eq!(other.expect("not held back by another model's priority turn").unwrap(), (1, None));
+    }
+
+    #[test]
+    fn strixfold_health_reads_as_slots_and_load() {
+        let mut n = serving(node("f", false, false), "dsv41");
+        n.busy = None;
+        let h = serde_json::json!({"status": "ok", "model": "dsv41", "max_batch_size": 1, "warming": false,
+                                   "live": {"connections": 1, "waiting": 2, "decode_tokens_per_second": 0.0}});
+        read_health(&mut n, true, &h);
+        assert!(n.up);
+        assert_eq!((n.slots, n.busy, n.model.as_deref()), (1, Some(3), Some("dsv41")));
+        // strixite's own fields win where both are present
+        let h = serde_json::json!({"status": "ok", "slots": 2, "busy_slots": 1, "queued": 0, "context_length": 262144});
+        read_health(&mut n, true, &h);
+        assert_eq!((n.slots, n.busy, n.context_length), (2, Some(1), 262144));
+        read_health(&mut n, true, &serde_json::json!({"status": "loading"}));
+        assert!(!n.up, "a status other than ok is not up");
+    }
+
     fn router(nodes: Vec<NodeState>, move_threads: bool) -> Router {
         let cfg = Config { move_threads, spill_tokens: 1000, ..Config::default() };
         Router { cfg, client: reqwest::Client::new(), xfer_client: reqwest::Client::new(), nodes: Mutex::new(nodes), counts: Mutex::new(Counts::default()), notify: Notify::new(), stopping: Default::default(), priority: Default::default(), priority_waiting: Default::default() }
     }
 
     fn node(url: &str, held: bool, xfer: bool) -> NodeState {
-        NodeState { url: url.into(), up: true, slots: 2, busy: Some(0), mine: 0, mine_at_poll: 0, wanted: 0, held, xfer: Some(xfer), context_length: 0, model: None }
+        NodeState { url: url.into(), up: true, slots: 2, busy: Some(0), mine: 0, mine_at_poll: 0, wanted: 0, held, xfer: Some(xfer), context_length: 0, model: None, serves: M.into() }
     }
 
     #[tokio::test]
     async fn a_held_node_takes_no_new_thread() {
         let r = router(vec![node("a", true, true), node("b", false, true)], true);
-        assert_eq!(r.place(None, None, 10, &[]).await.unwrap(), (1, None));
+        assert_eq!(r.place(M, None, None, 10, &[]).await.unwrap(), (1, None));
     }
 
     #[tokio::test]
     async fn a_thread_leaves_its_held_home_with_its_cache() {
         let r = router(vec![node("a", true, true), node("b", false, true)], true);
-        assert_eq!(r.place(None, Some("a"), 50_000, &[]).await.unwrap(), (1, Some(0)));
+        assert_eq!(r.place(M, None, Some("a"), 50_000, &[]).await.unwrap(), (1, Some(0)));
         assert_eq!(r.counts().moved, 1);
     }
 
     #[tokio::test]
     async fn a_thread_spills_from_a_held_home_that_cannot_move_it() {
         let r = router(vec![node("a", true, false), node("b", false, true)], true);
-        assert_eq!(r.place(None, Some("a"), 50_000, &[]).await.unwrap(), (1, None));
+        assert_eq!(r.place(M, None, Some("a"), 50_000, &[]).await.unwrap(), (1, None));
         let r = router(vec![node("a", true, true), node("b", false, true)], false);
-        assert_eq!(r.place(None, Some("a"), 50_000, &[]).await.unwrap(), (1, None));
+        assert_eq!(r.place(M, None, Some("a"), 50_000, &[]).await.unwrap(), (1, None));
         assert_eq!(r.counts().spilled, 1);
     }
 
@@ -675,7 +761,7 @@ mod tests {
         r.cfg.newcomer_wait_s = 1;
         r.cfg.node_down_wait_s = 30;
         let t = Instant::now();
-        assert_eq!(r.place(None, None, 10, &[]).await.unwrap(), (0, None));
+        assert_eq!(r.place(M, None, None, 10, &[]).await.unwrap(), (0, None));
         assert!(t.elapsed() >= Duration::from_secs(1), "it waited its turn first");
         assert_eq!(r.counts().new, 1);
     }
@@ -688,7 +774,7 @@ mod tests {
         let mut r = router(vec![a], true);
         r.cfg.newcomer_wait_s = 0;
         r.cfg.node_down_wait_s = 30;
-        let placed = tokio::time::timeout(Duration::from_millis(2500), r.place(None, None, 10, &[])).await;
+        let placed = tokio::time::timeout(Duration::from_millis(2500), r.place(M, None, None, 10, &[])).await;
         assert!(placed.is_err(), "the last slot stays with the threads waiting for their home");
     }
 
@@ -704,7 +790,7 @@ mod tests {
             r.cfg.newcomer_wait_s = 1;
             r.cfg.node_down_wait_s = 30;
             r.cfg.spill_tokens = 100_000;
-            let placed = tokio::time::timeout(Duration::from_secs(5), r.place(None, Some("a"), 50_000, &[])).await;
+            let placed = tokio::time::timeout(Duration::from_secs(5), r.place(M, None, Some("a"), 50_000, &[])).await;
             assert_eq!(placed.expect("it is placed once overdue, not when its home returns").unwrap().0, 1);
         }
     }
@@ -716,17 +802,17 @@ mod tests {
         let r = Arc::new(router(vec![a], true));
         r.set_priority("p", true);
         let rp = r.clone();
-        let prio = tokio::spawn(async move { rp.place(Some("p"), None, 10, &[]).await.unwrap() });
+        let prio = tokio::spawn(async move { rp.place(M, Some("p"), None, 10, &[]).await.unwrap() });
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(r.priority_waiting.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(r.priority_waiting.lock().unwrap().get(M).copied().unwrap_or(0), 1);
         // a slot frees: the ordinary turn waiting since before the priority one still yields to it
         let ro = r.clone();
-        let other = tokio::spawn(async move { tokio::time::timeout(Duration::from_secs(3), ro.place(Some("o"), Some("a"), 10, &[])).await });
+        let other = tokio::spawn(async move { tokio::time::timeout(Duration::from_secs(3), ro.place(M, Some("o"), Some("a"), 10, &[])).await });
         tokio::time::sleep(Duration::from_millis(100)).await;
         { let mut n = r.nodes.lock().await; n[0].mine = 1; n[0].wanted += 1; }  // freed, and wanted by home-waiters
         r.notify.notify_waiters();
         assert_eq!(prio.await.unwrap(), (0, None));
-        assert_eq!(r.priority_waiting.load(std::sync::atomic::Ordering::Relaxed), 0, "placed: no longer counted as waiting");
+        assert_eq!(r.priority_waiting.lock().unwrap().get(M).copied().unwrap_or(0), 0, "placed: no longer counted as waiting");
         assert!(other.await.unwrap().is_err(), "the ordinary turn got no slot (the node is full again)");
     }
 
@@ -736,13 +822,13 @@ mod tests {
         r.set_priority("p", true);
         r.set_priority("p", false);
         assert_eq!(r.priority_threads(), Vec::<String>::new());
-        assert_eq!(r.place(Some("p"), None, 10, &[]).await.unwrap(), (0, None));
+        assert_eq!(r.place(M, Some("p"), None, 10, &[]).await.unwrap(), (0, None));
     }
 
     #[tokio::test]
     async fn a_free_home_keeps_its_thread() {
         let r = router(vec![node("a", false, true), node("b", true, true)], true);
-        assert_eq!(r.place(None, Some("a"), 50_000, &[]).await.unwrap(), (0, None));
+        assert_eq!(r.place(M, None, Some("a"), 50_000, &[]).await.unwrap(), (0, None));
     }
 
     #[tokio::test]

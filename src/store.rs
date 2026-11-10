@@ -123,6 +123,10 @@ pub struct Expert {
     /// (strixite `steer_scope` {"messages": k}). Part of its version: the two scopes cache under different keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steer_scope: Option<String>,
+    /// The model a thread born from it runs on (a node serving it, `node_meta`); None = the config's `model`.
+    /// Part of its version: another model reads the same documents into another state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

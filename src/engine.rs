@@ -308,7 +308,8 @@ impl Engine {
         }
 
         // ---- room in the context -----------------------------------------------------------------
-        let limit = if self.cfg.max_context_tokens > 0 { self.cfg.max_context_tokens } else { self.router.context_length().await.saturating_sub(self.cfg.max_output_tokens) };
+        let model = self.model_of(&meta);
+        let limit = if self.cfg.max_context_tokens > 0 { self.cfg.max_context_tokens } else { self.router.context_length_for(&model).await.saturating_sub(self.cfg.max_output_tokens) };
         if limit > 0 && est > limit {
             return Ok(Outcome::Fatal(format!("context full: about {est} tokens, the limit is {limit}")));
         }
@@ -321,7 +322,7 @@ impl Engine {
         }
         self.fade(&mut messages, &meta, &history);
         let sent_est = tokens(&messages);
-        let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "max_tokens": self.cfg.max_output_tokens, "stream": false});
+        let mut body = json!({"model": model, "messages": messages, "tools": defs, "max_tokens": self.cfg.max_output_tokens, "stream": false});
         self.steer_into(&mut body, &meta);
 
         let mut reply_text = String::new();
@@ -590,6 +591,12 @@ impl Engine {
         window::fade_images_before(messages, window::count_images(&history[..from]), meta.images_kept_from);
     }
 
+    /// The model this thread runs on: its expert's, else the config's (the router places the turn on a node
+    /// serving it).
+    fn model_of(&self, meta: &ThreadMeta) -> String {
+        meta.expert.as_ref().and_then(|k| self.store.expert(k).ok().flatten()).and_then(|e| e.model).unwrap_or_else(|| self.cfg.model.clone())
+    }
+
     /// The steering every request of this thread carries: its expert's (a thread born from a steered expert is
     /// that persona on every turn, and the nodes cache its state under the steering's own key).
     fn steer_into(&self, body: &mut Value, meta: &ThreadMeta) {
@@ -744,7 +751,7 @@ impl Engine {
         let defs = rap::scope_defs(defs, meta.tools.as_deref());
         let mut messages = live_view(&p, &meta, &history, &meta.pending, self.page_min());
         self.fade(&mut messages, &meta, &history);
-        let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "max_tokens": self.cfg.max_output_tokens, "stream": false});
+        let mut body = json!({"model": self.model_of(&meta), "messages": messages, "tools": defs, "max_tokens": self.cfg.max_output_tokens, "stream": false});
         self.steer_into(&mut body, &meta);
         Some(body)
     }
@@ -768,7 +775,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     async fn window_cut(&self, thread: &str, meta: &mut ThreadMeta, prefix: &[Value], history: &[Value], pending: &[PendingCall], new_messages: &[Value], est: u64) -> Option<(Vec<Value>, u64)> {
         if !self.cfg.window { return None; }
-        let (budget, target) = self.window_limits().await?;
+        let (budget, target) = self.window_limits(&self.model_of(meta)).await?;
         if est <= budget { return None; }
         let low = meta.compactions.last().map(|c| c.from as usize).unwrap_or(0);
         let from = (meta.window_from as usize).max(low).min(history.len());
@@ -799,12 +806,12 @@ impl Engine {
 
     /// The window's budget and trim target: the config's numbers, or from the nodes' context length (none while
     /// no node has said).
-    async fn window_limits(&self) -> Option<(u64, u64)> {
+    async fn window_limits(&self, model: &str) -> Option<(u64, u64)> {
         const MARGIN: u64 = 8192;
         let budget = if self.cfg.window_tokens > 0 {
             self.cfg.window_tokens
         } else {
-            let ctx = if self.cfg.max_context_tokens > 0 { self.cfg.max_context_tokens } else { self.router.context_length().await };
+            let ctx = if self.cfg.max_context_tokens > 0 { self.cfg.max_context_tokens } else { self.router.context_length_for(model).await };
             if ctx == 0 { return None; }
             ctx.saturating_sub(self.cfg.max_output_tokens + MARGIN)
         };
@@ -844,7 +851,7 @@ impl Engine {
         // unsteered: the notes are stored text the thread will believe, so memory stays separate from voice (a
         // persona's steering never colors what a later freeze of these notes bakes in). The cost: the node reads
         // this view without the steered cache.
-        let mut body = json!({"model": self.router.model(), "messages": messages, "tools": defs, "tool_choice": "none", "max_tokens": self.cfg.compact_summary_tokens, "stream": false});
+        let mut body = json!({"model": self.model_of(meta), "messages": messages, "tools": defs, "tool_choice": "none", "max_tokens": self.cfg.compact_summary_tokens, "stream": false});
         // under scope "prefix" the generation is plain by construction, so the refocus keeps the steering fields and
         // the node serves the view from the expert's cached (steered) reading instead of reading it again
         if let Some(e) = meta.expert.as_ref().and_then(|k| self.store.expert(k).ok().flatten()) {
