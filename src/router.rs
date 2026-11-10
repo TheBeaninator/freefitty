@@ -75,6 +75,18 @@ pub struct Router {
     /// Set when the daemon stops: a turn still waiting for a slot gives up (ChatError::Stopping) instead of holding
     /// the stop for up to slice_timeout_s; a turn already sent to a node finishes.
     stopping: std::sync::atomic::AtomicBool,
+    /// Threads whose turns go first (`POST /threads/{id}/priority`; pod-ff marks its expedite cards' threads): while
+    /// one of their turns waits for a slot, no other turn takes one. After the 2026-11-09 rail loss the StrixFold
+    /// cards' rounds sat behind 33 others for B/C/D's six slots while F+A waited for those rounds (dad 2026-11-10).
+    priority: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Priority turns waiting for a slot now.
+    priority_waiting: std::sync::atomic::AtomicUsize,
+}
+
+/// Counts a priority turn as waiting until it is placed, fails or is dropped (a cancelled slice).
+struct PriorityWait<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for PriorityWait<'_> {
+    fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); }
 }
 
 pub struct Turn {
@@ -122,6 +134,8 @@ impl Router {
             counts: Mutex::new(Counts::default()),
             notify: Notify::new(),
             stopping: Default::default(),
+            priority: Default::default(),
+            priority_waiting: Default::default(),
         });
         for i in 0..cfg.nodes.len() {
             let r = r.clone();
@@ -132,6 +146,20 @@ impl Router {
 
     pub fn counts(&self) -> Counts {
         self.counts.try_lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    /// Mark (`on`) or unmark a thread's turns as going first; returns whether it is marked now.
+    pub fn set_priority(&self, thread: &str, on: bool) -> bool {
+        let mut p = self.priority.lock().unwrap();
+        if on { p.insert(thread.to_string()); } else { p.remove(thread); }
+        self.notify.notify_waiters();
+        on
+    }
+
+    pub fn priority_threads(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.priority.lock().unwrap().iter().cloned().collect();
+        v.sort();
+        v
     }
 
     pub async fn any_up(&self) -> bool {
@@ -209,11 +237,13 @@ impl Router {
         }
     }
 
-    /// Pick the node for a turn of a thread last served by `home`, carrying about `tokens` prompt tokens.
-    /// Returns (node index, node to move the cached state from). Waits while the usable nodes are full, and
-    /// up to `node_down_wait_s` while none is up.
-    async fn place(&self, home: Option<&str>, tokens: u64, avoid: &[usize]) -> Result<(usize, Option<usize>)> {
+    /// Pick the node for a turn of `thread` (None: not a thread's, an expert being read) last served by `home`,
+    /// carrying about `tokens` prompt tokens. Returns (node index, node to move the cached state from). Waits while
+    /// the usable nodes are full, and up to `node_down_wait_s` while none is up.
+    async fn place(&self, thread: Option<&str>, home: Option<&str>, tokens: u64, avoid: &[usize]) -> Result<(usize, Option<usize>)> {
         let started = Instant::now();
+        let prio = thread.is_some_and(|t| self.priority.lock().unwrap().contains(t));
+        let mut _prio_wait: Option<PriorityWait> = None;
         // a newcomer's patience is newcomer_wait_s plus up to half again, so newcomers born together (several
         // goldfish of one turn) do not all turn overdue in the same second
         let patience = Duration::from_millis(self.cfg.newcomer_wait_s * 1000 + rand::random_range(0..=self.cfg.newcomer_wait_s * 500));
@@ -240,18 +270,20 @@ impl Router {
                     let overdue = h.is_none_or(|h| nodes[h].held) && started.elapsed() >= patience;
                     // overdue, a newcomer may take a slot home-waiters want, but where two or more of them wait it leaves
                     // them one (a burst of overdue newcomers never takes a node's every slot from its own threads)
-                    let reserve = |w: u32| if overdue { (w as i64 - 1).max(0) } else { w as i64 };
+                    // a priority turn takes any free slot, home-waiters' included
+                    let reserve = |w: u32| if prio { 0 } else if overdue { (w as i64 - 1).max(0) } else { w as i64 };
                     let mut free: Vec<usize> = up.iter().copied().filter(|&i| !nodes[i].held && nodes[i].free() - reserve(nodes[i].wanted) > 0).collect();
                     // a node a thread can later leave with its cache first; then the least loaded
                     free.sort_by_key(|&i| (nodes[i].xfer == Some(false), nodes[i].wanted as i64 - nodes[i].free(), nodes[i].load(), i));
-                    let choice = match h {
+                    let yield_to_priority = !prio && self.priority_waiting.load(std::sync::atomic::Ordering::Relaxed) > 0;
+                    let choice = if yield_to_priority { None } else { match h {
                         Some(h) if !nodes[h].held && nodes[h].free() > 0 => Some((h, None, "kept")),
                         None if !free.is_empty() => Some((free[0], None, "new")),
                         // a held home is left like a full one, and spilled when its state cannot move
                         Some(h) if !free.is_empty() && (tokens <= self.cfg.spill_tokens || (self.cfg.move_threads && nodes[h].xfer == Some(false)) || (nodes[h].held && (!self.cfg.move_threads || nodes[h].xfer == Some(false)))) => Some((free[0], None, "spilled")),
                         Some(h) if !free.is_empty() && self.cfg.move_threads => Some((free[0], Some(h), "moved")),
                         _ => None,
-                    };
+                    } };
                     if let Some((n, from, why)) = choice {
                         nodes[n].mine += 1;
                         let mut c = self.counts.lock().await;
@@ -263,6 +295,10 @@ impl Router {
                         return Ok((n, from));
                     }
                     if let Some(h) = h.filter(|&h| !nodes[h].held) { nodes[h].wanted += 1; waiting_on = Some(h); }
+                    if prio && _prio_wait.is_none() {
+                        self.priority_waiting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        _prio_wait = Some(PriorityWait(&self.priority_waiting));
+                    }
                 }
             }
             waited = true;
@@ -460,19 +496,19 @@ impl Router {
         Ok(len)
     }
 
-    /// Run one chat completion for a thread. `home` is the node that served its last turn.
-    pub async fn chat(&self, home: Option<&str>, body: &Value) -> Result<Turn, ChatError> {
-        self.chat_restoring(home, body, None).await
+    /// Run one chat completion for `thread` (None: not a thread's). `home` is the node that served its last turn.
+    pub async fn chat(&self, thread: Option<&str>, home: Option<&str>, body: &Value) -> Result<Turn, ChatError> {
+        self.chat_restoring(thread, home, body, None).await
     }
 
     /// `chat`, first putting saved state (if any) into the node the turn is placed on.
-    pub async fn chat_restoring(&self, home: Option<&str>, body: &Value, parked: Option<&Path>) -> Result<Turn, ChatError> {
+    pub async fn chat_restoring(&self, thread: Option<&str>, home: Option<&str>, body: &Value, parked: Option<&Path>) -> Result<Turn, ChatError> {
         let tokens = (serde_json::to_vec(body).map(|b| b.len()).unwrap_or(0) / 4) as u64;
         let mut avoid = Vec::new();
         let total = self.cfg.nodes.len();
         let placed_at = Instant::now();
         loop {
-            let (i, from) = self.place(home, tokens, &avoid).await
+            let (i, from) = self.place(thread, home, tokens, &avoid).await
                 .map_err(|e| if self.is_stopping() { ChatError::Stopping } else { ChatError::Transient(e.to_string()) })?;
             let (waited, sent_at) = (placed_at.elapsed(), Instant::now());
             let (url, from_url) = {
@@ -601,7 +637,7 @@ mod tests {
 
     fn router(nodes: Vec<NodeState>, move_threads: bool) -> Router {
         let cfg = Config { move_threads, spill_tokens: 1000, ..Config::default() };
-        Router { cfg, client: reqwest::Client::new(), xfer_client: reqwest::Client::new(), nodes: Mutex::new(nodes), counts: Mutex::new(Counts::default()), notify: Notify::new(), stopping: Default::default() }
+        Router { cfg, client: reqwest::Client::new(), xfer_client: reqwest::Client::new(), nodes: Mutex::new(nodes), counts: Mutex::new(Counts::default()), notify: Notify::new(), stopping: Default::default(), priority: Default::default(), priority_waiting: Default::default() }
     }
 
     fn node(url: &str, held: bool, xfer: bool) -> NodeState {
@@ -611,22 +647,22 @@ mod tests {
     #[tokio::test]
     async fn a_held_node_takes_no_new_thread() {
         let r = router(vec![node("a", true, true), node("b", false, true)], true);
-        assert_eq!(r.place(None, 10, &[]).await.unwrap(), (1, None));
+        assert_eq!(r.place(None, None, 10, &[]).await.unwrap(), (1, None));
     }
 
     #[tokio::test]
     async fn a_thread_leaves_its_held_home_with_its_cache() {
         let r = router(vec![node("a", true, true), node("b", false, true)], true);
-        assert_eq!(r.place(Some("a"), 50_000, &[]).await.unwrap(), (1, Some(0)));
+        assert_eq!(r.place(None, Some("a"), 50_000, &[]).await.unwrap(), (1, Some(0)));
         assert_eq!(r.counts().moved, 1);
     }
 
     #[tokio::test]
     async fn a_thread_spills_from_a_held_home_that_cannot_move_it() {
         let r = router(vec![node("a", true, false), node("b", false, true)], true);
-        assert_eq!(r.place(Some("a"), 50_000, &[]).await.unwrap(), (1, None));
+        assert_eq!(r.place(None, Some("a"), 50_000, &[]).await.unwrap(), (1, None));
         let r = router(vec![node("a", true, true), node("b", false, true)], false);
-        assert_eq!(r.place(Some("a"), 50_000, &[]).await.unwrap(), (1, None));
+        assert_eq!(r.place(None, Some("a"), 50_000, &[]).await.unwrap(), (1, None));
         assert_eq!(r.counts().spilled, 1);
     }
 
@@ -639,7 +675,7 @@ mod tests {
         r.cfg.newcomer_wait_s = 1;
         r.cfg.node_down_wait_s = 30;
         let t = Instant::now();
-        assert_eq!(r.place(None, 10, &[]).await.unwrap(), (0, None));
+        assert_eq!(r.place(None, None, 10, &[]).await.unwrap(), (0, None));
         assert!(t.elapsed() >= Duration::from_secs(1), "it waited its turn first");
         assert_eq!(r.counts().new, 1);
     }
@@ -652,7 +688,7 @@ mod tests {
         let mut r = router(vec![a], true);
         r.cfg.newcomer_wait_s = 0;
         r.cfg.node_down_wait_s = 30;
-        let placed = tokio::time::timeout(Duration::from_millis(2500), r.place(None, 10, &[])).await;
+        let placed = tokio::time::timeout(Duration::from_millis(2500), r.place(None, None, 10, &[])).await;
         assert!(placed.is_err(), "the last slot stays with the threads waiting for their home");
     }
 
@@ -668,15 +704,45 @@ mod tests {
             r.cfg.newcomer_wait_s = 1;
             r.cfg.node_down_wait_s = 30;
             r.cfg.spill_tokens = 100_000;
-            let placed = tokio::time::timeout(Duration::from_secs(5), r.place(Some("a"), 50_000, &[])).await;
+            let placed = tokio::time::timeout(Duration::from_secs(5), r.place(None, Some("a"), 50_000, &[])).await;
             assert_eq!(placed.expect("it is placed once overdue, not when its home returns").unwrap().0, 1);
         }
     }
 
     #[tokio::test]
+    async fn a_priority_turn_goes_first_and_takes_slots_home_waiters_want() {
+        let mut a = node("a", false, true);
+        a.mine = 2;  // full
+        let r = Arc::new(router(vec![a], true));
+        r.set_priority("p", true);
+        let rp = r.clone();
+        let prio = tokio::spawn(async move { rp.place(Some("p"), None, 10, &[]).await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(r.priority_waiting.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // a slot frees: the ordinary turn waiting since before the priority one still yields to it
+        let ro = r.clone();
+        let other = tokio::spawn(async move { tokio::time::timeout(Duration::from_secs(3), ro.place(Some("o"), Some("a"), 10, &[])).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        { let mut n = r.nodes.lock().await; n[0].mine = 1; n[0].wanted += 1; }  // freed, and wanted by home-waiters
+        r.notify.notify_waiters();
+        assert_eq!(prio.await.unwrap(), (0, None));
+        assert_eq!(r.priority_waiting.load(std::sync::atomic::Ordering::Relaxed), 0, "placed: no longer counted as waiting");
+        assert!(other.await.unwrap().is_err(), "the ordinary turn got no slot (the node is full again)");
+    }
+
+    #[tokio::test]
+    async fn an_unmarked_thread_waits_normally() {
+        let r = router(vec![node("a", false, true)], true);
+        r.set_priority("p", true);
+        r.set_priority("p", false);
+        assert_eq!(r.priority_threads(), Vec::<String>::new());
+        assert_eq!(r.place(Some("p"), None, 10, &[]).await.unwrap(), (0, None));
+    }
+
+    #[tokio::test]
     async fn a_free_home_keeps_its_thread() {
         let r = router(vec![node("a", false, true), node("b", true, true)], true);
-        assert_eq!(r.place(Some("a"), 50_000, &[]).await.unwrap(), (0, None));
+        assert_eq!(r.place(None, Some("a"), 50_000, &[]).await.unwrap(), (0, None));
     }
 
     #[tokio::test]

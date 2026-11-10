@@ -1322,3 +1322,22 @@ async fn a_running_slice_is_cancelled_and_its_thread_deleted_at_once() {
     assert_eq!(api.post("/threads/thread-none/cancel", json!({})).await["cancelled"], json!(false));
     r.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_operator_marks_and_unmarks_a_priority_thread() {
+    let h = harness().await;
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let path = format!("{}/threads/thread-p/priority", api.base);
+    assert_eq!(api.c.post(&path).send().await.unwrap().status().as_u16(), 401, "operator token required");
+    assert_eq!(api.post("/threads/thread-p/priority", json!({})).await["priority"], json!(true));
+    assert_eq!(api.get("/health").await["priority"], json!(["thread-p"]));
+    let off: Value = api.c.delete(&path).bearer_auth(&api.token).send().await.unwrap().json().await.unwrap();
+    assert_eq!(off["priority"], json!(false));
+    assert_eq!(api.get("/health").await["priority"], json!([]));
+    // a marked thread's turn runs like any other when nothing waits
+    api.post("/threads/thread-p/priority", json!({})).await;
+    api.say("first", Some("thread-p")).await;
+    assert!(api.output("thread-p", 10).await.is_some(), "a reply");
+    r.shutdown().await;
+}

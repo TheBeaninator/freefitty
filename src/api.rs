@@ -68,6 +68,7 @@ pub fn routes(app: Arc<App>) -> AxumRouter {
         .route("/threads/{id}/messages", get(messages).put(import_messages))
         .route("/threads/{id}/compact", post(compact))
         .route("/threads/{id}/cancel", post(cancel_thread))
+        .route("/threads/{id}/priority", post(priority_on).delete(priority_off))
         .route("/experts", get(experts_list))
         .route("/experts/reload", post(experts_reload))
         .route("/experts/{name}/warm", post(experts_warm))
@@ -113,6 +114,7 @@ async fn health(State(app): Shared) -> Json<Value> {
         "model": app.cfg.model,
         "nodes": app.router.view().await,
         "router": app.router.counts(),
+        "priority": app.router.priority_threads(),
         "queue": app.queue.stats(),
         "store": app.store.counts().unwrap_or(Value::Null),
         "tools": app.tools.current().await.defs.len(),
@@ -425,6 +427,18 @@ async fn experts_from_thread(State(app): Shared, headers: HeaderMap, Path(id): P
 async fn cancel_thread(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
     if let Err(r) = operator(&app, &headers) { return *r; }
     Json(json!({"thread": id, "cancelled": app.queue.cancel(&id)})).into_response()
+}
+
+/// Mark the thread's turns as going first (the router: while one waits for a slot no other turn takes one).
+/// In memory: a restart forgets it, and pod-ff marks its expedite cards' threads again every tick.
+async fn priority_on(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    Json(json!({"thread": id, "priority": app.router.set_priority(&id, true)})).into_response()
+}
+
+async fn priority_off(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    Json(json!({"thread": id, "priority": app.router.set_priority(&id, false)})).into_response()
 }
 
 #[derive(Deserialize)]

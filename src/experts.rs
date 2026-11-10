@@ -257,7 +257,7 @@ impl Experts {
         }
         let (read, export) = bodies(&e, system, defs, router.model(), max_tokens);
         let t = std::time::Instant::now();
-        let turn = router.chat(None, &read).await.map_err(|e| anyhow::anyhow!("reading the expert: {e:?}"))?;
+        let turn = router.chat(None, None, &read).await.map_err(|e| anyhow::anyhow!("reading the expert: {e:?}"))?;
         let read_s = t.elapsed().as_secs_f64();
         // the entry wanted ends where the read's last message (a few tokens) begins
         let want = turn.prompt_tokens.unwrap_or(0).saturating_sub(64);

@@ -80,7 +80,7 @@ requests, so a node shared with other work counts as busy; between polls the rou
 state is in the prompt cache. A new thread goes to the node with the most free slots, nodes with the cache transfer
 routes first. While a thread's node is full the turn waits in the router, and a slot that frees there goes to it
 before any newcomer, for at most `newcomer_wait_s` (30): past that a newcomer takes any free slot, or steady load
-would never place a new thread (a goldfish, an expert's freeze). A thread leaves its node only when the node is full and the thread is under `spill_tokens` (it
+would never place a new thread (a goldfish, an expert's freeze). A thread marked priority (`POST /threads/{id}/priority`, in memory until a restart) goes first: while one of its turns waits for a slot no other turn takes one, and it takes any free slot, one that home-waiters want included. A thread leaves its node only when the node is full and the thread is under `spill_tokens` (it
 reads its prompt again) or, with `move_threads`, by taking its state along: `POST /cache/export` on the old node
 streams into `POST /cache/import` on the new one (strixite with `cache-xfer = on`), then the turn runs there. A node
 that refuses a connection is down until its `/health` answers; a turn that never reached it goes to another. While
@@ -142,6 +142,7 @@ PUT  /threads/{id}/messages {messages}   a history for a thread that has none   
 POST /threads/{id}/compact {focus?}      DELETE /threads/{id} (409 while a slice runs)  operator token
 POST /threads/{id}/cancel                stop its running slice now; nothing committed  operator token
 DELETE /threads/{id}?cancel=true         cancel the running slice, then delete          operator token
+POST /threads/{id}/priority              its turns go first for slots; DELETE unmarks    operator token
 GET  /dlq                 POST /dlq/redrive, /dlq/drop with {thread?}                  operator token
 GET  /experts             POST /experts/reload, /experts/{name}/warm, /experts/from-thread/{id}
 POST /rap/callback        or /rap/callback/{token}: a tool's result                    callback token

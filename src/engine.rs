@@ -347,7 +347,7 @@ impl Engine {
         loop {
             rounds += 1;
             let r = restore.take();
-            let turn = match self.router.chat_restoring(meta.node.as_deref(), &body, r.as_deref()).await {
+            let turn = match self.router.chat_restoring(Some(thread), meta.node.as_deref(), &body, r.as_deref()).await {
                 Ok(t) => t,
                 // the node says the prompt does not fit. With the window on and the node's own count in the message,
                 // the estimate was wrong: learn the ratio, cut, and send once more; otherwise the thread is done
@@ -853,13 +853,13 @@ impl Engine {
         let mut truncated = false;
         let mut summary = String::new();
         for attempt in 0..2 {
-            let turn = match self.router.chat(meta.node.as_deref(), &body).await {
+            let turn = match self.router.chat(Some(thread), meta.node.as_deref(), &body).await {
                 Ok(t) => t,
                 Err(ChatError::Stopping) => return Ok(Refocused::Stopping),
                 Err(ChatError::Transient(e)) => return Ok(Refocused::Failed(format!("refocus: {e}"))),
                 Err(ChatError::Rejected(_)) if body.get("tool_choice").is_some() => {
                     body.as_object_mut().unwrap().remove("tool_choice");
-                    match self.router.chat(meta.node.as_deref(), &body).await {
+                    match self.router.chat(Some(thread), meta.node.as_deref(), &body).await {
                         Ok(t) => t,
                         Err(e) => return Ok(Refocused::Failed(format!("refocus: {e}"))),
                     }

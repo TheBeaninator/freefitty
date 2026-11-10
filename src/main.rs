@@ -62,6 +62,12 @@ enum Cmd {
         #[arg(short, long)]
         focus: Option<String>,
     },
+    /// Let a thread's turns go first for slots (--off: back to normal); in memory until the daemon restarts.
+    Priority {
+        thread: String,
+        #[arg(long)]
+        off: bool,
+    },
     /// Experts: list, reload, warm NAME, freeze THREAD NAME [DESCRIPTION].
     Experts {
         #[arg(default_value = "list")]
@@ -215,6 +221,12 @@ async fn main() -> Result<()> {
         Cmd::Compact { thread, focus } => {
             let body = focus.map(|f| json!({"focus": f})).unwrap_or(json!({}));
             println!("{}", Client::new(&cli.config)?.post(&format!("/threads/{thread}/compact"), &body).await?);
+            Ok(())
+        }
+        Cmd::Priority { thread, off } => {
+            let c = Client::new(&cli.config)?;
+            let path = format!("/threads/{thread}/priority");
+            println!("{}", if off { c.delete(&path).await? } else { c.post(&path, &json!({})).await? });
             Ok(())
         }
         Cmd::Experts { action, args } => {
