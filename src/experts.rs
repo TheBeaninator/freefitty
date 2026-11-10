@@ -84,6 +84,13 @@ pub fn steer_into(body: &mut Value, e: &Expert) {
     }
 }
 
+/// The request's `shared_messages` for a thread of this expert: the system prompt and the expert's messages, the prefix
+/// every thread born from it starts with. A node that takes it (StrixFold) keeps that prefix's state as a shared one,
+/// and on disk with --learn: the expert stays read across the node's restarts. Only for nodes that take the field.
+pub fn shared_into(body: &mut Value, e: &Expert, on: bool) {
+    if on { body["shared_messages"] = json!(1 + e.messages.len()); }
+}
+
 /// One steering vector of an expert, by its name in the nodes' steer-dir.
 #[derive(Deserialize, serde::Serialize, Clone, Debug)]
 pub struct Steer {
@@ -197,13 +204,14 @@ pub fn context(system: &str, defs: &[Value]) -> String {
 /// The request an expert is read with, and the one its state is exported with. Strixite saves a checkpoint at
 /// the start of the last user message, which here is the end of the expert's acknowledgement; exporting with a
 /// different last message picks that checkpoint, the prefix every thread born from the expert shares.
-fn bodies(e: &Expert, system: &str, defs: &[Value], model: &str, max_tokens: u64) -> (Value, Value) {
+fn bodies(e: &Expert, system: &str, defs: &[Value], model: &str, max_tokens: u64, shared: bool) -> (Value, Value) {
     let with = |last: &str| {
         let mut messages = vec![json!({"role": "system", "content": system})];
         messages.extend(e.messages.iter().cloned());
         messages.push(json!({"role": "user", "content": last}));
         let mut b = json!({"model": model, "messages": messages, "tools": defs, "max_tokens": max_tokens, "stream": false});
         steer_into(&mut b, e);
+        shared_into(&mut b, e, shared);
         b
     };
     (with("Say ready."), with("."))
@@ -264,7 +272,8 @@ impl Experts {
                 Err(why) => bail!("steer_scope could not be checked: {why}"),
             }
         }
-        let (read, export) = bodies(&e, system, defs, e.model.as_deref().unwrap_or(router.model()), max_tokens);
+        let model = e.model.as_deref().unwrap_or(router.model());
+        let (read, export) = bodies(&e, system, defs, model, max_tokens, router.takes_shared_messages(model));
         let t = std::time::Instant::now();
         let turn = router.chat(None, None, &read).await.map_err(|e| anyhow::anyhow!("reading the expert: {e:?}"))?;
         let read_s = t.elapsed().as_secs_f64();
@@ -368,7 +377,7 @@ impl Experts {
             return Ok(out);
         }
         let model = e.model.clone().unwrap_or_else(|| router.model().to_owned());
-        let (body, _) = bodies(&e, system, defs, &model, max_tokens);
+        let (body, _) = bodies(&e, system, defs, &model, max_tokens, router.takes_shared_messages(&model));
         let mut out = Vec::new();
         for url in router.up_nodes_for(&model).await {
             let t = std::time::Instant::now();

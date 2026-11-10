@@ -600,7 +600,10 @@ impl Engine {
     /// The steering every request of this thread carries: its expert's (a thread born from a steered expert is
     /// that persona on every turn, and the nodes cache its state under the steering's own key).
     fn steer_into(&self, body: &mut Value, meta: &ThreadMeta) {
-        if let Some(e) = meta.expert.as_ref().and_then(|k| self.store.expert(k).ok().flatten()) { crate::experts::steer_into(body, &e); }
+        if let Some(e) = meta.expert.as_ref().and_then(|k| self.store.expert(k).ok().flatten()) {
+            crate::experts::steer_into(body, &e);
+            crate::experts::shared_into(body, &e, self.cfg.takes_shared_messages(&self.model_of(meta)));
+        }
     }
 
     /// A goldfish for a `goldfish` call: its thread's meta and first event. Born from the expert, with the

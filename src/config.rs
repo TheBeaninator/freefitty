@@ -27,7 +27,9 @@ pub struct Config {
     /// (the model it serves; a turn runs only on nodes serving its request's model), `context_length`, `slots`,
     /// `grant = false` (not under `grant_cmd`: a node that is not a strixite worker lease, the StrixFold pair), and
     /// `down_wait_s` (how long a turn of its model waits while every node serving that model is down; default
-    /// `node_down_wait_s`: the StrixFold pair goes down on purpose for card windows and takes minutes to load).
+    /// `node_down_wait_s`: the StrixFold pair goes down on purpose for card windows and takes minutes to load), and
+    /// `shared_messages = true` (the node takes a request's `shared_messages`: a thread born from an expert names its
+    /// shared prefix, which StrixFold keeps as a shared state and, with --learn, on disk across restarts).
     #[serde(default)]
     pub node_meta: std::collections::HashMap<String, NodeMeta>,
     /// Slots a node is assumed to have while its /health does not say.
@@ -233,6 +235,8 @@ pub struct NodeMeta {
     pub grant: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub down_wait_s: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_messages: Option<bool>,
 }
 
 impl Config {
@@ -240,6 +244,13 @@ impl Config {
     /// else `node_down_wait_s`.
     pub fn down_wait_s(&self, model: &str) -> u64 {
         self.nodes.iter().filter(|u| self.node_model(u) == model).filter_map(|u| self.node_meta.get(u).and_then(|m| m.down_wait_s)).max().unwrap_or(self.node_down_wait_s)
+    }
+
+    /// Whether requests of `model` carry `shared_messages`: every node serving it takes the field (one that does not
+    /// might refuse it).
+    pub fn takes_shared_messages(&self, model: &str) -> bool {
+        let mut serving = self.nodes.iter().filter(|u| self.node_model(u) == model).peekable();
+        serving.peek().is_some() && serving.all(|u| self.node_meta.get(u.as_str()).and_then(|m| m.shared_messages) == Some(true))
     }
 
     /// The model a node serves: its `node_meta` model, else `model`.

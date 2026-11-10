@@ -627,6 +627,11 @@ impl Router {
     pub fn model(&self) -> &str {
         &self.cfg.model
     }
+
+    /// Whether requests of `model` carry `shared_messages` (config `node_meta` shared_messages).
+    pub fn takes_shared_messages(&self, model: &str) -> bool {
+        self.cfg.takes_shared_messages(model)
+    }
 }
 
 /// Apply one /health answer (`up`: it answered) to a node: strixite's `slots`/`busy_slots`/`queued`, or

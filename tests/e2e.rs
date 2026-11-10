@@ -1007,7 +1007,7 @@ async fn a_goldfish_of_a_model_expert_runs_only_on_nodes_serving_that_model() {
     let sf = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(0), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false), probe_tokens: std::sync::atomic::AtomicU64::new(u64::MAX), steer_list: std::sync::Mutex::new(None), refuse_steer: AtomicBool::new(false), steer_fail: AtomicBool::new(false) });
     let sf_url = serve(Router::new().route("/health", get(strixfold_health)).route("/v1/chat/completions", post(completions)).with_state(sf.clone())).await;
     h.cfg.nodes.push(sf_url.clone());
-    h.cfg.node_meta.insert(sf_url.clone(), freefitty::config::NodeMeta { model: Some("dsv41".into()), context_length: Some(131072), grant: Some(false), ..Default::default() });
+    h.cfg.node_meta.insert(sf_url.clone(), freefitty::config::NodeMeta { model: Some("dsv41".into()), context_length: Some(131072), grant: Some(false), shared_messages: Some(true), ..Default::default() });
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("railhand.toml"), "description = \"knows the rail\"\nack = \"Read.\"\nmodel = \"dsv41\"\n[[reads]]\ntext = \"B is .51\"\n").unwrap();
     h.cfg.experts_dir = Some(dir.path().to_path_buf());
@@ -1027,6 +1027,10 @@ async fn a_goldfish_of_a_model_expert_runs_only_on_nodes_serving_that_model() {
     assert!(sf_bodies.iter().any(|b| b["messages"][1]["content"].as_str().is_some_and(|c| c.contains("B is .51"))), "born from the expert there");
     let main_bodies = h.model.bodies.lock().unwrap().clone();
     assert!(main_bodies.iter().all(|b| b["model"] != "dsv41"), "no dsv41 request reached the default node");
+    // the goldfish names its shared prefix (system prompt + the expert's two messages) to the node that takes it; the
+    // default node, whose node_meta does not say it takes the field, never sees it
+    assert!(sf_bodies.iter().filter(|b| b["messages"][1]["content"].as_str().is_some_and(|c| c.contains("B is .51"))).all(|b| b["shared_messages"] == 3), "{:?}", sf_bodies.iter().map(|b| b["shared_messages"].clone()).collect::<Vec<_>>());
+    assert!(main_bodies.iter().all(|b| b.get("shared_messages").is_none()), "no shared_messages on the default node");
     assert!(main_bodies.iter().any(|b| b["messages"].as_array().unwrap().last().unwrap()["content"].as_str().is_some_and(|c| c.starts_with("ask what is B"))), "the elephant ran on the default node");
     // the health view names what each node serves, and the StrixFold node's slots come from max_batch_size
     let health = api.get("/health").await;
