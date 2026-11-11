@@ -95,7 +95,10 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
     let shown: Vec<String> = last["content"].as_array().into_iter().flatten()
         .filter_map(|p| p.pointer("/image_url/url").and_then(|u| u.as_str()).map(str::to_owned)).collect();
     let gf_call = |expert: &str, q: &str| json!({"role": "assistant", "content": null, "tool_calls": [{"id": format!("call_g{}", msgs.len()), "type": "function", "function": {"name": "goldfish", "arguments": json!({"expert": expert, "question": q}).to_string()}}]});
-    let message = if goldfish && last["role"] == "user" {
+    let message = if goldfish && msgs.iter().any(|m| m["content"].as_str().is_some_and(|c| c.ends_with("loop forever"))) {
+        // a model stuck on one call, whatever comes back
+        json!({"role": "assistant", "content": null, "tool_calls": [{"id": format!("call_loop{}", msgs.len()), "type": "function", "function": {"name": "echo", "arguments": "{\"text\": \"again\"}"}}]})
+    } else if goldfish && last["role"] == "user" {
         // the goldfish: tries to ask a goldfish when told to, else answers with the tools it was offered
         if content.ends_with("try goldfish") {
             json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_gg", "type": "function", "function": {"name": "goldfish", "arguments": "{\"expert\": \"railhand\", \"question\": \"x\"}"}}]})
@@ -112,6 +115,11 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
         gf_call("rail2", q)
     } else if let Some(q) = content.strip_prefix("lookup ").filter(|_| last["role"] == "user") {
         json!({"role": "assistant", "content": null, "tool_calls": [{"id": format!("call_l{}", msgs.len()), "type": "function", "function": {"name": "rail_lookup", "arguments": json!({"topic": q}).to_string()}}]})
+    } else if content == "two calls" && last["role"] == "user" {
+        // one turn, two calls: one answered at once, one after 6 s
+        json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_fast", "type": "function", "function": {"name": "echo", "arguments": "{\"text\": \"fast\"}"}},
+            {"id": "call_slow", "type": "function", "function": {"name": "echo", "arguments": "{\"text\": \"slow\"}"}}]})
     } else if content == "askbad" {
         gf_call("nobody", "x")
     } else if let Some(n) = content.strip_prefix("flaky ").filter(|_| last["role"] == "user") {
@@ -1523,5 +1531,46 @@ async fn an_expert_tool_falls_back_while_its_model_has_no_free_node() {
     let threads = api.get("/threads").await;
     let names: Vec<&str> = threads.as_array().unwrap().iter().map(|t| t["thread"].as_str().unwrap()).collect();
     assert!(names.iter().any(|n| n.starts_with("el.gf-railhand-c-")) && !names.iter().any(|n| n.starts_with("el.gf-railhand-") && !n.starts_with("el.gf-railhand-c-")), "{names:?}");
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turns_calls_are_answered_together() {
+    // pod 2026-11-11: a turn of two calls ran its next turn on the first result alone, and the model then saw every
+    // result one turn late and asked again
+    let h = harness().await;
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.say("two calls", Some("two")).await;
+    assert!(api.output("two", 10).await.unwrap()["text"].as_str().unwrap().contains("[Tool Call: echo"));
+    let out = api.output("two", 20).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.starts_with("done: echo: slow"), "{out}");
+    // the model was asked once with the two calls, and once more when both had answered, never in between
+    let bodies = h.model.bodies.lock().unwrap().clone();
+    let mine: Vec<&Value> = bodies.iter().filter(|b| b["messages"].as_array().unwrap().iter().any(|m| m["content"] == "two calls")).collect();
+    assert_eq!(mine.len(), 2, "{} requests", mine.len());
+    let last: Vec<&Value> = mine[1]["messages"].as_array().unwrap().iter().rev().take(2).collect();
+    assert!(last.iter().all(|m| m["role"] == "tool"), "both results before the next turn: {last:?}");
+    let t = api.get("/threads/two").await;
+    assert_eq!(t["pending"].as_array().unwrap().len(), 0, "{t}");
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_goldfish_stuck_on_one_call_is_ended_and_its_elephant_told() {
+    let mut h = harness().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("railhand.toml"), "description = \"knows the rail\"\ntools = [\"echo\"]\n[[reads]]\ntext = \"B is .51\"\n").unwrap();
+    h.cfg.experts_dir = Some(dir.path().to_path_buf());
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.say("ask loop forever", Some("el")).await;
+    api.output("el", 10).await.unwrap();
+    let out = api.output("el", 60).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.contains("the goldfish failed: it made the same call 21 times in a row"), "{out}");
+    assert_eq!(h.tools.invocations.load(Ordering::Relaxed), 20, "the 21st identical call was not run");
+    let threads = api.get("/threads").await;
+    let fish = threads.as_array().unwrap().iter().find(|t| t["thread"].as_str().unwrap().starts_with("el.gf-railhand-")).unwrap();
+    assert_eq!(fish["closed"], "repeated itself");
     r.shutdown().await;
 }

@@ -64,6 +64,13 @@ pub enum Outcome {
 }
 
 const UNKNOWN_TOOL_ROUNDS: usize = 3;
+/// A model making the same calls (names and arguments) again and again is a harness bug until shown otherwise
+/// (dad 2026-11-11; that day a goldfish ran one `ls | grep` 335 times because it saw every result one turn late).
+/// At REPEAT_WARN in a row the journal says so, loudly, and nothing else changes: the model is not steered away,
+/// which would hide the bug. A goldfish at REPEAT_GOLDFISH is ended with an error for its elephant, so a bug not
+/// found yet cannot hold a node for hours.
+const REPEAT_WARN: usize = 3;
+const REPEAT_GOLDFISH: usize = 20;
 /// Turns cut off at the output limit with no whole tool call that a slice answers with a note and goes on.
 const CUT_OFF_ROUNDS: usize = 2;
 
@@ -297,6 +304,22 @@ impl Engine {
         }
         new_messages.extend(image_messages);
         if reply_to.is_none() { reply_to = live.last().map(|(_, e)| e.id.clone()); }
+        // the calls of one turn are answered together. While another call of the same turn as a result that just
+        // came is still out, the results are stored and the model waits for the rest: on the first one alone it saw
+        // half its answers, and from then on every turn ran on an older result while the newest call was out (pod
+        // 2026-11-11: a librarian goldfish saw each result one turn late and asked again, 335 times). A person's
+        // message, an event or a refocus wakes the thread as before; a sleep of the same turn is not waited for.
+        let answered: Vec<String> = live.iter().filter_map(|(_, e)| match &e.kind { EventKind::ToolResult { call, .. } => Some(call.clone()), _ => None }).collect();
+        let turn_of = |id: &str| id.rsplit_once('-').map(|(t, _)| t.to_owned());
+        let siblings_out = meta.pending.iter()
+            .filter(|p| p.name != rap::SLEEP && p.name != rap::SLEEP_UNTIL)
+            .filter(|p| answered.iter().any(|a| turn_of(a).is_some() && turn_of(a) == turn_of(&p.id)))
+            .count();
+        if siblings_out > 0 && live.iter().all(|(_, e)| matches!(e.kind, EventKind::ToolResult { .. })) {
+            tracing::info!("{thread}: {} result(s) in; waiting for {siblings_out} more call(s) of the same turn", answered.len());
+            self.store.commit(Commit { thread, meta, messages: new_messages, done, done_ids, replies: vec![], events: vec![], invocations: vec![], new_threads: vec![] })?;
+            return Ok(Outcome::Done);
+        }
 
         let prefix = prefix(&self.system, &self.store, &meta)?;
         let history = self.store.messages(thread)?;
@@ -481,6 +504,17 @@ impl Engine {
             }
             let mut unknown = Vec::new();
             let mut recalled: Vec<(Call, String)> = Vec::new();
+            let repeated = repeats(history.iter().chain(&new_messages[..new_messages.len() - 1]), &assistant);
+            if repeated >= REPEAT_WARN {
+                tracing::warn!("{thread}: the same call {} times in a row; look for a harness bug (what the model is shown, when its turns run)", repeated + 1);
+            }
+            if repeated >= REPEAT_GOLDFISH && meta.goldfish_of.is_some() {
+                tracing::error!("{thread}: the same call {} times in a row; the goldfish is ended", repeated + 1);
+                for c in &calls { new_messages.push(json!({"role": "tool", "tool_call_id": c.shown_id(), "content": "Not run: the goldfish was ended for repeating this call."})); }
+                if let Some(e) = self.goldfish_failed(thread, &format!("it made the same call {} times in a row without an answer", repeated + 1)) { events.push(e); }
+                meta.closed = Some("repeated itself".into());
+                break;
+            }
             for call in &calls {
                 match call.name.as_str() {
                     rap::EXPERTS => recalled.push((call.clone(), self.experts.catalog(&self.store).await)),
@@ -627,7 +661,7 @@ impl Engine {
         // a goldfish that ended a turn with nothing out has answered: its text returns to the elephant as the
         // call's result, and the goldfish is done
         if let Some(g) = meta.goldfish_of.clone() {
-            if !out && meta.pending.is_empty() && !events.iter().any(|e| e.thread == thread) {
+            if !out && meta.pending.is_empty() && meta.closed.is_none() && !events.iter().any(|e| e.thread == thread) {
                 let answer = if text_for_elephant(&new_messages).is_empty() { "(the goldfish ended without an answer)".to_owned() } else { text_for_elephant(&new_messages) };
                 events.push(Event { id: format!("goldfish-{}", g.call), thread: g.thread.clone(), due_ms: 0, created_ms: 0, attempts: 0,
                                     kind: EventKind::ToolResult { call: g.call.clone(), provider_call_id: g.provider_call_id.clone(), text: answer, images: vec![] } });
@@ -1028,17 +1062,42 @@ fn wake(thread: &str, call: &Call, due_ms: u64, text: String) -> Event {
 /// The assistant message as stored and resent: role, content, tool_calls with arguments that always render
 /// (a model sometimes JSON-encodes them twice, or writes a bare value; a node refuses the whole thread then).
 /// Reasoning is dropped: it is not resent.
+/// How many assistant turns in a row, newest first, made exactly the calls `this` makes (names and arguments,
+/// in any order). Tool results and other messages between them do not break the run; a turn with other calls,
+/// or with none, does.
+fn repeats<'a>(earlier: impl DoubleEndedIterator<Item = &'a Value>, this: &Value) -> usize {
+    fn sig(m: &Value) -> Option<Vec<(String, String)>> {
+        let mut s: Vec<(String, String)> = m.get("tool_calls")?.as_array()?.iter().map(|c| {
+            let f = &c["function"];
+            let args = f["arguments"].as_str().map(|a| serde_json::from_str::<Value>(a).map(|v| v.to_string()).unwrap_or_else(|_| a.to_owned())).unwrap_or_else(|| f["arguments"].to_string());
+            (f["name"].as_str().unwrap_or("").to_owned(), args)
+        }).collect();
+        if s.is_empty() { return None; }
+        s.sort();
+        Some(s)
+    }
+    let Some(mine) = sig(this) else { return 0 };
+    let mut n = 0;
+    for m in earlier.rev().filter(|m| m["role"] == "assistant") {
+        if sig(m).as_ref() != Some(&mine) { break; }
+        n += 1;
+    }
+    n
+}
+
 fn normalize(m: &Value) -> (Value, Vec<Call>) {
     let content = m.get("content").and_then(|c| c.as_str()).map(|s| s.to_owned());
     let mut calls = Vec::new();
     let mut tool_calls = Vec::new();
+    // one id per turn, the call's index after it: the calls of one turn are known as siblings by it
+    let turn = crate::config::id();
     for (i, tc) in m.get("tool_calls").and_then(|t| t.as_array()).into_iter().flatten().enumerate() {
         let f = tc.get("function").cloned().unwrap_or(Value::Null);
         let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("").to_owned();
         let args = repair_args(f.get("arguments").unwrap_or(&Value::Null));
         let provider_call_id = tc.get("id").and_then(|i| i.as_str()).map(str::to_owned);
         // the id the thread knows the call by: ours, unique across the store; the model's id rides along
-        let id = format!("{}-{}", crate::config::id(), i);
+        let id = format!("{turn}-{i}");
         tool_calls.push(json!({"id": provider_call_id.clone().unwrap_or_else(|| id.clone()), "type": "function",
             "function": {"name": name, "arguments": args.to_string()}}));
         calls.push(Call { id, provider_call_id, name, args });
