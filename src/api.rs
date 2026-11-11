@@ -63,6 +63,7 @@ pub fn routes(app: Arc<App>) -> AxumRouter {
         .route("/admin/backup", post(admin_backup))
         .route("/say", post(say))
         .route("/output", get(output))
+        .route("/prompt", get(prompt))
         .route("/threads", get(threads))
         .route("/threads/{id}", get(thread).delete(delete_thread))
         .route("/threads/{id}/messages", get(messages).put(import_messages))
@@ -118,7 +119,24 @@ async fn health(State(app): Shared) -> Json<Value> {
         "queue": app.queue.stats(),
         "store": app.store.counts().unwrap_or(Value::Null),
         "tools": app.tools.current().await.defs.len(),
+        "prompt": {"hoisted": app.engine.hoisted.iter().map(|h| json!({"command": h.command, "version": h.version})).collect::<Vec<_>>()},
     }))
+}
+
+/// What was hoisted into the system prompt at start, each command run again now: `stale` where its output has
+/// changed since (a tool upgraded); a restart hoists the new text.
+async fn prompt(State(app): Shared, headers: HeaderMap) -> Response {
+    if let Err(r) = operator(&app, &headers) { return *r; }
+    let hoisted = app.engine.hoisted.clone();
+    let now = tokio::task::spawn_blocking(move || hoisted.iter().map(|h| {
+        let mut v = json!({"command": h.command, "version": h.version, "sha": h.sha, "bytes": h.bytes});
+        match crate::config::hoist(&h.command) {
+            Ok(t) => { let n = crate::config::Hoisted::of(&h.command, &t); v["stale"] = json!(n.sha != h.sha); v["now_version"] = json!(n.version); }
+            Err(e) => { v["stale"] = Value::Null; v["now_error"] = json!(format!("{e:#}")); }
+        }
+        v
+    }).collect::<Vec<_>>()).await.unwrap_or_default();
+    Json(json!({"build": crate::BUILD, "hoisted": now})).into_response()
 }
 
 /// A store snapshot now, into <data_dir>/backups (newest backup_keep kept).
@@ -268,7 +286,7 @@ async fn thread(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) 
         Ok(Some(m)) => {
             let live_tokens = app.engine.view(&id).map(|v| engine::tokens(&v)).unwrap_or(0);
             let compaction = m.compactions.last().map(|c| json!({"from": c.from, "at_ms": c.at_ms, "summarized": c.summarized, "focus": c.focus, "truncated": c.truncated, "tokens_before": c.tokens_before, "count": m.compactions.len()}));
-            Json(json!({"thread": id, "created_ms": m.created_ms, "updated_ms": m.updated_ms, "node": m.node, "messages": m.messages, "bytes": m.bytes, "live_tokens": live_tokens, "prompt_tokens": m.prompt_tokens, "prompt_est": m.prompt_est, "window": json!({"from": m.window_from, "cuts": m.window_cuts}), "paging": json!({"before": m.paged_before, "pinned": m.pinned.len()}), "pending": m.pending, "last": m.last, "closed": m.closed, "expert": m.expert, "compaction": compaction, "metadata": m.metadata})).into_response()
+            Json(json!({"thread": id, "created_ms": m.created_ms, "updated_ms": m.updated_ms, "node": m.node, "messages": m.messages, "bytes": m.bytes, "live_tokens": live_tokens, "prompt_tokens": m.prompt_tokens, "prompt_est": m.prompt_est, "window": json!({"from": m.window_from, "cuts": m.window_cuts}), "instructions": m.instructions, "paging": json!({"before": m.paged_before, "pinned": m.pinned.len()}), "pending": m.pending, "last": m.last, "closed": m.closed, "expert": m.expert, "compaction": compaction, "metadata": m.metadata})).into_response()
         }
         Ok(None) => err(StatusCode::NOT_FOUND, "no such thread"),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),

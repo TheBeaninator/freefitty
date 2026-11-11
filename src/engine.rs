@@ -25,6 +25,10 @@ pub struct Engine {
     pub router: Arc<Router>,
     pub tools: Arc<ToolBox>,
     pub system: String,
+    /// What `system_prompt_commands` put into `system`, as it was at start.
+    pub hoisted: Vec<crate::config::Hoisted>,
+    /// Instruction ids whose text is on disk already.
+    pub instructions_seen: std::sync::Mutex<std::collections::HashSet<String>>,
     pub compact_prompt: String,
     pub callback_url: String,
     /// The latest node-count-over-estimate ratio any thread saw, times 1000; 0 until a turn has run.
@@ -174,6 +178,29 @@ struct Commissioned {
 }
 
 impl Engine {
+    /// The instructions this turn runs under (the system prompt and the thread's tool definitions, by the hash an
+    /// expert's frozen context carries too): recorded on the thread where they change, their text kept once under
+    /// `<data_dir>/instructions/<id>.json`, so every turn in every log traces to exactly what the model was told
+    /// (dad 2026-11-11: an instruction change invalidates what earlier logs say about a tool's use).
+    fn note_instructions(&self, meta: &mut ThreadMeta, from: u64, defs: &[Value]) {
+        let id = crate::experts::context(&self.system, defs);
+        if meta.instructions.last().map(|(_, i)| i) != Some(&id) { meta.instructions.push((from, id.clone())); }
+        if !self.instructions_seen.lock().unwrap().insert(id.clone()) { return; }
+        let dir = self.cfg.data_dir.join("instructions");
+        let body = json!({"id": id, "system": self.system, "tools": defs, "hoisted": self.hoisted, "build": crate::BUILD, "first_used_ms": now_ms()});
+        let wrote = std::fs::create_dir_all(&dir)
+            .and_then(|_| std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join(format!("{id}.json"))))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, &serde_json::to_vec_pretty(&body).unwrap_or_default()));
+        match wrote {
+            Ok(()) => tracing::info!("instructions {id}: first used; kept in {}", dir.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                tracing::warn!("instructions {id}: not kept ({e}); tried again on the next turn");
+                self.instructions_seen.lock().unwrap().remove(&id);
+            }
+        }
+    }
+
     pub async fn slice(&self, thread: &str, batch: &[(u64, Event)]) -> Outcome {
         match self.run(thread, batch).await {
             Ok(o) => o,
@@ -267,6 +294,7 @@ impl Engine {
         // a thread born with a tool list (a goldfish, an expert that declares one) sees and may call only those
         let defs = rap::scope_defs(defs, meta.tools.as_deref());
         let allowed: std::collections::HashSet<String> = defs.iter().filter_map(|d| d.pointer("/function/name").and_then(|n| n.as_str()).map(str::to_owned)).collect();
+        self.note_instructions(&mut meta, history.len() as u64, &defs);
         let mut asked = 0usize;
 
         // ---- refocus -----------------------------------------------------------------------------

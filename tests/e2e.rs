@@ -1467,3 +1467,36 @@ async fn the_operator_marks_and_unmarks_a_priority_thread() {
     assert!(api.output("thread-p", 10).await.is_some(), "a reply");
     r.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_turn_traces_to_the_instructions_it_ran_under() {
+    let mut h = harness().await;
+    let dir = tempfile::tempdir().unwrap();
+    let usage = dir.path().join("usage.md");
+    std::fs::write(&usage, "# board 0.1.3 (contract 1.1)\nread, comment, move\n").unwrap();
+    h.cfg.system_prompt_commands = vec![vec!["cat".into(), usage.to_str().unwrap().into()]];
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.say("hello", Some("t")).await;
+    api.output("t", 10).await.unwrap();
+    api.say("again", Some("t")).await;
+    api.output("t", 10).await.unwrap();
+    // one set of instructions, from the first message on: a second turn under the same ones adds nothing
+    let t = api.get("/threads/t").await;
+    let ins = t["instructions"].as_array().unwrap().clone();
+    assert_eq!(ins.len(), 1, "{t}");
+    assert_eq!(ins[0][0], 0);
+    let id = ins[0][1].as_str().unwrap().to_owned();
+    // their text is kept once: the system prompt with what was hoisted, and the thread's tools
+    let kept: Value = serde_json::from_str(&std::fs::read_to_string(h.cfg.data_dir.join("instructions").join(format!("{id}.json"))).unwrap()).unwrap();
+    assert!(kept["system"].as_str().unwrap().ends_with("# board 0.1.3 (contract 1.1)\nread, comment, move"), "{kept}");
+    assert!(kept["tools"].as_array().unwrap().iter().any(|d| d["function"]["name"] == "echo"), "{kept}");
+    assert_eq!(kept["hoisted"][0]["version"], "board 0.1.3 (contract 1.1)");
+    // /health names what was hoisted; /prompt says whether the tool has changed since
+    assert_eq!(api.get("/health").await["prompt"]["hoisted"][0]["version"], "board 0.1.3 (contract 1.1)");
+    assert_eq!(api.get("/prompt").await["hoisted"][0]["stale"], false);
+    std::fs::write(&usage, "# board 0.1.4 (contract 1.2)\nread, comment, move, archive\n").unwrap();
+    let p = api.get("/prompt").await;
+    assert_eq!((p["hoisted"][0]["stale"].clone(), p["hoisted"][0]["now_version"].clone()), (json!(true), json!("board 0.1.4 (contract 1.2)")), "{p}");
+    r.shutdown().await;
+}

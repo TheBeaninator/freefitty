@@ -65,7 +65,8 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
     if cfg.listen.ends_with(":0") { cfg.listen = addr.to_string(); }
     let router = router::Router::new(&cfg, &mut tasks);
     let tools = rap::ToolBox::start(cfg.clone(), store.clone(), &mut tasks).await?;
-    let system = cfg.system_prompt()?;
+    let (system, hoisted) = cfg.system_prompt()?;
+    for h in &hoisted { tracing::info!("system prompt: hoisted {} ({} bytes) from {:?}", h.version, h.bytes, h.command); }
     let compact_prompt = cfg.compact_prompt()?;
     let experts = experts::Experts::new(Some(cfg.data_dir.join("experts")));
     let loaded = experts.load(&cfg, &store).await?;
@@ -76,7 +77,7 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
         tracing::info!("parking sleepers' cached state in {} ({} GiB parked now, cap {} GiB)", dir.display(), p.bytes() >> 30, cfg.park_max_gib);
         Some(Arc::new(p))
     } else { None };
-    let engine = Arc::new(engine::Engine { cfg: cfg.clone(), store: store.clone(), router: router.clone(), tools: tools.clone(), system, compact_prompt, callback_url: cfg.callback_url(), scale_hint: std::sync::atomic::AtomicU64::new(0), parking, inflight: Default::default(), me: Default::default(), experts: experts.clone(), deliver: Default::default(), metrics: Default::default() });
+    let engine = Arc::new(engine::Engine { cfg: cfg.clone(), store: store.clone(), router: router.clone(), tools: tools.clone(), system, hoisted, instructions_seen: Default::default(), compact_prompt, callback_url: cfg.callback_url(), scale_hint: std::sync::atomic::AtomicU64::new(0), parking, inflight: Default::default(), me: Default::default(), experts: experts.clone(), deliver: Default::default(), metrics: Default::default() });
     let _ = engine.me.set(Arc::downgrade(&engine));
     let replies = Arc::new(Notify::new());
 

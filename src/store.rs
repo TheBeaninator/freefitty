@@ -133,6 +133,11 @@ pub struct Expert {
 pub struct ThreadMeta {
     pub created_ms: u64,
     pub updated_ms: u64,
+    /// The instructions the thread ran under, where they changed: (index of the first message under them, id).
+    /// The id is the hash of the system prompt and the thread's tool definitions; their text is in
+    /// `<data_dir>/instructions/<id>.json`. Empty for turns before 2026-11-11, which were not recorded.
+    #[serde(default)]
+    pub instructions: Vec<(u64, String)>,
     /// The node whose prompt cache holds this thread, as given in the config.
     #[serde(default)]
     pub node: Option<String>,

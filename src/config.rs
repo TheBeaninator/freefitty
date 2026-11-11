@@ -134,11 +134,13 @@ pub struct Config {
     /// Extra text appended to the system prompt (every thread shares it, so the prompt cache does too).
     #[serde(default)]
     pub system_prompt_extra: String,
-    /// Files appended to the system prompt after `system_prompt_extra`, in order, read at start: a tool's own
-    /// agent-facing text (`akb describe` > a file) that is regenerated when the tool changes, instead of a copy
-    /// pasted into the config that goes stale. Every thread asked akb for its usage (622 lookups in 257 threads).
+    /// Commands run at start whose output is appended to the system prompt, in order, after
+    /// `system_prompt_extra`: a tool describes itself once and FreeFitty hoists that (`["akb", "describe",
+    /// "--brief", "--verbs", "read,comment"]`; a plain file is `["cat", path]`). The output's first line should
+    /// name the tool's version: /health shows it, and `freefitty prompt` re-runs the commands and says which
+    /// changed since the start. A command that fails, hangs 30 s or prints nothing stops the start.
     #[serde(default)]
-    pub system_prompt_files: Vec<PathBuf>,
+    pub system_prompt_commands: Vec<Vec<String>>,
     /// Replies nobody collected are kept this many days.
     #[serde(default = "d_reply_days")]
     pub reply_retention_days: u64,
@@ -377,7 +379,8 @@ impl Config {
         .to_owned())
     }
 
-    pub fn system_prompt(&self) -> Result<String> {
+    /// The system prompt, and what was hoisted into it.
+    pub fn system_prompt(&self) -> Result<(String, Vec<Hoisted>)> {
         let mut p = match &self.system_prompt_file {
             Some(f) => std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?,
             None => include_str!("prompt.md").to_owned(),
@@ -386,12 +389,14 @@ impl Config {
             p.push_str("\n\n");
             p.push_str(self.system_prompt_extra.trim());
         }
-        for f in &self.system_prompt_files {
-            let text = std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
+        let mut hoisted = Vec::new();
+        for cmd in &self.system_prompt_commands {
+            let text = hoist(cmd)?;
             p.push_str("\n\n");
             p.push_str(text.trim());
+            hoisted.push(Hoisted::of(cmd, &text));
         }
-        Ok(p.trim().to_owned())
+        Ok((p.trim().to_owned(), hoisted))
     }
 }
 
@@ -410,6 +415,40 @@ pub fn id() -> String {
     let mut b = [0u8; 8];
     rand::rng().fill_bytes(&mut b);
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// One `system_prompt_commands` entry as it was run: the command, its output's first line (the tool's version,
+/// when the tool says it first), and a hash of the output.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Hoisted {
+    pub command: Vec<String>,
+    pub version: String,
+    pub sha: String,
+    pub bytes: usize,
+}
+
+impl Hoisted {
+    pub fn of(command: &[String], text: &str) -> Hoisted {
+        Hoisted { command: command.to_vec(), version: text.trim().lines().next().unwrap_or("").trim_start_matches('#').trim().to_owned(), sha: crate::rap::short_hash(text.trim()), bytes: text.trim().len() }
+    }
+}
+
+/// Run one hoist command: its standard output, or why not (exit status, nothing printed, 30 s without finishing).
+pub fn hoist(cmd: &[String]) -> Result<String> {
+    let (prog, args) = cmd.split_first().context("an empty system_prompt_commands entry")?;
+    let child = std::process::Command::new(prog).args(args).stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+        .spawn().with_context(|| format!("running {cmd:?}"))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
+    let out = rx.recv_timeout(std::time::Duration::from_secs(30)).map_err(|_| anyhow::anyhow!("{cmd:?} did not finish in 30 s"))?
+        .with_context(|| format!("running {cmd:?}"))?;
+    if !out.status.success() {
+        anyhow::bail!("{cmd:?} exited {}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim().chars().take(300).collect::<String>());
+    }
+    let text = String::from_utf8(out.stdout).with_context(|| format!("{cmd:?} printed non-UTF-8"))?;
+    if text.trim().is_empty() { anyhow::bail!("{cmd:?} printed nothing"); }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -457,16 +496,20 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_files_follow_the_extra_text_in_order() {
+    fn hoisted_commands_follow_the_extra_text_in_order() {
         let dir = tempfile::tempdir().unwrap();
-        let (a, b) = (dir.path().join("a.md"), dir.path().join("b.md"));
-        std::fs::write(&a, "\nAKB USAGE\n").unwrap();
-        std::fs::write(&b, "SECOND").unwrap();
-        let c = Config { system_prompt_extra: "EXTRA".into(), system_prompt_files: vec![a, b], ..Config::default() };
-        let p = c.system_prompt().unwrap();
-        assert!(p.ends_with("EXTRA\n\nAKB USAGE\n\nSECOND"), "{p}");
-        let missing = Config { system_prompt_files: vec![dir.path().join("gone.md")], ..Config::default() };
-        assert!(missing.system_prompt().is_err(), "a missing file stops the start, not a silent prompt without it");
+        let a = dir.path().join("a.md");
+        std::fs::write(&a, "\n# tool 1.2 (contract 3)\nUSAGE\n").unwrap();
+        let cmd = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let c = Config { system_prompt_extra: "EXTRA".into(), system_prompt_commands: vec![cmd(&["cat", a.to_str().unwrap()]), cmd(&["printf", "SECOND"])], ..Config::default() };
+        let (p, h) = c.system_prompt().unwrap();
+        assert!(p.ends_with("EXTRA\n\n# tool 1.2 (contract 3)\nUSAGE\n\nSECOND"), "{p}");
+        assert_eq!(h[0].version, "tool 1.2 (contract 3)", "the first line names the version");
+        assert_eq!((h[1].version.as_str(), h[1].bytes), ("SECOND", 6));
+        for bad in [cmd(&["cat", dir.path().join("gone.md").to_str().unwrap()]), cmd(&["true"]), cmd(&["no-such-command-here"])] {
+            let c = Config { system_prompt_commands: vec![bad.clone()], ..Config::default() };
+            assert!(c.system_prompt().is_err(), "{bad:?} stops the start, not a silent prompt without it");
+        }
     }
 
 }

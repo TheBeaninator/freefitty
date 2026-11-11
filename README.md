@@ -165,11 +165,18 @@ order, a thread stays on its node, state moves with it over the rail, and the vi
 named events, each one cache miss, never one a turn. The transcript is durable; the cache is a cost, never
 corruption.
 
-The system prompt is the built-in one (or `system_prompt_file`), then `system_prompt_extra`, then each of
-`system_prompt_files` in order, read at start. What every thread needs about a shared tool belongs in such a file,
-and only that: the few calls nearly every thread makes and the rules the tool enforces, with the tool's own help for
-the rest. On the pod, the full `akb describe` (12 KB) became 1.1 KB, checked against the installed akb by a script so
-it cannot drift. Any change to it is one cache miss for every thread and a refreeze of every expert.
+The system prompt is the built-in one (or `system_prompt_file`), then `system_prompt_extra`, then the output of
+each of `system_prompt_commands`, run at start. A shared tool describes itself once and FreeFitty hoists only what
+every thread needs: on the pod `akb describe --brief --verbs read,comment,move,query,list,update` (1.9 KB, usage
+lines generated from akb's own parameters, and the rules it enforces), with `akb help <verb>` for the rest. The
+first line of each output names the tool's version; `/health` shows it, and `freefitty prompt` runs the commands
+again and marks the ones whose output changed (a tool upgraded: restart to hoist it). Any change to the prompt is
+one cache miss for every thread and a refreeze of every expert.
+
+Every turn records the instructions it ran under: the id (a hash of the system prompt and the thread's tool
+definitions, the same one an expert's frozen context carries) goes on the thread where it changes (`GET
+/threads/{id}` `instructions`: [message index, id] pairs), and the text is kept once in
+`<data_dir>/instructions/<id>.json`. A study of how threads use a tool reads only the turns told the same thing.
 
 Three mechanisms move the view's head. Each has a default and the reason for it, decided from the pod's own
 numbers, not from a reflex either way.

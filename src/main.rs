@@ -100,6 +100,8 @@ enum Cmd {
     Status,
     /// A consistent snapshot of the store now, into <data_dir>/backups (the daemon keeps running).
     Backup,
+    /// What was hoisted into the system prompt at start, and which of it a tool has changed since.
+    Prompt,
     /// Put a snapshot back as the store: the daemon must be stopped; the current store is kept beside it.
     Restore { file: std::path::PathBuf },
     /// Replay stored histories under a budget window (and tool-result paging with --tau) to measure before
@@ -187,6 +189,10 @@ async fn main() -> Result<()> {
             c.watch(Some(&t)).await
         }
         Cmd::Watch { thread } => Client::new(&cli.config)?.watch(thread.as_deref()).await,
+        Cmd::Prompt => {
+            println!("{}", serde_json::to_string_pretty(&Client::new(&cli.config)?.get("/prompt").await?)?);
+            Ok(())
+        }
         Cmd::Backup => {
             println!("{}", Client::new(&cli.config)?.post("/admin/backup", &json!({})).await?);
             Ok(())
