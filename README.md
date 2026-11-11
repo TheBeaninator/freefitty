@@ -165,6 +165,11 @@ order, a thread stays on its node, state moves with it over the rail, and the vi
 named events, each one cache miss, never one a turn. The transcript is durable; the cache is a cost, never
 corruption.
 
+The system prompt is the built-in one (or `system_prompt_file`), then `system_prompt_extra`, then each of
+`system_prompt_files` in order, read at start. A tool's own agent-facing text belongs in such a file, regenerated
+when the tool changes (on the pod: `akb describe`, which threads otherwise looked up 622 times in 257 threads).
+Any change to it is one cache miss for every thread and a refreeze of every expert.
+
 Three mechanisms move the view's head. Each has a default and the reason for it, decided from the pod's own
 numbers, not from a reflex either way.
 

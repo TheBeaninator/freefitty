@@ -134,6 +134,11 @@ pub struct Config {
     /// Extra text appended to the system prompt (every thread shares it, so the prompt cache does too).
     #[serde(default)]
     pub system_prompt_extra: String,
+    /// Files appended to the system prompt after `system_prompt_extra`, in order, read at start: a tool's own
+    /// agent-facing text (`akb describe` > a file) that is regenerated when the tool changes, instead of a copy
+    /// pasted into the config that goes stale. Every thread asked akb for its usage (622 lookups in 257 threads).
+    #[serde(default)]
+    pub system_prompt_files: Vec<PathBuf>,
     /// Replies nobody collected are kept this many days.
     #[serde(default = "d_reply_days")]
     pub reply_retention_days: u64,
@@ -381,6 +386,11 @@ impl Config {
             p.push_str("\n\n");
             p.push_str(self.system_prompt_extra.trim());
         }
+        for f in &self.system_prompt_files {
+            let text = std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
+            p.push_str("\n\n");
+            p.push_str(text.trim());
+        }
         Ok(p.trim().to_owned())
     }
 }
@@ -445,4 +455,18 @@ mod tests {
         assert_eq!(c.min_cover("http://f:2", 70_000), 67_888);
         assert_eq!(c.min_cover("http://f:2", 100), 0);
     }
+
+    #[test]
+    fn system_prompt_files_follow_the_extra_text_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.md"), dir.path().join("b.md"));
+        std::fs::write(&a, "\nAKB USAGE\n").unwrap();
+        std::fs::write(&b, "SECOND").unwrap();
+        let c = Config { system_prompt_extra: "EXTRA".into(), system_prompt_files: vec![a, b], ..Config::default() };
+        let p = c.system_prompt().unwrap();
+        assert!(p.ends_with("EXTRA\n\nAKB USAGE\n\nSECOND"), "{p}");
+        let missing = Config { system_prompt_files: vec![dir.path().join("gone.md")], ..Config::default() };
+        assert!(missing.system_prompt().is_err(), "a missing file stops the start, not a silent prompt without it");
+    }
+
 }
