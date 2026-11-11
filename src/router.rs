@@ -323,8 +323,8 @@ impl Router {
                     // whose home is down or held has no home to wait for and is a newcomer too (pod, 2026-11-09:
                     // threads of a down node waited 2.6 h for it to come back)
                     let overdue = h.is_none_or(|h| nodes[h].held) && started.elapsed() >= patience;
-                    // overdue, a newcomer may take a slot home-waiters want, but where two or more of them wait it leaves
-                    // them one (a burst of overdue newcomers never takes a node's every slot from its own threads)
+                    // overdue, a newcomer may take a spare slot home-waiters want, but where two or more of them wait it
+                    // leaves them one (a burst of overdue newcomers never takes a node's every slot from its own threads)
                     // a priority turn takes any free slot, home-waiters' included
                     let reserve = |w: u32| if prio { 0 } else if overdue { (w as i64 - 1).max(0) } else { w as i64 };
                     let mut free: Vec<usize> = up.iter().copied().filter(|&i| !nodes[i].held && nodes[i].free() - reserve(nodes[i].wanted) > 0).collect();
@@ -339,6 +339,17 @@ impl Router {
                         Some(h) if !free.is_empty() && self.cfg.move_threads => Some((free[0], Some(h), "moved")),
                         _ => None,
                     } };
+                    // an overdue newcomer with no spare slot anywhere waits on one node as that node's own threads do,
+                    // and takes a slot there on their terms. Taking only slots no home-waiter wanted, it was never
+                    // placed while every node had two or more waiting (pod, 2026-11-11: a djinn thread, 3.5 h)
+                    let adopt = if overdue && choice.is_none() && !yield_to_priority {
+                        up.iter().copied().filter(|&i| !nodes[i].held).min_by_key(|&i| (nodes[i].wanted as i64 - nodes[i].free(), nodes[i].load(), i))
+                    } else { None };
+                    let choice = choice.or_else(|| adopt.filter(|&a| nodes[a].free() > 0).map(|a| match h {
+                        None => (a, None, "new"),
+                        Some(h) if tokens <= self.cfg.spill_tokens || !self.cfg.move_threads || nodes[h].xfer == Some(false) => (a, None, "spilled"),
+                        Some(h) => (a, Some(h), "moved"),
+                    }));
                     if let Some((n, from, why)) = choice {
                         nodes[n].mine += 1;
                         let mut c = self.counts.lock().await;
@@ -349,7 +360,7 @@ impl Router {
                         }
                         return Ok((Hold { r: self, i: n, slot: true }, from));
                     }
-                    if let Some(h) = h.filter(|&h| !nodes[h].held) { nodes[h].wanted += 1; waiting_on = Some(Hold { r: self, i: h, slot: false }); }
+                    if let Some(w) = h.filter(|&h| !nodes[h].held).or(adopt) { nodes[w].wanted += 1; waiting_on = Some(Hold { r: self, i: w, slot: false }); }
                     if prio && _prio_wait.is_none() {
                         *self.priority_waiting.lock().unwrap().entry(model.to_owned()).or_default() += 1;
                         _prio_wait = Some(PriorityWait(&self.priority_waiting, model.to_owned()));
@@ -840,15 +851,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overdue_newcomers_leave_one_slot_where_two_threads_wait_for_home() {
+    async fn an_overdue_newcomer_waits_on_a_full_node_like_its_own_threads() {
+        // pod 2026-11-11: every node full with two to four threads waiting for home, a new djinn thread waited 3.5 h
         let mut a = node("a", false, true);
-        a.mine = 1;
-        a.wanted = 2;  // two threads wait for a's last free slot
+        a.mine = 2;
+        a.wanted = 2;  // full, two threads wait for a slot
         let mut r = router(vec![a], true);
         r.cfg.newcomer_wait_s = 0;
         r.cfg.node_down_wait_s = 30;
-        let placed = tokio::time::timeout(Duration::from_millis(2500), r.placed(M, None, None, 10, &[])).await;
-        assert!(placed.is_err(), "the last slot stays with the threads waiting for their home");
+        let r = std::sync::Arc::new(r);
+        let p = { let r = r.clone(); tokio::spawn(async move { r.placed(M, None, None, 10, &[]).await.unwrap() }) };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(r.lock_nodes().await[0].wanted, 3, "it waits beside the home-waiters");
+        r.lock_nodes().await[0].mine = 1;  // a slot frees: it takes it on the same terms as they do
+        r.notify.notify_waiters();
+        let placed = tokio::time::timeout(Duration::from_secs(3), p).await.expect("placed when a slot frees").unwrap();
+        assert_eq!(placed, (0, None));
+        assert_eq!(r.lock_nodes().await[0].wanted, 2, "its wait is given back");
     }
 
     #[tokio::test]
