@@ -304,19 +304,24 @@ impl Engine {
         }
         new_messages.extend(image_messages);
         if reply_to.is_none() { reply_to = live.last().map(|(_, e)| e.id.clone()); }
-        // the calls of one turn are answered together. While another call of the same turn as a result that just
-        // came is still out, the results are stored and the model waits for the rest: on the first one alone it saw
-        // half its answers, and from then on every turn ran on an older result while the newest call was out (pod
-        // 2026-11-11: a librarian goldfish saw each result one turn late and asked again, 335 times). A person's
-        // message, an event or a refocus wakes the thread as before; a sleep of the same turn is not waited for.
-        let answered: Vec<String> = live.iter().filter_map(|(_, e)| match &e.kind { EventKind::ToolResult { call, .. } => Some(call.clone()), _ => None }).collect();
-        let turn_of = |id: &str| id.rsplit_once('-').map(|(t, _)| t.to_owned());
-        let siblings_out = meta.pending.iter()
+        // the model takes a turn only once it can see the results of every call it made last: tool results alone
+        // never start a turn while a call of the latest assistant turn is still out; they are stored and wait.
+        // Otherwise the model acts without its newest results and, as far as it can tell, its calls did nothing:
+        // pod 2026-11-11, a librarian goldfish woke on one result of a two-call turn, from then on always saw its
+        // results one turn late, and repeated one call 591 times. A person's message, an event or a refocus wakes
+        // the thread as before (the model is told nothing is lost: the results land when they come); sleeps of
+        // the latest turn are not waited for.
+        let latest: Vec<String> = self.store.messages(thread)?.iter().rev().find(|m| m["role"] == "assistant")
+            .and_then(|m| m["tool_calls"].as_array().cloned()).unwrap_or_default()
+            .iter().filter_map(|c| c["id"].as_str().map(str::to_owned)).collect();
+        let shown = |p: &PendingCall| p.provider_call_id.clone().unwrap_or_else(|| p.id.clone());
+        let latest_out = meta.pending.iter()
             .filter(|p| p.name != rap::SLEEP && p.name != rap::SLEEP_UNTIL)
-            .filter(|p| answered.iter().any(|a| turn_of(a).is_some() && turn_of(a) == turn_of(&p.id)))
+            .filter(|p| latest.contains(&shown(p)))
             .count();
-        if siblings_out > 0 && live.iter().all(|(_, e)| matches!(e.kind, EventKind::ToolResult { .. })) {
-            tracing::info!("{thread}: {} result(s) in; waiting for {siblings_out} more call(s) of the same turn", answered.len());
+        if latest_out > 0 && live.iter().all(|(_, e)| matches!(e.kind, EventKind::ToolResult { .. })) {
+            let answered = live.len();
+            tracing::info!("{thread}: {answered} result(s) in; waiting for {latest_out} call(s) of its latest turn before it runs");
             self.store.commit(Commit { thread, meta, messages: new_messages, done, done_ids, replies: vec![], events: vec![], invocations: vec![], new_threads: vec![] })?;
             return Ok(Outcome::Done);
         }
@@ -1089,15 +1094,13 @@ fn normalize(m: &Value) -> (Value, Vec<Call>) {
     let content = m.get("content").and_then(|c| c.as_str()).map(|s| s.to_owned());
     let mut calls = Vec::new();
     let mut tool_calls = Vec::new();
-    // one id per turn, the call's index after it: the calls of one turn are known as siblings by it
-    let turn = crate::config::id();
     for (i, tc) in m.get("tool_calls").and_then(|t| t.as_array()).into_iter().flatten().enumerate() {
         let f = tc.get("function").cloned().unwrap_or(Value::Null);
         let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("").to_owned();
         let args = repair_args(f.get("arguments").unwrap_or(&Value::Null));
         let provider_call_id = tc.get("id").and_then(|i| i.as_str()).map(str::to_owned);
         // the id the thread knows the call by: ours, unique across the store; the model's id rides along
-        let id = format!("{turn}-{i}");
+        let id = format!("{}-{}", crate::config::id(), i);
         tool_calls.push(json!({"id": provider_call_id.clone().unwrap_or_else(|| id.clone()), "type": "function",
             "function": {"name": name, "arguments": args.to_string()}}));
         calls.push(Call { id, provider_call_id, name, args });

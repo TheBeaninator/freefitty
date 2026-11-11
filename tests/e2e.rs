@@ -115,6 +115,10 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
         gf_call("rail2", q)
     } else if let Some(q) = content.strip_prefix("lookup ").filter(|_| last["role"] == "user") {
         json!({"role": "assistant", "content": null, "tool_calls": [{"id": format!("call_l{}", msgs.len()), "type": "function", "function": {"name": "rail_lookup", "arguments": json!({"topic": q}).to_string()}}]})
+    } else if (content == "long call" || content == "and another") && last["role"] == "user" {
+        // a call that takes 6 s; the person speaks while it runs and the model makes a second one
+        let id = if content == "long call" { "call_a" } else { "call_b" };
+        json!({"role": "assistant", "content": null, "tool_calls": [{"id": id, "type": "function", "function": {"name": "echo", "arguments": "{\"text\": \"slow\"}"}}]})
     } else if content == "two calls" && last["role"] == "user" {
         // one turn, two calls: one answered at once, one after 6 s
         json!({"role": "assistant", "content": null, "tool_calls": [
@@ -1572,5 +1576,30 @@ async fn a_goldfish_stuck_on_one_call_is_ended_and_its_elephant_told() {
     let threads = api.get("/threads").await;
     let fish = threads.as_array().unwrap().iter().find(|t| t["thread"].as_str().unwrap().starts_with("el.gf-railhand-")).unwrap();
     assert_eq!(fish["closed"], "repeated itself");
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_result_does_not_start_a_turn_while_the_newest_call_is_out() {
+    // a person wakes the thread while a call runs; the model makes another; the first call's result must not start
+    // a turn the model would take without the result of the call it just made (the stagger behind the 591 repeats)
+    let h = harness().await;
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.say("long call", Some("w")).await;
+    api.output("w", 10).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    api.say("and another", Some("w")).await;
+    api.output("w", 10).await.unwrap();
+    let out = api.output("w", 20).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.starts_with("done:"), "{out}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let bodies = h.model.bodies.lock().unwrap().clone();
+    for b in bodies.iter().filter(|b| b["messages"].as_array().unwrap().iter().any(|m| m["content"] == "and another")) {
+        let ms = b["messages"].as_array().unwrap();
+        let asked_b = ms.iter().any(|m| m["tool_calls"][0]["id"] == "call_b");
+        let got_b = ms.iter().any(|m| m["role"] == "tool" && m["tool_call_id"] == "call_b");
+        assert!(!asked_b || got_b, "a turn ran with call_b out: {:?}", ms.iter().map(|m| (m["role"].clone(), m["tool_call_id"].clone())).collect::<Vec<_>>());
+    }
     r.shutdown().await;
 }
