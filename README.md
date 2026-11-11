@@ -290,7 +290,9 @@ which answer once and are gone. Three built-ins make that general:
 - An expert whose definition has a `[tool]` table (`name`, `description`, JSON-schema `parameters`, `ask?`) answers
   that tool: every thread sees it beside the other tools, and a call to it is a goldfish of the expert briefed with
   the call's arguments, whose answer returns as the result. A ToolBox tool of the same name wins; a goldfish cannot
-  call one.
+  call one. `fallback` names an expert that answers instead while no node of the expert's model is up and free
+  (on the pod `ark_lookup` is the librarian on the StrixFold pair, and the same librarian on the cluster while
+  the pair is down or held for a window).
 
 The paths a model names (a goldfish's `documents`, a commission's `reads`) are resolved, symlinks and `..` included,
 and read only under `read_roots` (empty, the default: no files at all). FreeFitty's own data, park and config

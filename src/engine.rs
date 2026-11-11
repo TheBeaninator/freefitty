@@ -178,6 +178,19 @@ struct Commissioned {
 }
 
 impl Engine {
+    /// The expert that answers a call to an expert's tool now: the tool's own, or its `fallback` while no node of
+    /// the own one's model can take a turn.
+    async fn tool_expert(&self, tool: &str, expert: String, spec: &crate::experts::ToolSpec) -> String {
+        let Some(fallback) = spec.fallback.as_deref() else { return expert };
+        let model = match self.experts.key(&expert).await.and_then(|k| self.store.expert(&k).ok().flatten()) {
+            Some(e) => e.model.unwrap_or_else(|| self.cfg.model.clone()),
+            None => return expert,
+        };
+        if self.router.usable_for(&model).await || self.experts.key(fallback).await.is_none() { return expert; }
+        tracing::info!("{tool}: no {model} node can take a turn now; {fallback} answers instead of {expert}");
+        fallback.to_owned()
+    }
+
     /// The instructions this turn runs under (the system prompt and the thread's tool definitions, by the hash an
     /// expert's frozen context carries too): recorded on the thread where they change, their text kept once under
     /// `<data_dir>/instructions/<id>.json`, so every turn in every log traces to exactly what the model was told
@@ -551,6 +564,7 @@ impl Engine {
                         None => match self.experts.tool(name).await.filter(|_| allowed.contains(name)) {
                             // a tool an expert answers: a goldfish of it, briefed with the call's arguments
                             Some((expert, spec)) if meta.goldfish_of.is_none() => {
+                                let expert = self.tool_expert(name, expert, &spec).await;
                                 let ask = Call { args: json!({"expert": expert, "question": spec.brief(&call.args)}), ..call.clone() };
                                 match self.goldfish(thread, &ask).await {
                                     Ok((child_meta, first)) => {

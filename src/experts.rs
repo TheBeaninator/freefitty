@@ -27,6 +27,7 @@
 //! thread sees beside the others, and a call to it is a goldfish of this expert with the call's arguments as its brief
 //! (`ask`, optional: what the answer must look like). To the caller it is one more tool with a result; behind it is
 //! a model that has read what the expert read. A ToolBox tool of the same name wins, and a goldfish cannot call one.
+//! `fallback` names an expert that answers instead while no node of this expert's model is up and free.
 //!
 //! Or frozen from a thread's focal point: its latest refocus notes become what the expert has read.
 //! Versions are stored by content hash and never pruned: a thread keeps the bytes it was born with when a
@@ -81,6 +82,10 @@ pub struct ToolSpec {
     /// What the answer must look like; unset = the result only, in the shape the description promises.
     #[serde(default)]
     pub ask: Option<String>,
+    /// Another expert that answers in its place while no node of this one's model can take a turn (the StrixFold
+    /// pair down or held for a card window): a call never waits hours on one model when another has read the same.
+    #[serde(default)]
+    pub fallback: Option<String>,
 }
 
 fn no_parameters() -> Value {

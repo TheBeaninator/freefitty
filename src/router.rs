@@ -660,6 +660,11 @@ impl Router {
         self.lock_nodes().await.iter().filter(|n| n.up && n.serves == model).map(|n| n.url.clone()).collect()
     }
 
+    /// Whether a turn of `model` could start now: some node serving it is up and not held.
+    pub async fn usable_for(&self, model: &str) -> bool {
+        self.lock_nodes().await.iter().any(|n| n.up && !n.held && n.serves == model)
+    }
+
     /// One completion on one named node, outside placement (warming an expert's prefix into its cache).
     pub async fn chat_on(&self, url: &str, body: &Value) -> Result<Turn> {
         let r = self.client.post(format!("{url}/v1/chat/completions")).json(body).send().await?;

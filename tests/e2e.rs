@@ -1500,3 +1500,28 @@ async fn every_turn_traces_to_the_instructions_it_ran_under() {
     assert_eq!((p["hoisted"][0]["stale"].clone(), p["hoisted"][0]["now_version"].clone()), (json!(true), json!("board 0.1.4 (contract 1.2)")), "{p}");
     r.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expert_tool_falls_back_while_its_model_has_no_free_node() {
+    let mut h = harness().await;
+    let dir = tempfile::tempdir().unwrap();
+    // the tool's own expert runs on a model no node serves (the StrixFold pair down or held); its fallback has
+    // read the same and runs on the cluster's model
+    std::fs::write(dir.path().join("railhand.toml"), concat!("description = \"knows the rail\"\nmodel = \"dsv41\"\n[[reads]]\ntext = \"B is .51\"\n",
+        "[tool]\nname = \"rail_lookup\"\ndescription = \"The address of a rail node\"\nfallback = \"railhand-c\"\n")).unwrap();
+    std::fs::write(dir.path().join("railhand-c.toml"), "description = \"knows the rail\"\n[[reads]]\ntext = \"B is .51\"\n").unwrap();
+    h.cfg.experts_dir = Some(dir.path().to_path_buf());
+    h.cfg.node_down_wait_s = 600;  // without the fallback, the call would wait this long
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let t = std::time::Instant::now();
+    api.say("lookup what is B", Some("el")).await;
+    assert!(api.output("el", 10).await.unwrap()["text"].as_str().unwrap().contains("[Tool Call: rail_lookup"));
+    let out = api.output("el", 20).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.starts_with("done: fish(tools=") && out.contains("Answer as the tool's result"), "{out}");
+    assert!(t.elapsed() < Duration::from_secs(30), "answered by the fallback, not after a wait");
+    let threads = api.get("/threads").await;
+    let names: Vec<&str> = threads.as_array().unwrap().iter().map(|t| t["thread"].as_str().unwrap()).collect();
+    assert!(names.iter().any(|n| n.starts_with("el.gf-railhand-c-")) && !names.iter().any(|n| n.starts_with("el.gf-railhand-") && !n.starts_with("el.gf-railhand-c-")), "{names:?}");
+    r.shutdown().await;
+}
