@@ -193,6 +193,15 @@ pub struct Config {
     /// Experts whose frozen state is put into every node's cache once the nodes are up (every expert is frozen then).
     #[serde(default)]
     pub warm_on_start: Vec<String>,
+    /// Directories the model may name files in (a goldfish's `documents`, a commission's `reads`); empty = none.
+    /// Paths are resolved (symlinks, `..`) before the check, and FreeFitty's own data, park and config directories
+    /// stay closed whatever this says: the config holds both tokens (review 2026-11-11). Files the operator names
+    /// (`experts_dir` definitions, prompt files) are not checked.
+    #[serde(default)]
+    pub read_roots: Vec<PathBuf>,
+    /// The file this config was loaded from (`Config::load`), so its directory stays closed to the model.
+    #[serde(skip)]
+    pub config_path: Option<PathBuf>,
 }
 
 fn d_listen() -> String { "127.0.0.1:8081".into() }
@@ -279,9 +288,27 @@ impl Default for Config {
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let c: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let mut c: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        c.config_path = Some(path.to_path_buf());
         c.check()?;
         Ok(c)
+    }
+
+    /// The resolved path of a file the model named, when `read_roots` lets it read there.
+    pub fn model_read(&self, p: &str) -> Result<PathBuf> {
+        let real = std::fs::canonicalize(p).with_context(|| format!("reading {p}"))?;
+        let under = |d: &Path| std::fs::canonicalize(d).is_ok_and(|d| real.starts_with(d));
+        let park = self.park_dir.clone().unwrap_or_else(|| self.data_dir.join("parked"));
+        let own = [Some(self.data_dir.as_path()), Some(park.as_path()), self.config_path.as_deref().and_then(|c| c.parent())];
+        let expert_defs = self.experts_dir.as_deref().is_some_and(under);
+        if own.into_iter().flatten().any(under) && !expert_defs {
+            bail!("{p} is in FreeFitty's own files, which no thread reads");
+        }
+        if !self.read_roots.iter().any(|r| under(r)) {
+            if self.read_roots.is_empty() { bail!("{p}: threads read no files here (read_roots is empty)"); }
+            bail!("{p} is outside read_roots ({})", self.read_roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", "));
+        }
+        Ok(real)
     }
 
     pub fn check(&self) -> Result<()> {
@@ -378,6 +405,28 @@ pub fn id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_model_reads_only_under_read_roots_and_never_freefittys_own_files() {
+        let d = std::env::temp_dir().join(format!("ff-roots-{}", std::process::id()));
+        let (docs, home) = (d.join("docs"), d.join("ff"));
+        for x in [&docs, &home.join("data"), &home.join("experts"), &d.join("other")] { std::fs::create_dir_all(x).unwrap(); }
+        for f in [docs.join("a.md"), home.join("freefitty.toml"), home.join("data/x"), home.join("experts/e.toml"), d.join("other/b.md")] { std::fs::write(f, "x").unwrap(); }
+        std::os::unix::fs::symlink(home.join("freefitty.toml"), docs.join("sneaky.md")).unwrap();
+        let mut c = Config { data_dir: home.join("data"), experts_dir: Some(home.join("experts")), config_path: Some(home.join("freefitty.toml")), ..Config::default() };
+        let p = |x: &Path| x.display().to_string();
+        assert!(c.model_read(&p(&docs.join("a.md"))).unwrap_err().to_string().contains("read_roots is empty"));
+        c.read_roots = vec![docs.clone()];
+        assert!(c.model_read(&p(&docs.join("a.md"))).is_ok());
+        assert!(c.model_read(&p(&d.join("other/b.md"))).unwrap_err().to_string().contains("outside read_roots"));
+        assert!(c.model_read(&p(&docs.join("../other/b.md"))).is_err(), ".. leaves the root");
+        c.read_roots = vec![d.clone()];  // a root over FreeFitty's own directory still leaves it closed
+        for own in [docs.join("sneaky.md"), home.join("freefitty.toml"), home.join("data/x")] {
+            assert!(c.model_read(&p(&own)).unwrap_err().to_string().contains("FreeFitty's own"), "{}", own.display());
+        }
+        assert!(c.model_read(&p(&home.join("experts/e.toml"))).is_ok(), "expert definitions stay readable");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 
     #[test]
     fn a_model_waits_as_long_as_its_slowest_node_allows() {

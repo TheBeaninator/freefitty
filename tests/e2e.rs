@@ -14,6 +14,8 @@ struct FakeModel {
     calls: AtomicUsize,
     /// the next notes answer is cut off (finish_reason length)
     cut_notes: AtomicBool,
+    /// the next /steer answers after 3 s (a slice is cancelled while it checks a commission's steering)
+    slow_steer: AtomicBool,
     bodies: std::sync::Mutex<Vec<Value>>,
     /// what /cache/export answers (None: 404, nothing cached), and every body /cache/import got
     kv: std::sync::Mutex<Option<Vec<u8>>>,
@@ -110,6 +112,14 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
         gf_call("rail2", q)
     } else if content == "askbad" {
         gf_call("nobody", "x")
+    } else if let Some(n) = content.strip_prefix("flaky ").filter(|_| last["role"] == "user") {
+        // a commission, a goldfish, then a steered commission whose check waits on the node; ids differ per
+        // generation, as a model's do when a slice runs again
+        let k = m.calls.load(Ordering::Relaxed);
+        json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": format!("call_fm{k}"), "type": "function", "function": {"name": "commission_expert", "arguments": json!({"name": n, "description": "knows rail three", "reads": [{"text": "D is .53"}], "tools": ["echo"]}).to_string()}},
+            {"id": format!("call_fg{k}"), "type": "function", "function": {"name": "goldfish", "arguments": json!({"expert": "railhand", "question": "what is B"}).to_string()}},
+            {"id": format!("call_fp{k}"), "type": "function", "function": {"name": "commission_expert", "arguments": json!({"name": format!("persona-{n}"), "description": "a voice", "reads": [{"text": "be dramatic"}], "tools": ["echo"], "steer": [{"vector": "villain24", "scale": 6.0}]}).to_string()}}]})
     } else if let Some(n) = content.strip_prefix("commission ").filter(|_| last["role"] == "user") {
         json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_m", "type": "function", "function": {"name": "commission_expert", "arguments": json!({"name": n, "description": "knows rail two", "reads": [{"text": "C is .52"}], "tools": ["echo", "goldfish"], "steer": if n.starts_with("persona") { json!([{"vector": "villain24", "scale": 6.0}]) } else { json!([]) }}).to_string()}}]})
     } else if !shown.is_empty() {
@@ -161,6 +171,7 @@ async fn probe(State(m): State<Arc<FakeModel>>) -> axum::response::Response {
 async fn steer_list(State(m): State<Arc<FakeModel>>) -> axum::response::Response {
     use axum::response::IntoResponse;
     if m.steer_fail.load(Ordering::Relaxed) { return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
+    if m.slow_steer.swap(false, Ordering::Relaxed) { tokio::time::sleep(Duration::from_secs(3)).await; }
     match m.steer_list.lock().unwrap().clone() {
         Some(v) => Json(v).into_response(),
         None => axum::http::StatusCode::NOT_FOUND.into_response(),
@@ -234,7 +245,7 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
-    let model = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(0), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false), probe_tokens: std::sync::atomic::AtomicU64::new(u64::MAX), steer_list: std::sync::Mutex::new(None), refuse_steer: AtomicBool::new(false), steer_fail: AtomicBool::new(false) });
+    let model = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(0), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), slow_steer: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false), probe_tokens: std::sync::atomic::AtomicU64::new(u64::MAX), steer_list: std::sync::Mutex::new(None), refuse_steer: AtomicBool::new(false), steer_fail: AtomicBool::new(false) });
     let model_url = serve(Router::new().route("/health", get(health)).route("/v1/chat/completions", post(completions)).route("/cache/export", post(export)).route("/cache/import", post(import)).route("/cache/probe", post(probe)).route("/steer", get(steer_list)).with_state(model.clone())).await;
     let tools = Arc::new(FakeTools { base: String::new(), invocations: AtomicUsize::new(0) });
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -996,6 +1007,41 @@ async fn elephants_find_ask_and_commission_goldfish() {
     r.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slice_cancelled_after_its_calls_leaves_no_goldfish_or_expert_behind() {
+    // review 2026-11-11: the goldfish thread and the commissioned expert were made inside the turn loop, so a slice
+    // cancelled after them ran again into "an expert named rail3 exists already" beside a stray goldfish
+    let mut h = harness().await;
+    h.cfg.commission_steer = true;
+    *h.model.kv.lock().unwrap() = Some(vec![5u8; 1 << 10]);
+    *h.model.steer_list.lock().unwrap() = Some(json!({"vectors": [{"name": "villain24", "layer": 24}]}));
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("railhand.toml"), "description = \"knows the rail\"\nack = \"Read.\"\n[[reads]]\ntext = \"B is .51\"\n").unwrap();
+    h.cfg.experts_dir = Some(dir.path().to_path_buf());
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    h.model.slow_steer.store(true, Ordering::Relaxed);
+    api.say("flaky rail3", Some("el")).await;
+    while !h.model.bodies.lock().unwrap().iter().any(|b| b.to_string().contains("flaky rail3")) { tokio::time::sleep(Duration::from_millis(50)).await; }
+    tokio::time::sleep(Duration::from_millis(500)).await;  // inside the steered commission's check now
+    assert_eq!(api.post("/threads/el/cancel", json!({})).await["cancelled"], json!(true));
+    let mut said = Vec::new();
+    while let Some(o) = api.output("el", 20).await {
+        said.push(o["text"].as_str().unwrap_or("").to_owned());
+        if ["is ready", "fish("].iter().all(|w| said.iter().any(|t| t.contains(w))) { break; }
+    }
+    assert!(!h.model.slow_steer.load(Ordering::Relaxed), "the steering check was slowed");
+    // both freezes' results arrive (the fake model echoes the later one); both definitions were written once
+    assert!(said.iter().any(|t| t.contains("Expert ") && t.contains("is ready")), "{said:?}");
+    assert!(!said.iter().any(|t| t.contains("exists already") || t.contains("Error")), "{said:?}");
+    let threads = api.get("/threads").await;
+    let fish = threads.as_array().unwrap().iter().filter(|t| t["thread"].as_str().unwrap().starts_with("el.gf-")).count();
+    assert_eq!(fish, 1, "{threads}");
+    assert!(std::fs::read_to_string(dir.path().join("rail3.toml")).unwrap().contains("D is .53"));
+    assert!(std::fs::read_to_string(dir.path().join("persona-rail3.toml")).unwrap().contains("villain24"));
+    r.shutdown().await;
+}
+
 async fn strixfold_health(State(m): State<Arc<FakeModel>>) -> Json<Value> {
     Json(json!({"status": "ok", "model": "dsv41", "max_batch_size": 1, "warming": false, "live": {"connections": m.busy.load(Ordering::Relaxed), "waiting": 0}}))
 }
@@ -1004,7 +1050,7 @@ async fn strixfold_health(State(m): State<Arc<FakeModel>>) -> Json<Value> {
 async fn a_goldfish_of_a_model_expert_runs_only_on_nodes_serving_that_model() {
     let mut h = harness().await;
     // a second node the way StrixFold answers: its own /health shape, no cache routes, another model
-    let sf = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(0), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false), probe_tokens: std::sync::atomic::AtomicU64::new(u64::MAX), steer_list: std::sync::Mutex::new(None), refuse_steer: AtomicBool::new(false), steer_fail: AtomicBool::new(false) });
+    let sf = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(0), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), slow_steer: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false), probe_tokens: std::sync::atomic::AtomicU64::new(u64::MAX), steer_list: std::sync::Mutex::new(None), refuse_steer: AtomicBool::new(false), steer_fail: AtomicBool::new(false) });
     let sf_url = serve(Router::new().route("/health", get(strixfold_health)).route("/v1/chat/completions", post(completions)).with_state(sf.clone())).await;
     h.cfg.nodes.push(sf_url.clone());
     h.cfg.node_meta.insert(sf_url.clone(), freefitty::config::NodeMeta { model: Some("dsv41".into()), context_length: Some(131072), grant: Some(false), shared_messages: Some(true), ..Default::default() });
@@ -1226,7 +1272,7 @@ async fn a_persona_needs_its_vector_on_every_node() {
     h.cfg.commission_steer = true;
     *h.model.steer_list.lock().unwrap() = Some(json!({"vectors": [{"name": "villain24", "layer": 24}]}));
     // a second node that holds no vectors: villain24 is not on every node
-    let other = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(2), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false), probe_tokens: std::sync::atomic::AtomicU64::new(u64::MAX), steer_list: std::sync::Mutex::new(Some(json!({"vectors": []}))), refuse_steer: AtomicBool::new(false), steer_fail: AtomicBool::new(false) });
+    let other = Arc::new(FakeModel { fail: AtomicBool::new(false), busy: AtomicUsize::new(2), calls: AtomicUsize::new(0), cut_notes: AtomicBool::new(false), slow_steer: AtomicBool::new(false), bodies: std::sync::Mutex::new(Vec::new()), kv: std::sync::Mutex::new(None), imports: std::sync::Mutex::new(Vec::new()), short_first: AtomicBool::new(false), probe_tokens: std::sync::atomic::AtomicU64::new(u64::MAX), steer_list: std::sync::Mutex::new(Some(json!({"vectors": []}))), refuse_steer: AtomicBool::new(false), steer_fail: AtomicBool::new(false) });
     let other_url = serve(Router::new().route("/health", get(health)).route("/steer", get(steer_list)).with_state(other.clone())).await;
     h.cfg.nodes.push(other_url);
     let r = freefitty::start(h.cfg.clone()).await.unwrap();
@@ -1361,6 +1407,9 @@ async fn a_running_slice_is_cancelled_and_its_thread_deleted_at_once() {
     assert_eq!(s.as_u16(), 404);
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(h.model.calls.load(Ordering::Relaxed), 2);
+    // both cancelled turns gave their node slot back (it leaked until a restart before 2026-11-11)
+    let hv = api.get("/health").await;
+    assert_eq!((&hv["nodes"][0]["mine"], &hv["nodes"][0]["waiting"]), (&json!(0), &json!(0)), "{hv}");
     // a thread with nothing running: cancel says so
     assert_eq!(api.post("/threads/thread-none/cancel", json!({})).await["cancelled"], json!(false));
     r.shutdown().await;

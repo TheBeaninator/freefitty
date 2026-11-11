@@ -98,8 +98,11 @@ pub fn overflow_count(msg: &str) -> Option<u64> {
 
 /// A node's 400 that says the prompt does not fit its context: no retry fixes it.
 pub fn is_context_overflow(msg: &str) -> bool {
+    // the servers' own phrasings only: an overflow closes the thread, so any other 400 that happens to mention
+    // context and tokens must not read as one (review 2026-11-11)
     let m = msg.to_ascii_lowercase();
-    m.contains("context") && (m.contains("token") || m.contains("length"))
+    ["the context holds", "maximum context length", "exceeds the available context size", "exceed the context window", "exceeds the context window", "context_length_exceeded"]
+        .iter().any(|p| m.contains(p))
 }
 
 /// The shared prefix: the system prompt, then the expert's own messages. The system message is always the
@@ -161,6 +164,15 @@ pub fn live_view(prefix: &[Value], meta: &ThreadMeta, history: &[Value], pending
     v
 }
 
+/// A `commission_expert` call checked and built during a slice, registered after its commit.
+struct Commissioned {
+    expert: crate::store::Expert,
+    definition: Option<(std::path::PathBuf, String)>,
+    thread: String,
+    call: String,
+    provider_call_id: Option<String>,
+}
+
 impl Engine {
     pub async fn slice(&self, thread: &str, batch: &[(u64, Event)]) -> Outcome {
         match self.run(thread, batch).await {
@@ -196,7 +208,7 @@ impl Engine {
         let done: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
         let done_ids: Vec<String> = batch.iter().map(|(_, e)| e.id.clone()).collect();
         if live.is_empty() {
-            self.store.commit(Commit { thread, meta, messages: vec![], done, done_ids, replies: vec![], events: vec![], invocations: vec![] })?;
+            self.store.commit(Commit { thread, meta, messages: vec![], done, done_ids, replies: vec![], events: vec![], invocations: vec![], new_threads: vec![] })?;
             return Ok(Outcome::Done);
         }
 
@@ -281,7 +293,7 @@ impl Engine {
         }
         if new_messages.is_empty() {
             // only a refocus was asked for: no turn
-            self.store.commit(Commit { thread, meta, messages: vec![], done, done_ids, replies: vec![], events: vec![], invocations: vec![] })?;
+            self.store.commit(Commit { thread, meta, messages: vec![], done, done_ids, replies: vec![], events: vec![], invocations: vec![], new_threads: vec![] })?;
             return Ok(Outcome::Done);
         }
 
@@ -328,6 +340,11 @@ impl Engine {
         let mut reply_text = String::new();
         let mut events: Vec<Event> = Vec::new();
         let mut invocations: Vec<Invocation> = Vec::new();
+        // goldfish threads and commissioned experts take effect with the commit, not before it: a slice that fails or
+        // is cancelled and runs again would otherwise leave an orphan goldfish, or find its own expert "exists
+        // already" while the first freeze's result arrives late (review 2026-11-11)
+        let mut new_threads: Vec<(String, ThreadMeta)> = Vec::new();
+        let mut commissions: Vec<Commissioned> = Vec::new();
         let mut rounds = 0;
         let mut recut = false;
         let mut cut_off = 0;
@@ -427,22 +444,18 @@ impl Engine {
                     rap::EXPERTS => recalled.push((call.clone(), self.experts.catalog(&self.store).await)),
                     rap::GOLDFISH if allowed.contains(rap::GOLDFISH) => match self.goldfish(thread, call).await {
                         Ok((child_meta, first)) => {
-                            let child = first.thread.clone();
-                            match self.store.new_thread(&child, &child_meta) {
-                                Ok(_) => {
-                                    events.push(first);
-                                    meta.pending.push(call.pending());
-                                    asked += 1;
-                                    tracing::info!("{thread}: asked goldfish {child}");
-                                    reply_text.push_str(&format!("\n[Tool Call: goldfish with arguments {}]", call.args));
-                                }
-                                Err(e) => recalled.push((call.clone(), format!("Error: the goldfish could not be made: {e}"))),
-                            }
+                            tracing::info!("{thread}: asks goldfish {}", first.thread);
+                            new_threads.push((first.thread.clone(), child_meta));
+                            events.push(first);
+                            meta.pending.push(call.pending());
+                            asked += 1;
+                            reply_text.push_str(&format!("\n[Tool Call: goldfish with arguments {}]", call.args));
                         }
                         Err(e) => recalled.push((call.clone(), format!("Error: {e:#}"))),
                     },
-                    rap::COMMISSION if allowed.contains(rap::COMMISSION) => match self.commission(thread, call).await {
-                        Ok(()) => {
+                    rap::COMMISSION if allowed.contains(rap::COMMISSION) => match self.commission(thread, call, &commissions).await {
+                        Ok(c) => {
+                            commissions.push(c);
                             meta.pending.push(call.pending());
                             asked += 1;
                             reply_text.push_str(&format!("\n[Tool Call: commission_expert with arguments {}]", call.args));
@@ -564,7 +577,8 @@ impl Engine {
         let node = meta.node.clone();
         let closed = meta.closed.is_some();
         let covered = meta.node.as_deref().map_or(meta.prompt_tokens.saturating_sub(64), |n| self.cfg.min_cover(n, meta.prompt_tokens));
-        self.store.commit(Commit { thread, meta, messages: new_messages, done, done_ids, replies, events, invocations })?;
+        self.store.commit(Commit { thread, meta, messages: new_messages, done, done_ids, replies, events, invocations, new_threads })?;
+        for c in commissions { self.register(c).await; }
         if let Some(p) = &self.parking {
             // the node's cache is newer than any parked copy from here on, including one whose write began
             // before this slice and ended during it
@@ -623,7 +637,7 @@ impl Engine {
         let mut text = String::from("You are a goldfish: you were born for this one brief and answer it once; your answer returns to the agent that asked. You cannot ask goldfish or commission experts. If another expert should look at something, say so in your answer and name it (`experts` lists them).\n\n");
         let mut total = 0usize;
         for p in call.args.get("documents").and_then(|d| d.as_array()).into_iter().flatten().filter_map(|p| p.as_str()) {
-            let doc = std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("reading document {p}: {e}"))?;
+            let doc = std::fs::read_to_string(self.cfg.model_read(p)?).map_err(|e| anyhow::anyhow!("reading document {p}: {e}"))?;
             if doc.len() > 256 << 10 { anyhow::bail!("document {p} is {} bytes, over 256 KiB", doc.len()); }
             total += doc.len();
             if total > 1 << 20 { anyhow::bail!("the documents are over 1 MiB together"); }
@@ -645,12 +659,11 @@ impl Engine {
         Ok((meta, first))
     }
 
-    /// Start a `commission_expert` call: the expert is registered now and frozen in the background; the result
-    /// returns to the caller when the freeze ends.
-    async fn commission(&self, thread: &str, call: &Call) -> anyhow::Result<()> {
+    /// Check and build a `commission_expert` call's expert; `register` makes it real once the slice commits.
+    async fn commission(&self, thread: &str, call: &Call, earlier: &[Commissioned]) -> anyhow::Result<Commissioned> {
         let a = &call.args;
         let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        if self.experts.key(name).await.is_some() { anyhow::bail!("an expert named {name:?} exists already"); }
+        if self.experts.key(name).await.is_some() || earlier.iter().any(|c| c.expert.name == name) { anyhow::bail!("an expert named {name:?} exists already"); }
         let reads: Vec<crate::experts::Read> = serde_json::from_value(a.get("reads").cloned().unwrap_or(json!([])))
             .map_err(|e| anyhow::anyhow!("reads must be a list of {{path}} or {{text}}: {e}"))?;
         let tools: Vec<String> = a.get("tools").and_then(|t| t.as_array()).map(|t| t.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
@@ -682,28 +695,42 @@ impl Engine {
                 }
             }
         }
-        let e = crate::experts::commission(&self.cfg, name, a.get("description").and_then(|d| d.as_str()).unwrap_or(""), a.get("ack").and_then(|d| d.as_str()), &reads, rap::goldfish_tools(&tools), steer, steer_scope, thread)?;
-        let key = self.experts.add(&self.store, &e).await?;
-        tracing::info!("{thread}: commissioned expert {key}");
+        let (expert, definition) = crate::experts::commission(&self.cfg, name, a.get("description").and_then(|d| d.as_str()).unwrap_or(""), a.get("ack").and_then(|d| d.as_str()), &reads, rap::goldfish_tools(&tools), steer, steer_scope, thread)?;
+        Ok(Commissioned { expert, definition, thread: thread.to_owned(), call: call.id.clone(), provider_call_id: call.provider_call_id.clone() })
+    }
+
+    /// A committed commission: the expert is registered now and frozen in the background; the result returns to
+    /// the caller when the freeze ends, or at once when registering fails.
+    async fn register(&self, c: Commissioned) {
+        let Commissioned { expert: e, definition, thread, call: call_id, provider_call_id: provider } = c;
+        let deliver = self.deliver.clone();
+        let result = move |text: String| if let Some(d) = deliver.get() {
+            d(Event { id: format!("commission-{call_id}"), thread, due_ms: 0, created_ms: 0, attempts: 0,
+                      kind: EventKind::ToolResult { call: call_id, provider_call_id: provider, text, images: vec![] } });
+        };
+        let added = match definition.as_ref().map(crate::experts::write_definition).transpose() {
+            Ok(_) => self.experts.add(&self.store, &e).await,
+            Err(err) => Err(err),
+        };
+        let key = match added {
+            Ok(k) => k,
+            Err(err) => return result(format!("Error: expert {} could not be registered: {err:#}", e.name)),
+        };
+        tracing::info!("commissioned expert {key}");
         // frozen in the context its goldfish will see: the plain built-ins and its own tools (from the whole set,
         // not the commissioning thread's, which may be scoped)
         let mut full = rap::builtin_defs(self.cfg.compaction, self.cfg.window);
         full.extend(self.tools.current().await.defs.iter().cloned());
         let scoped = rap::scope_defs(full, e.tools.as_deref());
         let (experts, store, router, system, max) = (self.experts.clone(), self.store.clone(), self.router.clone(), self.system.clone(), self.cfg.max_output_tokens);
-        let (deliver, thread, call_id, provider) = (self.deliver.clone(), thread.to_owned(), call.id.clone(), call.provider_call_id.clone());
         tokio::spawn(async move {
             let text = match experts.freeze(&key, &store, &router, &system, &scoped, max).await {
                 Ok(r) => format!("Expert {key} is ready: frozen from {} prompt tokens ({:.2} GB of cached state). Ask it with goldfish {{\"expert\": \"{}\", ...}}.",
                                  r["prompt_tokens"].as_u64().unwrap_or(0), r["bytes"].as_u64().unwrap_or(0) as f64 / 1e9, key.split('@').next().unwrap_or("")),
                 Err(e) => format!("Expert {key} is registered, but freezing it failed ({e:#}); a goldfish born from it reads it instead."),
             };
-            if let Some(d) = deliver.get() {
-                d(Event { id: format!("commission-{call_id}"), thread, due_ms: 0, created_ms: 0, attempts: 0,
-                          kind: EventKind::ToolResult { call: call_id, provider_call_id: provider, text, images: vec![] } });
-            }
+            result(text);
         });
-        Ok(())
     }
 
     /// The error result a failed goldfish owes its elephant, if the thread is one.
@@ -1033,6 +1060,8 @@ mod tests {
         assert!(is_context_overflow("http://n:5300 answered 400 Bad Request: {\"error\":{\"message\":\"the prompt is 267832 tokens; the context holds 262144\"}}"));
         assert!(is_context_overflow("This model's maximum context length is 262144 tokens"));
         assert!(!is_context_overflow("400 Bad Request: unknown field tool_choice"));
+        assert!(is_context_overflow("the request exceeds the available context size, try increasing it"));
+        assert!(!is_context_overflow("400 Bad Request: max_tokens must be under the context length in tokens"));
     }
 
     #[test]

@@ -19,7 +19,7 @@ model with two slots and a 262,144-token context. The pod's work cards run as Fr
 thread per card round and watches it, pod-hands is the tool server the threads call, and the board decides what
 runs. FreeFitty replaced the freefinity stack on 2026-11-07: hydro-project/infinity's AWS durable mode on stand-ins
 (ElasticMQ, moto, dynalite, Postgres, two Lambda emulators, a Python bridge, a Python router, fourteen containers).
-What those did that mattered is here, in about 4,100 lines: a queue with due times instead of SQS, delay queues and
+What those did that mattered is here, in about 6,400 lines: a queue with due times instead of SQS, delay queues and
 a scheduler; one [redb](https://github.com/cberner/redb) file instead of DynamoDB and Postgres; the nodes' own slot
 counts instead of hand-sized worker replicas; one process instead of a bridge, a relay, a clock, an outbox, a
 receiver, a callback service and a model router; a unit instead of rootless podman.
@@ -274,6 +274,11 @@ which answer once and are gone. Three built-ins make that general:
 - `commission_expert {name, description, reads, ack?, tools?, steer?}` registers a new expert at once, writes its
   definition to `experts_dir` with the commissioning thread named, and freezes it; the elephant sleeps until the
   freeze ends and wakes to the expert's name and version.
+
+The paths a model names (a goldfish's `documents`, a commission's `reads`) are resolved, symlinks and `..` included,
+and read only under `read_roots` (empty, the default: no files at all). FreeFitty's own data, park and config
+directories stay closed whatever `read_roots` says, since the config holds both tokens; expert definitions in
+`experts_dir` stay readable. Files the operator names (definitions, prompt files) are not checked.
 
 A goldfish sees and may call only the plain built-ins (the sleeps, `recall`, `refocus`, `experts`) and the tools
 it was granted: the call's `tools`, else its expert's `tools = [...]`, else none. An expert's tool list is part of

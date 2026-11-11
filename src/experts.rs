@@ -161,25 +161,35 @@ pub fn read_docs(reads: &[Read], max_file: usize) -> Result<Vec<(Option<String>,
     Ok(docs)
 }
 
-/// An expert an elephant commissioned; its definition is written to `experts_dir` (when set) so it survives
-/// a restart, with who commissioned it.
-pub fn commission(cfg: &Config, name: &str, description: &str, ack: Option<&str>, reads: &[Read], tools: Vec<String>, steer: Vec<Steer>, steer_scope: Option<&str>, by: &str) -> Result<Expert> {
+/// An expert an elephant commissioned, and its definition for `experts_dir` (when set; `write_definition`) so it
+/// survives a restart, with who commissioned it. Nothing is written here: the slice has not committed yet.
+pub fn commission(cfg: &Config, name: &str, description: &str, ack: Option<&str>, reads: &[Read], tools: Vec<String>, steer: Vec<Steer>, steer_scope: Option<&str>, by: &str) -> Result<(Expert, Option<(std::path::PathBuf, String)>)> {
     if !name_ok(name) { bail!("expert names are 1-64 of [A-Za-z0-9._-]"); }
     if reads.is_empty() { bail!("an expert needs something to read"); }
+    let reads = reads.iter().map(|r| Ok(Read { path: r.path.as_deref().map(|p| cfg.model_read(p)).transpose()?.map(|p| p.display().to_string()), text: r.text.clone() }))
+        .collect::<Result<Vec<_>>>()?;
+    let reads = reads.as_slice();
     let docs = read_docs(reads, 1 << 20)?;
     let ack = ack.map(str::to_owned).unwrap_or_else(default_ack);
     let scope = steer_scope_of(steer_scope, &steer)?;
     let e = build(name, description, &ack, &docs, Some(tools.clone()), steer_field(&steer), scope.clone(), None);
+    let mut definition = None;
     if let Some(dir) = &cfg.experts_dir {
         let path = dir.join(format!("{name}.toml"));
         if path.exists() { bail!("an expert definition named {name} exists already"); }
         #[derive(serde::Serialize)]
         struct Def<'a> { description: &'a str, ack: &'a str, tools: &'a [String], reads: &'a [Read], #[serde(skip_serializing_if = "<[Steer]>::is_empty")] steer: &'a [Steer], #[serde(skip_serializing_if = "Option::is_none")] steer_scope: Option<&'a str> }
         let body = toml::to_string(&Def { description, ack: &ack, tools: &tools, reads, steer: &steer, steer_scope: scope.as_deref() })?;
-        std::fs::write(&path, format!("# commissioned by thread {by} on {}\n{body}", chrono::Utc::now().to_rfc3339()))
-            .with_context(|| format!("writing {}", path.display()))?;
+        definition = Some((path, format!("# commissioned by thread {by} on {}\n{body}", chrono::Utc::now().to_rfc3339())));
     }
-    Ok(e)
+    Ok((e, definition))
+}
+
+/// Write a commissioned expert's definition, refusing one that appeared since it was checked.
+pub fn write_definition((path, text): &(std::path::PathBuf, String)) -> Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path).with_context(|| format!("writing {}", path.display()))?;
+    f.write_all(text.as_bytes()).with_context(|| format!("writing {}", path.display()))
 }
 
 fn load_file(path: &std::path::Path) -> Result<Expert> {

@@ -236,6 +236,9 @@ pub struct Commit<'a> {
     pub replies: Vec<(String, Option<String>, String, Value)>,
     pub events: Vec<Event>,
     pub invocations: Vec<Invocation>,
+    /// Threads the slice starts (its goldfish), made in the same transaction as their first events: a slice that
+    /// fails or is cancelled before its commit leaves none behind.
+    pub new_threads: Vec<(String, ThreadMeta)>,
 }
 
 pub struct Store {
@@ -641,6 +644,9 @@ impl Store {
                 let r = Reply { seq, thread: c.thread.to_owned(), text, reply_to, kind, metadata: extra, created_ms: now_ms() };
                 replies.insert(seq, enc(&r).as_slice())?;
                 new_replies.push(seq);
+            }
+            for (t, tm) in &c.new_threads {
+                if threads.get(t.as_str())?.is_none() { threads.insert(t.as_str(), enc(tm).as_slice())?; }
             }
             for mut ev in c.events {
                 let seq = Self::next_seq(&mut meta)?;
