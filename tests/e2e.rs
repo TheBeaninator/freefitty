@@ -1603,3 +1603,27 @@ async fn a_late_result_does_not_start_a_turn_while_the_newest_call_is_out() {
     }
     r.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_reply_is_sampled_with_a_seed_a_replay_can_recompute() {
+    // strixite gives an unseeded request a random seed, so a recorded reply could not be reproduced (2026-11-11)
+    let h = harness().await;
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.say("hello", Some("s")).await;
+    api.output("s", 10).await.unwrap();
+    api.say("again", Some("s")).await;
+    api.output("s", 10).await.unwrap();
+    let bodies = h.model.bodies.lock().unwrap().clone();
+    let mine: Vec<&Value> = bodies.iter().filter(|b| b["messages"].as_array().unwrap().iter().any(|m| m["content"] == "hello")).collect();
+    assert_eq!(mine.len(), 2);
+    let stored = api.get("/threads/s/messages").await;
+    let stored = stored.as_array().unwrap();
+    // each request's seed is the one derived from where its reply was stored
+    for (b, want_index) in mine.iter().zip([1u64, 3]) {
+        assert_eq!(stored[want_index as usize]["role"], "assistant");
+        assert_eq!(b["seed"], json!(freefitty::engine::turn_seed("s", want_index)), "{}", b["seed"]);
+    }
+    assert_ne!(mine[0]["seed"], mine[1]["seed"]);
+    r.shutdown().await;
+}

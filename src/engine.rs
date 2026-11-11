@@ -435,6 +435,9 @@ impl Engine {
         loop {
             rounds += 1;
             let r = restore.take();
+            // the seed the node samples this reply with, from where the reply will be stored: a replay of the stored
+            // transcript sends the same seed, so a recorded turn can be reproduced (a node picks a random one without it)
+            body["seed"] = json!(turn_seed(thread, (history.len() + new_messages.len()) as u64));
             let turn = match self.router.chat_restoring(Some(thread), meta.node.as_deref(), &body, r.as_deref()).await {
                 Ok(t) => t,
                 // the node says the prompt does not fit. With the window on and the node's own count in the message,
@@ -1067,6 +1070,12 @@ fn wake(thread: &str, call: &Call, due_ms: u64, text: String) -> Event {
 /// The assistant message as stored and resent: role, content, tool_calls with arguments that always render
 /// (a model sometimes JSON-encodes them twice, or writes a bare value; a node refuses the whole thread then).
 /// Reasoning is dropped: it is not resent.
+/// The sampling seed of the reply stored at `index` in `thread`'s history: derived, so nothing is stored for it and a
+/// replay of the transcript recomputes it. 31 bits: every node takes it as a plain integer.
+pub fn turn_seed(thread: &str, index: u64) -> u64 {
+    u64::from_str_radix(&rap::short_hash(&format!("{thread}\u{0}{index}"))[..8], 16).unwrap_or(0) & 0x7fff_ffff
+}
+
 /// How many assistant turns in a row, newest first, made exactly the calls `this` makes (names and arguments,
 /// in any order). Tool results and other messages between them do not break the run; a turn with other calls,
 /// or with none, does.

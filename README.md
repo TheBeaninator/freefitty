@@ -173,6 +173,8 @@ first line of each output names the tool's version; `/health` shows it, and `fre
 again and marks the ones whose output changed (a tool upgraded: restart to hoist it). Any change to the prompt is
 one cache miss for every thread and a refreeze of every expert.
 
+Every request carries a sampling `seed` derived from the thread and the index its reply is stored at (`engine::turn_seed`), so a replay of a stored transcript samples each turn with the same seed; a node picks a random one without it.
+
 Every turn records the instructions it ran under: the id (a hash of the system prompt and the thread's tool
 definitions, the same one an expert's frozen context carries) goes on the thread where it changes (`GET
 /threads/{id}` `instructions`: [message index, id] pairs), and the text is kept once in
