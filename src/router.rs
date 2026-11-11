@@ -628,6 +628,11 @@ impl Router {
         &self.cfg.model
     }
 
+    /// The fewest tokens an export from `node` must cover for a `prompt_tokens`-token prompt (config min_cover).
+    pub fn min_cover(&self, node: &str, prompt_tokens: u64) -> u64 {
+        self.cfg.min_cover(node, prompt_tokens)
+    }
+
     /// Whether requests of `model` carry `shared_messages` (config `node_meta` shared_messages).
     pub fn takes_shared_messages(&self, model: &str) -> bool {
         self.cfg.takes_shared_messages(model)

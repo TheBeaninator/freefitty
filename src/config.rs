@@ -29,7 +29,9 @@ pub struct Config {
     /// `down_wait_s` (how long a turn of its model waits while every node serving that model is down; default
     /// `node_down_wait_s`: the StrixFold pair goes down on purpose for card windows and takes minutes to load), and
     /// `shared_messages = true` (the node takes a request's `shared_messages`: a thread born from an expert names its
-    /// shared prefix, which StrixFold keeps as a shared state and, with --learn, on disk across restarts).
+    /// shared prefix, which StrixFold keeps as a shared state and, with --learn, on disk across restarts), and
+    /// `keep_step` (the node keeps states only at multiples of it, StrixFold's 2048-row chunk ends: an export may
+    /// cover that many fewer tokens than the prompt and still be the thread's state, parked or frozen).
     #[serde(default)]
     pub node_meta: std::collections::HashMap<String, NodeMeta>,
     /// Slots a node is assumed to have while its /health does not say.
@@ -237,6 +239,8 @@ pub struct NodeMeta {
     pub down_wait_s: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_messages: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_step: Option<u64>,
 }
 
 impl Config {
@@ -251,6 +255,13 @@ impl Config {
     pub fn takes_shared_messages(&self, model: &str) -> bool {
         let mut serving = self.nodes.iter().filter(|u| self.node_model(u) == model).peekable();
         serving.peek().is_some() && serving.all(|u| self.node_meta.get(u.as_str()).and_then(|m| m.shared_messages) == Some(true))
+    }
+
+    /// The fewest tokens an export of a `prompt_tokens`-token prompt from `node` must cover to be that prompt's own
+    /// state (not the system prompt's): all but the last message's few tokens, less the node's keep_step.
+    pub fn min_cover(&self, node: &str, prompt_tokens: u64) -> u64 {
+        let step = self.node_meta.get(node).and_then(|m| m.keep_step).unwrap_or(0);
+        prompt_tokens.saturating_sub(64 + step)
     }
 
     /// The model a node serves: its `node_meta` model, else `model`.
@@ -375,5 +386,14 @@ mod tests {
         assert_eq!(c.down_wait_s("dsv41"), 900);
         assert_eq!(c.down_wait_s(&c.model.clone()), 120, "the default model keeps node_down_wait_s");
         assert_eq!(c.down_wait_s("other"), 120);
+    }
+
+    #[test]
+    fn a_node_that_keeps_at_chunk_ends_covers_up_to_a_chunk_less() {
+        let mut c = Config { nodes: vec!["http://a:1".into(), "http://f:2".into()], ..Config::default() };
+        c.node_meta.insert("http://f:2".into(), NodeMeta { keep_step: Some(2048), ..Default::default() });
+        assert_eq!(c.min_cover("http://a:1", 70_000), 69_936);
+        assert_eq!(c.min_cover("http://f:2", 70_000), 67_888);
+        assert_eq!(c.min_cover("http://f:2", 100), 0);
     }
 }

@@ -563,7 +563,7 @@ impl Engine {
         }
         let node = meta.node.clone();
         let closed = meta.closed.is_some();
-        let covered = meta.prompt_tokens.saturating_sub(64);
+        let covered = meta.node.as_deref().map_or(meta.prompt_tokens.saturating_sub(64), |n| self.cfg.min_cover(n, meta.prompt_tokens));
         self.store.commit(Commit { thread, meta, messages: new_messages, done, done_ids, replies, events, invocations })?;
         if let Some(p) = &self.parking {
             // the node's cache is newer than any parked copy from here on, including one whose write began
