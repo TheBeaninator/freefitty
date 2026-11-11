@@ -274,6 +274,10 @@ which answer once and are gone. Three built-ins make that general:
 - `commission_expert {name, description, reads, ack?, tools?, steer?}` registers a new expert at once, writes its
   definition to `experts_dir` with the commissioning thread named, and freezes it; the elephant sleeps until the
   freeze ends and wakes to the expert's name and version.
+- An expert whose definition has a `[tool]` table (`name`, `description`, JSON-schema `parameters`, `ask?`) answers
+  that tool: every thread sees it beside the other tools, and a call to it is a goldfish of the expert briefed with
+  the call's arguments, whose answer returns as the result. A ToolBox tool of the same name wins; a goldfish cannot
+  call one.
 
 The paths a model names (a goldfish's `documents`, a commission's `reads`) are resolved, symlinks and `..` included,
 and read only under `read_roots` (empty, the default: no files at all). FreeFitty's own data, park and config

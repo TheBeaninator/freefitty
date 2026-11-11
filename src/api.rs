@@ -351,6 +351,7 @@ async fn compact(State(app): Shared, headers: HeaderMap, Path(id): Path<String>,
 async fn freeze_in_background(app: &Arc<App>) {
     let mut defs = rap::builtin_defs(app.cfg.compaction, app.cfg.window);
     defs.extend(app.tools.current().await.defs.iter().cloned());
+    let defs = app.experts.with_tools(defs).await;
     let app = app.clone();
     tokio::spawn(async move {
         app.experts.freeze_all(&app.store, &app.router, &app.engine.system, &defs, app.cfg.max_output_tokens).await;
@@ -361,6 +362,7 @@ async fn experts_list(State(app): Shared, headers: HeaderMap) -> Response {
     if let Err(r) = operator(&app, &headers) { return *r; }
     let mut defs = rap::builtin_defs(app.cfg.compaction, app.cfg.window);
     defs.extend(app.tools.current().await.defs.iter().cloned());
+    let defs = app.experts.with_tools(defs).await;
     let ctx = experts::context(&app.engine.system, &defs);
     let current = app.experts.current.read().await.clone();
     let threads = app.store.threads().unwrap_or_default();
@@ -390,6 +392,7 @@ async fn experts_warm(State(app): Shared, headers: HeaderMap, Path(name): Path<S
     if let Err(r) = operator(&app, &headers) { return *r; }
     let mut defs = rap::builtin_defs(app.cfg.compaction, app.cfg.window);
     defs.extend(app.tools.current().await.defs.iter().cloned());
+    let defs = app.experts.with_tools(defs).await;
     match app.experts.warm(&name, &app.store, &app.router, &app.engine.system, &defs, app.cfg.max_output_tokens).await {
         Ok(nodes) => Json(json!({"expert": name, "nodes": nodes})).into_response(),
         Err(e) => err(StatusCode::NOT_FOUND, &e.to_string()),

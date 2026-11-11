@@ -43,6 +43,11 @@ const PLAIN: [&str; 6] = [SLEEP, SLEEP_UNTIL, SLEEP_UNTIL_EVENT, REFOCUS, RECALL
 /// Built-ins a goldfish never has, whatever it was granted: it suggests a goldfish to its elephant instead.
 pub const ELEPHANT_ONLY: [&str; 2] = [GOLDFISH, COMMISSION];
 
+/// A name FreeFitty answers itself, whatever the ToolBox and the experts define.
+pub fn is_builtin(name: &str) -> bool {
+    PLAIN.contains(&name) || ELEPHANT_ONLY.contains(&name)
+}
+
 /// The definitions a thread with this tool list sees: the plain built-ins and the named tools; None = all.
 pub fn scope_defs(defs: Vec<Value>, allow: Option<&[String]>) -> Vec<Value> {
     let Some(allow) = allow else { return defs };

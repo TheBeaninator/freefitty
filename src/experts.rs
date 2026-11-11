@@ -23,6 +23,11 @@
 //! pair); unset = the config's `model`. A node that cannot export state (StrixFold today) is not frozen on: the
 //! thread reads the expert there, and the node's own prompt cache serves the next thread born from it.
 //!
+//! `[tool]` makes the expert answer a tool: `name`, `description` and JSON-schema `parameters` define a tool every
+//! thread sees beside the others, and a call to it is a goldfish of this expert with the call's arguments as its brief
+//! (`ask`, optional: what the answer must look like). To the caller it is one more tool with a result; behind it is
+//! a model that has read what the expert read. A ToolBox tool of the same name wins, and a goldfish cannot call one.
+//!
 //! Or frozen from a thread's focal point: its latest refocus notes become what the expert has read.
 //! Versions are stored by content hash and never pruned: a thread keeps the bytes it was born with when a
 //! file changes. The system prompt is not part of the stored expert, so a prompt edit changes every thread
@@ -61,6 +66,38 @@ struct Definition {
     /// The model the expert and its threads run on; unset = the config's `model`.
     #[serde(default)]
     model: Option<String>,
+    /// A tool this expert answers (see the module docs).
+    #[serde(default)]
+    tool: Option<ToolSpec>,
+}
+
+/// A tool answered by a goldfish of an expert: looks like any tool to the caller.
+#[derive(Deserialize, Clone, Debug)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    #[serde(default = "no_parameters")]
+    pub parameters: Value,
+    /// What the answer must look like; unset = the result only, in the shape the description promises.
+    #[serde(default)]
+    pub ask: Option<String>,
+}
+
+fn no_parameters() -> Value {
+    json!({"type": "object", "properties": {}})
+}
+
+impl ToolSpec {
+    pub fn def(&self) -> Value {
+        json!({"type": "function", "function": {"name": self.name, "description": self.description, "parameters": self.parameters}})
+    }
+
+    /// The goldfish's brief for one call.
+    pub fn brief(&self, args: &Value) -> String {
+        let args = serde_json::to_string_pretty(args).unwrap_or_default();
+        let ask = self.ask.as_deref().unwrap_or("Answer as the tool's result: what was asked for, in the shape its description promises, with no preamble and nothing after it.");
+        format!("You are answering a call to the tool `{}` ({}). Its arguments:\n{args}\n\n{ask}", self.name, self.description)
+    }
 }
 
 /// A definition's `steer_scope`, checked: None (= "all") or Some("prefix").
@@ -192,13 +229,18 @@ pub fn write_definition((path, text): &(std::path::PathBuf, String)) -> Result<(
     f.write_all(text.as_bytes()).with_context(|| format!("writing {}", path.display()))
 }
 
-fn load_file(path: &std::path::Path) -> Result<Expert> {
+fn load_file(path: &std::path::Path) -> Result<(Expert, Option<ToolSpec>)> {
     let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_owned();
     if !name_ok(&name) { bail!("{}: expert names are 1-64 of [A-Za-z0-9._-]", path.display()); }
     let def: Definition = toml::from_str(&std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?).with_context(|| format!("parsing {}", path.display()))?;
     let docs = read_docs(&def.reads, usize::MAX).with_context(|| path.display().to_string())?;
     let scope = steer_scope_of(def.steer_scope.as_deref(), &def.steer).with_context(|| path.display().to_string())?;
-    Ok(build(&name, &def.description, &def.ack, &docs, def.tools, steer_field(&def.steer), scope, def.model))
+    if let Some(t) = &def.tool {
+        if !name_ok(&t.name) || t.name.contains('.') { bail!("{}: a tool name is 1-64 of [A-Za-z0-9_-]", path.display()); }
+        if rap::is_builtin(&t.name) { bail!("{}: {} is a built-in tool", path.display(), t.name); }
+        if t.parameters.get("type").and_then(|x| x.as_str()) != Some("object") { bail!("{}: tool parameters must be a JSON schema of type object", path.display()); }
+    }
+    Ok((build(&name, &def.description, &def.ack, &docs, def.tools, steer_field(&def.steer), scope, def.model), def.tool))
 }
 
 /// An expert whose reading is a thread's focal point: its latest refocus notes.
@@ -230,6 +272,8 @@ fn bodies(e: &Expert, system: &str, defs: &[Value], model: &str, max_tokens: u64
 /// The experts by name, each at its current version key ("name@hash"), and where their frozen state lives.
 pub struct Experts {
     pub current: RwLock<HashMap<String, String>>,
+    /// The tools experts answer, by tool name: (expert name, spec).
+    tools: RwLock<HashMap<String, (String, ToolSpec)>>,
     state_dir: Option<PathBuf>,
     freezing: std::sync::Mutex<HashSet<PathBuf>>,
 }
@@ -239,7 +283,7 @@ impl Experts {
         if let Some(d) = &state_dir {
             if let Err(e) = std::fs::create_dir_all(d) { tracing::warn!("experts: state directory {}: {e}", d.display()); }
         }
-        Arc::new(Experts { current: RwLock::new(HashMap::new()), state_dir, freezing: Default::default() })
+        Arc::new(Experts { current: RwLock::new(HashMap::new()), tools: Default::default(), state_dir, freezing: Default::default() })
     }
 
     fn state_path(&self, key: &str, ctx: &str) -> Option<PathBuf> {
@@ -317,18 +361,26 @@ impl Experts {
     pub async fn load(&self, cfg: &Config, store: &Store) -> Result<Vec<String>> {
         let Some(dir) = &cfg.experts_dir else { return Ok(vec![]) };
         let mut names = Vec::new();
+        let mut tools: HashMap<String, (String, ToolSpec)> = HashMap::new();
         let mut entries: Vec<_> = std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "toml")).collect();
         entries.sort();
         for path in entries {
             match load_file(&path) {
-                Ok(e) => {
+                Ok((e, tool)) => {
                     let key = store.save_expert(&e)?;
                     self.current.write().await.insert(e.name.clone(), key);
+                    if let Some(t) = tool {
+                        match tools.get(&t.name) {
+                            Some((other, _)) => tracing::warn!("experts: {} and {other} both answer the tool {}; {other} keeps it", e.name, t.name),
+                            None => { tools.insert(t.name.clone(), (e.name.clone(), t)); }
+                        }
+                    }
                     names.push(e.name);
                 }
                 Err(err) => tracing::warn!("experts: {err:#}"),
             }
         }
+        *self.tools.write().await = tools;
         Ok(names)
     }
 
@@ -344,6 +396,7 @@ impl Experts {
         cur.sort();
         if cur.is_empty() { return "No experts yet. commission_expert makes one.".into(); }
         let mut out = String::from("Experts (ask one with goldfish {expert, question}):\n");
+        let answers = self.tools.read().await.clone();
         for (name, key) in cur {
             let e = store.expert(&key).ok().flatten();
             let desc = e.as_ref().map(|e| e.description.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| "(no description)".into());
@@ -358,9 +411,26 @@ impl Experts {
                 None => "no tools as a goldfish".to_owned(),
             };
             let on = e.as_ref().and_then(|e| e.model.as_deref()).map(|m| format!("; runs on {m}")).unwrap_or_default();
-            out.push_str(&format!("- {name}: {desc} ({tools}{steer}{on})\n"));
+            let answers = answers.iter().filter(|(_, (n, _))| n == &name).map(|(t, _)| format!("; answers the tool {t}")).collect::<String>();
+            out.push_str(&format!("- {name}: {desc} ({tools}{steer}{on}{answers})\n"));
         }
         out
+    }
+
+    /// `defs` (the built-ins and the ToolBox's) and after them the tools experts answer, in name order; one whose
+    /// name is taken already stays out, as the dispatch gives that name to the tool already there.
+    pub async fn with_tools(&self, mut defs: Vec<Value>) -> Vec<Value> {
+        let taken: HashSet<String> = defs.iter().filter_map(|d| d.pointer("/function/name").and_then(|n| n.as_str()).map(str::to_owned)).collect();
+        let tools = self.tools.read().await;
+        let mut mine: Vec<&ToolSpec> = tools.values().map(|(_, t)| t).filter(|t| !taken.contains(&t.name)).collect();
+        mine.sort_by(|a, b| a.name.cmp(&b.name));
+        defs.extend(mine.into_iter().map(ToolSpec::def));
+        defs
+    }
+
+    /// The expert that answers the tool `name`, and its spec.
+    pub async fn tool(&self, name: &str) -> Option<(String, ToolSpec)> {
+        self.tools.read().await.get(name).cloned()
     }
 
     pub async fn key(&self, name: &str) -> Option<String> {
@@ -398,5 +468,21 @@ impl Experts {
         }
         tracing::info!("expert {name}: warmed on {} node(s)", out.len());
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_expert_tool_needs_a_free_name_and_an_object_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, tool: &str| { let p = dir.path().join(format!("{name}.toml")); std::fs::write(&p, format!("description = \"x\"\n[tool]\n{tool}")).unwrap(); p };
+        let (_, t) = load_file(&file("ok", "name = \"look_up\"\ndescription = \"d\"\n")).unwrap();
+        assert_eq!(t.unwrap().def()["function"]["parameters"]["type"], "object", "no parameters = an empty object");
+        assert!(format!("{:#}", load_file(&file("b", "name = \"goldfish\"\ndescription = \"d\"\n")).unwrap_err()).contains("built-in"));
+        assert!(load_file(&file("c", "name = \"x\"\ndescription = \"d\"\nparameters = { type = \"string\" }\n")).is_err());
+        assert!(load_file(&file("d", "name = \"a.b\"\ndescription = \"d\"\n")).is_err());
     }
 }

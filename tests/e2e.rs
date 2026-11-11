@@ -110,6 +110,8 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
         gf_call("railhand", q)
     } else if let Some(q) = content.strip_prefix("askr2 ").filter(|_| last["role"] == "user") {
         gf_call("rail2", q)
+    } else if let Some(q) = content.strip_prefix("lookup ").filter(|_| last["role"] == "user") {
+        json!({"role": "assistant", "content": null, "tool_calls": [{"id": format!("call_l{}", msgs.len()), "type": "function", "function": {"name": "rail_lookup", "arguments": json!({"topic": q}).to_string()}}]})
     } else if content == "askbad" {
         gf_call("nobody", "x")
     } else if let Some(n) = content.strip_prefix("flaky ").filter(|_| last["role"] == "user") {
@@ -1004,6 +1006,38 @@ async fn elephants_find_ask_and_commission_goldfish() {
     let out = api.output("el", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
     assert!(out.contains("echo") && !out.contains("goldfish,") && out.ends_with("): what is C"), "{out}");
     assert!(h.model.imports.lock().unwrap().len() >= 1, "the goldfish was born into the frozen expert");
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expert_answers_a_tool_through_a_goldfish() {
+    let mut h = harness().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("railhand.toml"), concat!("description = \"knows the rail\"\nack = \"Read.\"\n[[reads]]\ntext = \"B is .51\"\n",
+        "[tool]\nname = \"rail_lookup\"\ndescription = \"The address of a rail node\"\nask = \"Answer with the address only.\"\n",
+        "[tool.parameters]\ntype = \"object\"\nrequired = [\"topic\"]\n[tool.parameters.properties.topic]\ntype = \"string\"\n")).unwrap();
+    h.cfg.experts_dir = Some(dir.path().to_path_buf());
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.say("catalog", Some("el")).await;
+    let out = api.output("el", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.contains("- railhand: knows the rail (no tools as a goldfish; answers the tool rail_lookup)"), "{out}");
+    // to the elephant it is one more tool; behind it a goldfish of the expert reads the call's arguments
+    api.say("lookup what is B", Some("el")).await;
+    assert!(api.output("el", 10).await.unwrap()["text"].as_str().unwrap().contains("[Tool Call: rail_lookup"));
+    let out = api.output("el", 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+    assert!(out.starts_with("done: fish(tools=") && out.ends_with("): Answer with the address only."), "{out}");
+    let bodies = h.model.bodies.lock().unwrap().clone();
+    let el = bodies.iter().find(|b| b["messages"].as_array().unwrap().last().unwrap()["content"] == "lookup what is B").unwrap();
+    let def = el["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "rail_lookup").expect("the elephant is offered the tool");
+    assert_eq!(def["function"]["parameters"]["required"], json!(["topic"]));
+    let fish = bodies.iter().find(|b| b["messages"].as_array().unwrap().last().unwrap()["content"].as_str().is_some_and(|c| c.starts_with("You are a goldfish") && c.contains("`rail_lookup`"))).cloned().unwrap();
+    let brief = fish["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_owned();
+    assert!(brief.contains("\"topic\": \"what is B\""), "{brief}");
+    assert!(fish["messages"][1]["content"].as_str().unwrap().contains("B is .51"), "born from the expert");
+    assert!(fish["tools"].as_array().unwrap().iter().all(|t| t["function"]["name"] != "rail_lookup"), "a goldfish is not offered it");
+    let threads = api.get("/threads").await;
+    assert_eq!(threads.as_array().unwrap().iter().filter(|t| t["thread"].as_str().unwrap().starts_with("el.gf-railhand-")).count(), 1);
     r.shutdown().await;
 }
 

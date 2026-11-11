@@ -111,6 +111,7 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let mut defs = rap::builtin_defs(cfg2.compaction, cfg2.window);
             defs.extend(tools2.current().await.defs.iter().cloned());
+            let defs = experts2.with_tools(defs).await;
             experts2.freeze_all(&store2, &router2, &engine2.system, &defs, cfg2.max_output_tokens).await;
             for name in &cfg2.warm_on_start {
                 match experts2.warm(name, &store2, &router2, &engine2.system, &defs, cfg2.max_output_tokens).await {

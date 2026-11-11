@@ -263,6 +263,7 @@ impl Engine {
         let tools = self.tools.current().await;
         let mut defs = rap::builtin_defs(self.cfg.compaction, self.cfg.window);
         defs.extend(tools.defs.iter().cloned());
+        let defs = self.experts.with_tools(defs).await;
         // a thread born with a tool list (a goldfish, an expert that declares one) sees and may call only those
         let defs = rap::scope_defs(defs, meta.tools.as_deref());
         let allowed: std::collections::HashSet<String> = defs.iter().filter_map(|d| d.pointer("/function/name").and_then(|n| n.as_str()).map(str::to_owned)).collect();
@@ -519,7 +520,25 @@ impl Engine {
                             meta.pending.push(call.pending());
                             reply_text.push_str(&format!("\n[Tool Call: {name} with arguments {}]", call.args));
                         }
-                        None => unknown.push(call.clone()),
+                        None => match self.experts.tool(name).await.filter(|_| allowed.contains(name)) {
+                            // a tool an expert answers: a goldfish of it, briefed with the call's arguments
+                            Some((expert, spec)) if meta.goldfish_of.is_none() => {
+                                let ask = Call { args: json!({"expert": expert, "question": spec.brief(&call.args)}), ..call.clone() };
+                                match self.goldfish(thread, &ask).await {
+                                    Ok((child_meta, first)) => {
+                                        tracing::info!("{thread}: {name} goes to goldfish {}", first.thread);
+                                        new_threads.push((first.thread.clone(), child_meta));
+                                        events.push(first);
+                                        meta.pending.push(call.pending());
+                                        asked += 1;
+                                        reply_text.push_str(&format!("\n[Tool Call: {name} with arguments {}]", call.args));
+                                    }
+                                    Err(e) => recalled.push((call.clone(), format!("Error: {e:#}"))),
+                                }
+                            }
+                            Some((expert, _)) => recalled.push((call.clone(), format!("Error: {name} is answered by a goldfish of the expert {expert}, and a goldfish cannot ask one; say in your answer that {name} should be called"))),
+                            None => unknown.push(call.clone()),
+                        },
                     },
                 }
             }
@@ -721,6 +740,7 @@ impl Engine {
         // not the commissioning thread's, which may be scoped)
         let mut full = rap::builtin_defs(self.cfg.compaction, self.cfg.window);
         full.extend(self.tools.current().await.defs.iter().cloned());
+        let full = self.experts.with_tools(full).await;
         let scoped = rap::scope_defs(full, e.tools.as_deref());
         let (experts, store, router, system, max) = (self.experts.clone(), self.store.clone(), self.router.clone(), self.system.clone(), self.cfg.max_output_tokens);
         tokio::spawn(async move {
@@ -778,7 +798,7 @@ impl Engine {
         let p = prefix(&self.system, &self.store, &meta).ok()?;
         let mut defs = rap::builtin_defs(self.cfg.compaction, self.cfg.window);
         defs.extend(self.tools.current().await.defs.iter().cloned());
-        let defs = rap::scope_defs(defs, meta.tools.as_deref());
+        let defs = rap::scope_defs(self.experts.with_tools(defs).await, meta.tools.as_deref());
         let mut messages = live_view(&p, &meta, &history, &meta.pending, self.page_min());
         self.fade(&mut messages, &meta, &history);
         let mut body = json!({"model": self.model_of(&meta), "messages": messages, "tools": defs, "max_tokens": self.cfg.max_output_tokens, "stream": false});
