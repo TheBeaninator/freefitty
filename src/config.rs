@@ -81,9 +81,13 @@ pub struct Config {
     /// ... keeping the newest this many.
     #[serde(default = "d_backup_keep")]
     pub backup_keep: usize,
-    /// The park directory's cap; the oldest files go first.
+    /// The park directory's cap, a backstop like `expert_states_max_gib`: the least recently used go first.
     #[serde(default = "d_park_gib")]
     pub park_max_gib: u64,
+    /// The cap on frozen expert states (`<data_dir>/experts/*.kv`), a backstop: superseded states go first
+    /// (see `Engine::prune_states`), and only if the rest are over this do the least recently used go.
+    #[serde(default = "d_expert_gib")]
+    pub expert_states_max_gib: u64,
     /// A command that says whether a node may take work now, run every `grant_check_s` per node with `{node}`
     /// replaced by its URL: exit 1 = held (no new, spilled or moved threads; a thread living there leaves at its
     /// next turn), anything else = free. Empty = every node is free.
@@ -223,6 +227,7 @@ fn d_backup_every() -> u64 { 24 }
 fn d_backup_keep() -> usize { 7 }
 fn d_steer_scale() -> f64 { 8.0 }
 fn d_park_gib() -> u64 { 64 }
+fn d_expert_gib() -> u64 { 32 }
 fn d_keep_images() -> usize { 4 }
 fn d_grant_check() -> u64 { 5 }
 fn d_toolset_refresh() -> u64 { 300 }

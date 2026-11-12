@@ -139,6 +139,19 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
         f.notify_one();
     }));
 
+    // saved states that can never be used again go, at start and hourly (Engine::prune_states)
+    {
+        let engine = engine.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut at_start = true;
+            loop {
+                engine.prune_states(at_start).await;
+                at_start = false;
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        }));
+    }
+
     // snapshots of the store, newest backup_keep kept: one at start when the newest is older than the interval
     if cfg.backup_every_h > 0 {
         let (s, dir, every, keep) = (store.clone(), cfg.data_dir.join("backups"), cfg.backup_every_h * 3600, cfg.backup_keep.max(1));

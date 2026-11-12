@@ -424,7 +424,7 @@ impl Engine {
         // node takes the turn; not frozen for this context yet, it is frozen now for the next thread
         if let (None, None, Some(key)) = (&restore, &meta.node, &meta.expert) {
             let ctx = crate::experts::context(&self.system, &defs);
-            restore = self.experts.state(key, &ctx);
+            restore = self.experts.use_state(key, &ctx);
             if restore.is_none() {
                 let (experts, store, router, system, defs, key, max) = (self.experts.clone(), self.store.clone(), self.router.clone(), self.system.clone(), defs.clone(), key.clone(), self.cfg.max_output_tokens);
                 tokio::spawn(async move {
@@ -863,7 +863,7 @@ impl Engine {
                 Ok(Some(n)) => {
                     if unchanged(&engine) {
                         tracing::info!("{thread}: parked its cached state from {node} ({:.1} GB in {:.1}s)", n as f64 / 1e9, t.elapsed().as_secs_f64());
-                        park.prune();
+                        park.prune(|_, _| false);
                     } else {
                         park.forget(&thread);  // a turn ran while it was written
                     }
@@ -872,6 +872,64 @@ impl Engine {
                 Err(e) => tracing::warn!("{thread}: parking its state from {node} failed: {e:#}"),
             }
         });
+    }
+
+    /// A hash of what renders before every saved state's own messages: the system prompt and the full tool set.
+    async fn context_hash(&self) -> String {
+        let mut defs = rap::builtin_defs(self.cfg.compaction, self.cfg.window);
+        defs.extend(self.tools.current().await.defs.iter().cloned());
+        let defs = self.experts.with_tools(defs).await;
+        rap::short_hash(&format!("{}\u{0}{}", self.system, serde_json::to_string(&defs).unwrap_or_default()))
+    }
+
+    /// Keep the saved states (frozen experts, parked threads) to what can still be used; run at start and hourly.
+    /// A state is made under one system prompt and tool set, and when either changes it can never be imported
+    /// again. `<data_dir>/state-epoch.json` holds since when the current pair has held: a state not written or
+    /// used since then is superseded and goes, as do an expert version that has been replaced and a parked
+    /// state whose thread is gone. Age alone removes nothing; the caps only bite on what is left, least recently
+    /// used first, and every pass logs what it kept.
+    pub async fn prune_states(&self, at_start: bool) {
+        let path = self.cfg.data_dir.join("state-epoch.json");
+        let now = now_ms() / 1000;
+        let hash = self.context_hash().await;
+        let prev: Option<Value> = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        let field = |k: &str| prev.as_ref().and_then(|p| p[k].as_u64());
+        let since = match prev.as_ref().and_then(|p| p["hash"].as_str()) {
+            Some(h) if h == hash => field("since").unwrap_or(now),
+            // the prompt is set at start, so a change found then dates from now; the tool set changes while running,
+            // so a change found later dates from the last pass that saw the old one (a state written in between stays)
+            Some(_) if !at_start => field("checked").unwrap_or(now),
+            _ => now,
+        };
+        if let Err(e) = std::fs::write(&path, json!({"hash": hash, "since": since, "checked": now}).to_string()) {
+            tracing::warn!("saved states: {}: {e}", path.display());
+            return;
+        }
+        if at_start {
+            // what a thread born now would import stays: every current expert in the current context, with every
+            // tool and with its own tool list (a goldfish's)
+            let mut defs = rap::builtin_defs(self.cfg.compaction, self.cfg.window);
+            defs.extend(self.tools.current().await.defs.iter().cloned());
+            let defs = self.experts.with_tools(defs).await;
+            for key in self.experts.current.read().await.values() {
+                let own = self.store.expert(key).ok().flatten().and_then(|e| e.tools).unwrap_or_default();
+                for scope in [None, Some(own.as_slice())] {
+                    let ctx = crate::experts::context(&self.system, &rap::scope_defs(defs.clone(), scope));
+                    if let Some(p) = self.experts.state(key, &ctx) { crate::park::touch(&p); }
+                }
+            }
+        }
+        let epoch = std::time::UNIX_EPOCH + std::time::Duration::from_secs(since);
+        let e = self.experts.prune(self.cfg.expert_states_max_gib.saturating_mul(1 << 30), epoch).await;
+        // with no record yet (the first run), a parked state's context is unknown: only a gone thread's goes
+        let park_epoch = if prev.is_some() { epoch } else { std::time::UNIX_EPOCH };
+        let p = self.parking.as_ref().map(|park| park.prune(|f, written| {
+            let thread = f.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            written < park_epoch || matches!(self.store.thread(thread), Ok(None))
+        })).unwrap_or_default();
+        let gb = |b: u64| b as f64 / 1e9;
+        tracing::info!("saved states (context {hash} since {since}): experts {} kept ({:.1} GB), {:.1} GB superseded, {:.1} GB over cap; parked {} kept ({:.1} GB), {:.1} GB superseded, {:.1} GB over cap",
+            e.kept, gb(e.kept_bytes), gb(e.superseded_bytes), gb(e.over_cap_bytes), p.kept, gb(p.kept_bytes), gb(p.superseded_bytes), gb(p.over_cap_bytes));
     }
 
     /// The request a parked thread's state is exported with: its view now (what the node cached for its last

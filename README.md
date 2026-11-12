@@ -103,7 +103,8 @@ export that comes back shorter than the thread's last prompt (an older entry) is
 daemon asks the node how much of the conversation it already holds (strixite `POST /cache/probe`); a node holding
 at least what the file covers is sent nothing (`restore_skipped`), which saves up to gigabytes over the rail when a
 thread wakes on the node it slept on. Files are written under a temporary name and renamed; a turn that commits removes its thread's file,
-deleting a thread removes it, and the oldest files go past `park_max_gib` (64). On because the node's own disk
+deleting a thread removes it, the hourly pass (see Experts) drops a file made under a system prompt or tool set
+no longer in use or whose thread is gone, and past `park_max_gib` (64) the least recently used go. On because the node's own disk
 tier was measured failing on the pod; a node without cache transfer answers the export with an error and nothing
 is parked. `/health` counts `parked`, `park_missed` (the node held nothing), `restored`, `restore_skipped` and
 `restore_failed`.
@@ -270,7 +271,12 @@ changes the expert is frozen again, and a thread born meanwhile reads the expert
 Every current expert without state is frozen once a node is up, after `experts reload`, and after `experts freeze
 THREAD NAME`, which makes a thread's refocus notes what an expert has read. The stored messages stay as its
 provenance: every born thread sends those exact bytes, and the state is rebuilt from them. Versions are never
-pruned: a thread keeps the bytes it was born with when a file changes. `experts warm NAME` puts the frozen state
+pruned: a thread keeps the bytes it was born with when a file changes. Frozen states are: at start and hourly,
+a state that can never be imported again goes - one of a replaced version, or one not written or used since the
+system prompt or tool set last changed (`<data_dir>/state-epoch.json` records since when the current pair has
+held; using a state marks it, and at start every current expert's state in the current context is marked). Age
+alone removes nothing. `expert_states_max_gib` (32) is a backstop on what is left, least recently used first;
+each pass logs what it kept and freed. `experts warm NAME` puts the frozen state
 into every up node (a reading on each, where nodes cannot take state); `warm_on_start` does that at boot.
 `experts list` shows each expert's frozen bytes. Off until the experts exist: the mechanism is cheap, the practice
 is the work, and it is a board card (FF-EXPERTS) to grow a small set from the kinds of work the pod repeats,

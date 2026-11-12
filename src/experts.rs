@@ -300,6 +300,29 @@ impl Experts {
         self.state_path(key, ctx).filter(|p| p.is_file())
     }
 
+    /// The frozen state a thread or a warm is about to import, marked used now so pruning keeps it.
+    pub fn use_state(&self, key: &str, ctx: &str) -> Option<PathBuf> {
+        let p = self.state(key, ctx)?;
+        crate::park::touch(&p);
+        Some(p)
+    }
+
+    /// Drop the frozen states that can never be imported again: a version its expert has replaced, or one made
+    /// before `epoch` (the last change of the system prompt or tool set; a state in use is touched, so it is newer).
+    /// Then, only over `max_bytes`, the least recently used. A state being frozen now stays; the stored versions
+    /// (what a state is rebuilt from) are never touched.
+    pub async fn prune(&self, max_bytes: u64, epoch: std::time::SystemTime) -> crate::park::Pruned {
+        let Some(dir) = &self.state_dir else { return Default::default() };
+        let keep: Vec<PathBuf> = self.freezing.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
+        let current = self.current.read().await.clone();
+        crate::park::prune_dir(dir, max_bytes, &keep, "frozen expert state", |p, written| {
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let key = stem.rsplit_once('-').map_or(stem, |(k, _)| k);
+            let replaced = key.split_once('@').and_then(|(name, _)| current.get(name)).is_some_and(|k| k != key);
+            replaced || written < epoch
+        })
+    }
+
     /// Freeze an expert version for the current context: read it once on a node and export that node's state.
     /// A version already frozen is left alone; two freezes of the same one never run at once.
     pub async fn freeze(&self, key: &str, store: &Store, router: &Router, system: &str, defs: &[Value], max_tokens: u64) -> Result<Value> {
@@ -449,7 +472,7 @@ impl Experts {
         let key = self.key(name).await.with_context(|| format!("no expert named {name}"))?;
         let e = store.expert(&key)?.context("expert vanished")?;
         if let Err(err) = self.freeze(&key, store, router, system, defs, max_tokens).await { tracing::warn!("expert {key}: not frozen: {err:#}"); }
-        if let Some(state) = self.state(&key, &context(system, defs)) {
+        if let Some(state) = self.use_state(&key, &context(system, defs)) {
             let mut out = Vec::new();
             for url in router.up_nodes_for(e.model.as_deref().unwrap_or(router.model())).await {
                 let t = std::time::Instant::now();
