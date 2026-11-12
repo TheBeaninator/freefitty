@@ -241,6 +241,14 @@ impl Router {
             .collect()
     }
 
+    /// A request to a node, with its `node_meta` bearer token when it has one.
+    fn to_node(&self, url: &str, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.cfg.node_meta.get(url).and_then(|m| m.bearer_token.as_deref()) {
+            Some(t) => rb.bearer_auth(t),
+            None => rb,
+        }
+    }
+
     async fn poll(&self, i: usize) {
         let probe = reqwest::Client::builder().timeout(Duration::from_secs(2)).connect_timeout(Duration::from_secs(2)).build().expect("client");
         let url = self.cfg.nodes[i].clone();
@@ -255,13 +263,13 @@ impl Router {
                     tracing::info!("node {url}: {}", if held { "held: no new threads, its threads leave at their next turn" } else { "released" });
                 }
             }
-            let health = probe.get(format!("{url}/health")).send().await;
+            let health = self.to_node(&url, probe.get(format!("{url}/health"))).send().await;
             let was_up;
             let (up, parsed) = match health {
                 Ok(r) if r.status().is_success() => (true, r.json::<Value>().await.unwrap_or(Value::Null)),
                 Ok(r) if r.status().as_u16() == 404 => {
                     // no /health: up while /v1/models answers
-                    (probe.get(format!("{url}/v1/models")).send().await.map(|r| r.status().is_success()).unwrap_or(false), Value::Null)
+                    (self.to_node(&url, probe.get(format!("{url}/v1/models"))).send().await.map(|r| r.status().is_success()).unwrap_or(false), Value::Null)
                 }
                 _ => (false, Value::Null),
             };
@@ -276,7 +284,7 @@ impl Router {
             }
             if xfer_unknown {
                 // the cache routes exist only with cache-xfer on: an empty export answers 400 there, 404 elsewhere
-                let x = match probe.post(format!("{url}/cache/export")).header("content-type", "application/json").body("").send().await {
+                let x = match self.to_node(&url, probe.post(format!("{url}/cache/export"))).header("content-type", "application/json").body("").send().await {
                     Ok(r) if r.status().as_u16() == 400 => Some(true),
                     Ok(r) if r.status().as_u16() == 404 => Some(false),
                     Ok(_) => Some(false),
@@ -392,14 +400,14 @@ impl Router {
 
     /// Stream a thread's cached state from one node to another; Ok(false) when nothing was cached.
     pub async fn move_state(&self, from: &str, to: &str, body: &Value) -> Result<bool> {
-        let exp = self.xfer_client.post(format!("{from}/cache/export")).json(body).send().await?;
+        let exp = self.to_node(&from, self.xfer_client.post(format!("{from}/cache/export"))).json(body).send().await?;
         match exp.status().as_u16() {
             200 => {}
             404 => return Ok(false),
             s => bail!("export answered {s}"),
         }
         let len = exp.content_length();
-        let mut req = self.xfer_client.post(format!("{to}/cache/import")).header("content-type", "application/octet-stream");
+        let mut req = self.to_node(&to, self.xfer_client.post(format!("{to}/cache/import"))).header("content-type", "application/octet-stream");
         if let Some(l) = len { req = req.header("content-length", l); }
         let imp = req.body(reqwest::Body::wrap_stream(exp.bytes_stream())).send().await?;
         if !imp.status().is_success() {
@@ -446,7 +454,7 @@ impl Router {
     pub async fn save_state(&self, from: &str, body: &Value, path: &Path) -> Result<Option<(u64, u64)>> {
         use futures_util::StreamExt;
         use tokio::io::AsyncWriteExt;
-        let exp = self.xfer_client.post(format!("{from}/cache/export")).json(body).send().await?;
+        let exp = self.to_node(&from, self.xfer_client.post(format!("{from}/cache/export"))).json(body).send().await?;
         match exp.status().as_u16() {
             200 => {}
             404 => return Ok(None),
@@ -474,7 +482,7 @@ impl Router {
     /// How many tokens of this request's prompt a node's prompt cache holds (strixite POST /cache/probe); None when
     /// the node cannot say (an older strixite), so the caller sends the state.
     async fn probe(&self, url: &str, body: &Value) -> Option<u64> {
-        let r = self.xfer_client.post(format!("{url}/cache/probe")).json(body).timeout(Duration::from_secs(10)).send().await.ok()?;
+        let r = self.to_node(&url, self.xfer_client.post(format!("{url}/cache/probe"))).json(body).timeout(Duration::from_secs(10)).send().await.ok()?;
         if !r.status().is_success() { return None; }
         r.json::<Value>().await.ok()?.get("tokens")?.as_u64()
     }
@@ -490,7 +498,7 @@ impl Router {
         for url in self.up_nodes().await {
             let mut got = None;
             for attempt in 0..3 {
-                match self.client.get(format!("{url}/steer")).timeout(Duration::from_secs(5)).send().await {
+                match self.to_node(&url, self.client.get(format!("{url}/steer"))).timeout(Duration::from_secs(5)).send().await {
                     Ok(r) if r.status().as_u16() == 404 => { got = Some(false); break; }
                     Ok(r) if r.status().is_success() => {
                         let v: Value = r.json().await.unwrap_or(Value::Null);
@@ -514,7 +522,7 @@ impl Router {
         for url in self.up_nodes().await {
             let mut held = None;
             for attempt in 0..3 {
-                match self.client.get(format!("{url}/steer")).timeout(Duration::from_secs(5)).send().await {
+                match self.to_node(&url, self.client.get(format!("{url}/steer"))).timeout(Duration::from_secs(5)).send().await {
                     Ok(r) if r.status().as_u16() == 404 => { held = Some(Default::default()); break; }
                     Ok(r) if r.status().is_success() => {
                         let v: Value = r.json().await.unwrap_or(Value::Null);
@@ -549,7 +557,7 @@ impl Router {
                 Err(e) => Some((Err(e), f)),
             }
         });
-        let imp = self.xfer_client.post(format!("{to}/cache/import")).header("content-type", "application/octet-stream")
+        let imp = self.to_node(&to, self.xfer_client.post(format!("{to}/cache/import"))).header("content-type", "application/octet-stream")
             .header("content-length", len).body(reqwest::Body::wrap_stream(stream)).send().await?;
         if !imp.status().is_success() {
             bail!("import answered {}: {}", imp.status(), imp.text().await.unwrap_or_default().chars().take(200).collect::<String>());
@@ -610,7 +618,7 @@ impl Router {
                     }
                 }
             }
-            let res = self.client.post(format!("{url}/v1/chat/completions")).json(body).send().await;
+            let res = self.to_node(&url, self.client.post(format!("{url}/v1/chat/completions"))).json(body).send().await;
             let resp = match res {
                 Ok(r) => r,
                 Err(e) if e.is_connect() => {
@@ -667,7 +675,7 @@ impl Router {
 
     /// One completion on one named node, outside placement (warming an expert's prefix into its cache).
     pub async fn chat_on(&self, url: &str, body: &Value) -> Result<Turn> {
-        let r = self.client.post(format!("{url}/v1/chat/completions")).json(body).send().await?;
+        let r = self.to_node(&url, self.client.post(format!("{url}/v1/chat/completions"))).json(body).send().await?;
         let status = r.status();
         let text = r.bytes().await?;
         if !status.is_success() {

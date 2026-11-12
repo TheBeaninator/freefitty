@@ -1627,3 +1627,36 @@ async fn every_reply_is_sampled_with_a_seed_a_replay_can_recompute() {
     assert_ne!(mine[0]["seed"], mine[1]["seed"]);
     r.shutdown().await;
 }
+
+/// A node behind an API key: anything without `Authorization: Bearer node-key` is answered 401 and counted.
+static UNAUTHORIZED: AtomicUsize = AtomicUsize::new(0);
+fn keyed(h: &axum::http::HeaderMap) -> bool {
+    let ok = h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer node-key");
+    if !ok { UNAUTHORIZED.fetch_add(1, Ordering::Relaxed); }
+    ok
+}
+async fn keyed_health(State(m): State<Arc<FakeModel>>, h: axum::http::HeaderMap) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !keyed(&h) { return axum::http::StatusCode::UNAUTHORIZED.into_response(); }
+    health(State(m)).await.into_response()
+}
+async fn keyed_completions(State(m): State<Arc<FakeModel>>, h: axum::http::HeaderMap, body: Json<Value>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !keyed(&h) { return axum::http::StatusCode::UNAUTHORIZED.into_response(); }
+    completions(State(m), body).await.into_response()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_behind_an_api_key_gets_its_bearer_token() {
+    let mut h = harness().await;
+    let url = serve(Router::new().route("/health", get(keyed_health)).route("/v1/chat/completions", post(keyed_completions)).with_state(h.model.clone())).await;
+    h.cfg.nodes = vec![url.clone()];
+    h.cfg.node_meta.insert(url.clone(), freefitty::config::NodeMeta { bearer_token: Some("node-key".into()), ..Default::default() });
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.say("hello there", Some("keyed")).await;
+    let out = api.output("keyed", 10).await.expect("a reply from the keyed node");
+    assert_eq!(out["text"], "hi: hello there", "{out}");
+    assert_eq!(UNAUTHORIZED.load(Ordering::Relaxed), 0, "every request to the node carried its token");
+    r.shutdown().await;
+}

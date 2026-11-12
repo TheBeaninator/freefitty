@@ -260,6 +260,10 @@ pub struct NodeMeta {
     pub down_wait_s: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_messages: Option<bool>,
+    /// Sent as `Authorization: Bearer` on every request to this node (a hosted or keyed endpoint, a StrixFold with
+    /// API keys); unset = no credentials, as for the pod's own nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_step: Option<u64>,
 }

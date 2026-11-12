@@ -14,6 +14,17 @@ is a language model. The model has no loop; the scheduler is the loop and the mo
 ends the step, so sleeping costs nothing, a retry re-runs a step that committed nothing, and running a turn exactly
 once falls out of the commit boundary. Everything else in this file follows from that one choice.
 
+## Why
+
+[hydro-project/infinity](https://github.com/hydro-project/infinity) showed the model this file builds on: an agent
+that holds nothing between turns, tools that answer whenever they are done, and a sleep that costs nothing. Its
+durable mode runs on AWS (SQS, DynamoDB, EventBridge, Lambda). Off AWS, on the pod, that meant fourteen containers of
+emulated AWS plus a bridge and a router in Python, and the failures lived in the seams between them: a message
+invisible for sixteen minutes after a kill, a redelivered event running its turn twice, a status page green while
+work starved. FreeFitty keeps the model and replaces the stack with one process and one transactional file, and
+adds what a cluster of local nodes makes possible: a thread stays on the node that holds its cache, and that cache
+can be saved, moved and shared (parking, cache moves, frozen experts).
+
 ## Where it runs
 
 The pod: pod-control (the scheduler) and the [strixite](https://github.com/shawnshekari/strixite) nodes on a 100 GbE
@@ -44,8 +55,8 @@ enough to run FreeFitty as described here.
 Against a server that has only the first row (vLLM, llama.cpp's server, and the like): a 404 on `/health` falls back
 to `GET /v1/models` to tell whether the node is up; nothing is parked, moved with its cache or frozen (each answers
 with an error and the thread reads its prompt again); set `max_context_tokens`, since without a context length the
-budget window and the pre-send check are off; leave steering unset. FreeFitty sends no credentials to a node, so a
-hosted endpoint that needs an API key does not work at all. Placement assumes each node keeps a prefix cache per
+budget window and the pre-send check are off; leave steering unset. A node behind an API key gets it as
+`node_meta."<url>".bearer_token`, sent as `Authorization: Bearer` on every request to that node. Placement assumes each node keeps a prefix cache per
 conversation; without one every turn re-reads its whole prompt.
 
 ## Run it
@@ -79,7 +90,7 @@ below explain each one; this is the list, with defaults.
 | `data_dir` | `data` | store, parked and frozen states, backups, instructions |
 | `model` | `qwen3.8-flash-next` | the model a thread runs on unless its expert names another, and every node's unless `node_meta` says |
 | `nodes` | none | node URLs |
-| `node_meta."<url>"` | none | per node: `model`, `context_length`, `slots`, `grant` (false: not under `grant_cmd`), `down_wait_s`, `shared_messages`, `keep_step` |
+| `node_meta."<url>"` | none | per node: `model`, `context_length`, `slots`, `bearer_token`, `grant` (false: not under `grant_cmd`), `down_wait_s`, `shared_messages`, `keep_step` |
 | `node_slots` | 2 | slots assumed while a node's `/health` does not say |
 | `spill_tokens` | 16384 | a thread under this may leave a full node and read its prompt again |
 | `move_threads` | on | a thread over it leaves a full node with its cache |
@@ -393,7 +404,7 @@ see also [google/elephant-goldfish-model](https://github.com/google/elephant-gol
   freeze ends and wakes to the expert's name and version.
 - An expert whose definition has a `[tool]` table (`name`, `description`, JSON-schema `parameters`, `ask?`) answers
   that tool: every thread sees it beside the other tools, and a call to it is a goldfish of the expert briefed with
-  the call's arguments, whose answer returns as the result. A ToolBox tool of the same name wins; a goldfish cannot
+  the call's arguments, whose answer returns as the result. A RAP server's tool of the same name wins; a goldfish cannot
   call one. `fallback` names an expert that answers instead while no node of the expert's model is up and free
   (on the pod `ark_lookup` is the librarian on the StrixFold pair, and the same librarian on the cluster while
   the pair is down or held for a window).
@@ -438,9 +449,10 @@ recompute once in some thirty turns.
 
 `deploy/freefitty.service` is a user unit for pod-control: binary in `~/.local/bin`, config and data under
 `/data/pod/freefitty`. It is an enabled unit, not a transient one, so pod-mem-guard never takes it for an idle
-stray. pod-ff and pod-hands speak this API: `/data/pod/freefitty/.env` carries
-`FREEFINITY_PORT`, `BRIDGE_TOKEN` (the operator token) and `CALLBACK_TOKEN` for them, and their units set `FF_STACK`
-to that directory. pod-ff reads thread sizes and last turns from `/threads` and prunes with `DELETE`. The Isekai'd
+stray. pod-ff (the pod's card runner) and pod-hands (the pod's RAP tool server) speak this API. They were written
+for freefinity, FreeFitty's predecessor, and keep its variable names: `/data/pod/freefitty/.env` carries
+`FREEFINITY_PORT` (this daemon's port), `BRIDGE_TOKEN` (the operator token) and `CALLBACK_TOKEN` for them, and their
+units set `FF_STACK` to that directory. pod-ff reads thread sizes and last turns from `/threads` and prunes with `DELETE`. The Isekai'd
 director rounds run on the same daemon under thread ids starting `isk-`.
 
 Upgrading: build on a machine with the pod's glibc or older, copy the binary over, `install` it, and
@@ -514,37 +526,46 @@ Each of these is a property of the design, not a patch on it.
 
 ## Tests
 
-`cargo test` runs the unit tests (the window's cut, stubs, notice, paging boundary, batch and handle, and replay; the estimate's scaling; argument
-repair; the router's placement with held nodes) and `tests/e2e.rs`: the daemon against a scripted model node and a
-RAP tool server, in process. It covers a plain turn, a sleep through the queue, a RAP tool whose result is posted
-twice, double-encoded arguments, an unknown tool, a turn with nothing in it, three failures to the dead-letter queue
-and a redrive that keeps the input's id, two threads at once, a restart with a wake-up pending; a refocus from the
-tool and from the operator with the pending call bridged and its late result answered, notes cut off and asked
-again, nothing-to-fold, the token trigger, failed notes; experts sharing their prefix bytes, version pinning across
-a file change, warm on start, and an expert frozen from a thread's notes; an expert frozen once into a state file
-that each born thread's first turn imports byte for byte, a later turn importing nothing, and a restart keeping the
-state without a second reading; an elephant reading the catalog, asking a goldfish born from an expert with only
-the plain built-ins and getting its answer as the call's result, a goldfish that tries to ask a goldfish being
-told there is no such tool, an unknown expert answered with the catalog, and a commissioned expert frozen, its
-definition written, and its goldfish holding the granted tool but never `goldfish`; a steered expert read under
-its steering, every turn of its threads carrying it, a plain thread's none, and the steering a version of its own; the window cutting whole units at the
-budget, the notice carrying the first message, the cut point holding across turns, `recall` returning the exact
-text within the slice, and the replay agreeing with the live run; old results paging out in a batch as handles, an
-error result staying, and a recalled result pinned back in full; a node's count correcting a wrong estimate so
-the turn runs; a full context closing a thread that has nothing to cut; a wait for a node slot longer than the
-slice timeout that is not a failure; a tool's images reaching the model; and a sleeper parked and its exact bytes
-restored into the node when it wakes, nothing parked when the node holds nothing, and its file removed with the
-thread; a slice that panics counted as a failed attempt and dead-lettered; `/metrics` after a turn (outcome, cached
-tokens per node, histograms) and a snapshot on demand that reopens with its schema; a store from a newer schema
-refused; a stop that does not wait for a turn still queued for a slot, which runs after the restart uncounted; overdue newcomers leaving one slot where two threads wait for their home; an unreachable node named when a
-persona's vector is checked; a slice cancelled at once, its thread deleted, and none of its goldfish or experts left
-behind; a priority thread marked and unmarked; every turn tracing to the instructions it ran under, and every reply
-carrying a seed a replay recomputes; a reply cut off mid-call going on in the same slice; a turn's calls answered
-together, and a late result not starting a turn while the newest call is out; a goldfish stuck on one call ended
-and its elephant told; an expert tool falling back while its model has no free node; a model-pinned goldfish
-running only on nodes serving its model; prefix-scoped steering, and its refusal on nodes without the scope; and a
-node already holding a state not sent it again. `FREEFITTY_NODES=http://a:5300,http://b:5300
-cargo test --test real_nodes -- --ignored` proves the cache move on two real strixite nodes.
+`cargo test` runs the unit tests (the window's cut, stubs, notice, paging boundary, batch and handle, and replay; the
+estimate's scaling; argument repair; the router's placement with held nodes; saved-state pruning and its epoch) and
+`tests/e2e.rs`: the daemon against a scripted model node and a RAP tool server, in process. What the e2e tests cover:
+
+- **Turns and the queue:** a plain turn; a sleep through the queue; a RAP tool whose result is posted twice;
+  double-encoded arguments; an unknown tool; a turn with nothing in it; three failures to the dead-letter queue and
+  a redrive that keeps the input's id; two threads at once; a restart with a wake-up pending; a slice that panics,
+  counted as a failed attempt and dead-lettered; a stop that does not wait for a turn still queued for a slot, which
+  runs after the restart uncounted; a running slice cancelled at once, its thread deleted, no goldfish or expert
+  left behind.
+- **What the model sees:** a turn's calls answered together, and a late result not starting a turn while the newest
+  call is out; a reply cut off mid-call going on in the same slice; a goldfish stuck on one call ended and its
+  elephant told; every turn tracing to the instructions it ran under; every reply carrying a seed a replay
+  recomputes.
+- **Refocus:** from the tool and from the operator, with the pending call bridged and its late result answered;
+  notes cut off and asked again; nothing to fold; the token trigger; failed notes.
+- **Window and paging:** whole units cut at the budget; the notice carrying the first message; the cut point holding
+  across turns; `recall` returning the exact text within the slice; the replay agreeing with the live run; old
+  results paging out in a batch as handles, an error result staying, a recalled result pinned back in full; a
+  node's count correcting a wrong estimate so the turn runs; a full context closing a thread with nothing to cut.
+- **Experts and goldfish:** experts sharing their prefix bytes; version pinning across a file change; warm on start;
+  an expert frozen from a thread's notes; a state frozen once that each born thread's first turn imports byte for
+  byte, a later turn importing nothing, and a restart keeping it without a second reading; an elephant reading the
+  catalog and asking a goldfish that holds only the plain built-ins; a goldfish that tries to ask a goldfish; an
+  unknown expert answered with the catalog; a commissioned expert frozen, written and granted its tools; an expert
+  tool falling back while its model has no free node; a model-pinned goldfish running only on nodes serving its
+  model.
+- **Steering:** a steered expert's every request carrying it, a plain thread's none, the steering a version of its
+  own; prefix-scoped steering, and its refusal on nodes without the scope; a commissioned persona checked before it
+  exists; a node refusing a thread's steering closing it at once; a persona's vector checked on every node.
+- **Nodes and state:** a wait for a node slot longer than the slice timeout that is not a failure; overdue newcomers
+  leaving one slot where two threads wait for their home; a sleeper parked and its exact bytes restored when it
+  wakes, nothing parked when the node holds nothing, its file removed with the thread; a node already holding a
+  state not sent it again; a node behind an API key getting its bearer token; a tool's images reaching the model;
+  the operator marking and unmarking a priority thread.
+- **Operations:** `/metrics` after a turn (outcome, cached tokens per node, histograms); a snapshot on demand that
+  reopens with its schema; a store from a newer schema refused.
+
+`FREEFITTY_NODES=http://a:5300,http://b:5300 cargo test --test real_nodes -- --ignored` proves the cache move on two
+real strixite nodes.
 
 ## License
 
