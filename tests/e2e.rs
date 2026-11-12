@@ -1660,3 +1660,32 @@ async fn a_node_behind_an_api_key_gets_its_bearer_token() {
     assert_eq!(UNAUTHORIZED.load(Ordering::Relaxed), 0, "every request to the node carried its token");
     r.shutdown().await;
 }
+
+async fn routes_v1() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (axum::http::StatusCode::BAD_REQUEST, [("x-cache-routes", "1")], "not a request").into_response()
+}
+async fn routes_v2() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (axum::http::StatusCode::BAD_REQUEST, [("x-cache-routes", "2")], "not a request").into_response()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_naming_another_cache_routes_version_is_not_used_for_transfers() {
+    let mut h = harness().await;
+    let v1 = serve(Router::new().route("/health", get(health)).route("/v1/chat/completions", post(completions)).route("/cache/export", post(routes_v1)).with_state(h.model.clone())).await;
+    let v2 = serve(Router::new().route("/health", get(health)).route("/v1/chat/completions", post(completions)).route("/cache/export", post(routes_v2)).with_state(h.model.clone())).await;
+    h.cfg.nodes = vec![v1.clone(), v2.clone()];
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let mut xfer = (Value::Null, Value::Null);
+    for _ in 0..50 {
+        let health = api.get("/health").await;
+        let of = |u: &str| health["nodes"].as_array().unwrap().iter().find(|n| n["url"] == u).unwrap()["xfer"].clone();
+        xfer = (of(&v1), of(&v2));
+        if !xfer.0.is_null() && !xfer.1.is_null() { break; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(xfer, (json!(true), json!(false)), "version 1 (or no header) takes transfers; another version does not");
+    r.shutdown().await;
+}

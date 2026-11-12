@@ -32,7 +32,8 @@ prefix of that prompt.
   if the entry is stored as a delta on a base, the bytes carry the base first and the delta after it.
 - `404`: no entry covers any prefix of this prompt.
 - `400`: the body is not a request the server can render (this includes an empty body; see Discovery).
-- `409`: the server has no prompt cache (it runs with it off).
+- `409`: the server has no prompt cache (it runs with it off). This check comes before the body is read, so a
+  server without a cache answers `409` even to an empty body.
 
 The export MUST NOT change what the server holds. It SHOULD stream.
 
@@ -62,11 +63,24 @@ Request: a chat-completions request body, as for export.
 Probe is OPTIONAL. Without it a client imports a state it holds whenever it places a conversation, even on a server
 that already has it.
 
+## Version
+
+This is version 1 of the contract. A server SHOULD send `X-Cache-Routes: 1` on every response of the three routes,
+errors included; a response without the header is version 1. A client MUST NOT use the routes of a server that
+names a version it does not implement. A change that breaks a version 1 client gets a new number.
+
 ## Discovery
 
-A client tells whether a server has the routes by sending `POST /cache/export` with an empty body: `400` means the
-routes exist (the empty body is not a request), `404` means they do not. FreeFitty probes each node this way once
-it is up, and turns parking, moves and freezing off for a node without them.
+A client tells whether a server has the routes by sending `POST /cache/export` with an empty body:
+
+- `400`: the routes exist and the server has a prompt cache (the empty body is not a request).
+- `409`: the routes exist but the server has no prompt cache, so there is nothing to move. A server MUST check for
+  its cache before it reads the body, so this answer takes precedence over the `400`.
+- `404`: the routes do not exist.
+
+Only a `400` whose `X-Cache-Routes` is absent or names a version the client implements means the routes are usable.
+FreeFitty probes each node this way once it is up, and turns parking, moves and freezing off for a node where they
+are not.
 
 ## What the engine has to cache
 
@@ -97,8 +111,11 @@ covers up to one boundary less than the prompt and is still the conversation's s
 ## Security
 
 Both export and import carry conversation contents, and an import changes what a server answers for every request
-that shares the imported prefix. A server SHOULD expose the routes only to trusted networks or behind
-authentication. FreeFitty sends a node's `node_meta` `bearer_token`, when set, on these routes as on every other.
+that shares the imported prefix: an import is a way to poison a cache. A server MUST require authentication on the
+three routes on any interface other than loopback; on loopback it MAY leave them open.
+
+The reference build does not meet this yet: the pod's strixite serves the routes without authentication, on a rail
+network nothing outside the pod can reach. It fails checklist item 6 until it does. FreeFitty sends a node's `node_meta` `bearer_token`, when set, on these routes as on every other.
 
 ## Mapping another engine
 
@@ -116,5 +133,7 @@ them.
    counts them as cached prompt tokens) and does not prefill them again.
 3. Import of those bytes into a server of a different model or configuration returns `409`; truncated or altered
    bytes return `400`.
-4. Export of a prompt sharing no prefix with any entry returns `404`; an empty-body export returns `400`.
+4. Export of a prompt sharing no prefix with any entry returns `404`; an empty-body export returns `400`, or `409`
+   when the server has no prompt cache.
 5. Probe (if offered) returns the covered token count without changing what the server holds.
+6. Off loopback, every route refuses a request without valid authentication.

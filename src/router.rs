@@ -283,9 +283,11 @@ impl Router {
                 if !n.up { n.xfer = None; }
             }
             if xfer_unknown {
-                // the cache routes exist only with cache-xfer on: an empty export answers 400 there, 404 elsewhere
+                // the cache routes exist only with cache-xfer on: an empty export answers 400 there, 404 elsewhere, 409
+                // where the server has no prompt cache (docs/cache-routes.md, Discovery); a server naming a contract
+                // version other than 1 in X-Cache-Routes is not used
                 let x = match self.to_node(&url, probe.post(format!("{url}/cache/export"))).header("content-type", "application/json").body("").send().await {
-                    Ok(r) if r.status().as_u16() == 400 => Some(true),
+                    Ok(r) if r.status().as_u16() == 400 => Some(r.headers().get("x-cache-routes").and_then(|v| v.to_str().ok()).is_none_or(|v| v.trim() == "1")),
                     Ok(r) if r.status().as_u16() == 404 => Some(false),
                     Ok(_) => Some(false),
                     Err(_) => None,

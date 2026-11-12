@@ -559,7 +559,8 @@ estimate's scaling; argument repair; the router's placement with held nodes; sav
 - **Nodes and state:** a wait for a node slot longer than the slice timeout that is not a failure; overdue newcomers
   leaving one slot where two threads wait for their home; a sleeper parked and its exact bytes restored when it
   wakes, nothing parked when the node holds nothing, its file removed with the thread; a node already holding a
-  state not sent it again; a node behind an API key getting its bearer token; a tool's images reaching the model;
+  state not sent it again; a node behind an API key getting its bearer token; a node naming another cache-routes
+  version not used for transfers; a tool's images reaching the model;
   the operator marking and unmarking a priority thread.
 - **Operations:** `/metrics` after a turn (outcome, cached tokens per node, histograms); a snapshot on demand that
   reopens with its schema; a store from a newer schema refused.

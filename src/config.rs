@@ -5,7 +5,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// No Debug, on purpose: Config holds the operator and callback tokens and every node's bearer token, and a `{:?}`
+// in a log line would print them all. Without the derive such a line does not compile. NodeMeta likewise.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Where the operator API listens. Loopback by default: the tokens are the only auth, and a front door
@@ -245,7 +247,7 @@ fn d_page_turns() -> u64 { 4 }
 fn d_page_min() -> u64 { 500 }
 fn d_page_batch() -> u64 { 32 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
