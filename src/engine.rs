@@ -893,14 +893,7 @@ impl Engine {
         let now = now_ms() / 1000;
         let hash = self.context_hash().await;
         let prev: Option<Value> = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok());
-        let field = |k: &str| prev.as_ref().and_then(|p| p[k].as_u64());
-        let since = match prev.as_ref().and_then(|p| p["hash"].as_str()) {
-            Some(h) if h == hash => field("since").unwrap_or(now),
-            // the prompt is set at start, so a change found then dates from now; the tool set changes while running,
-            // so a change found later dates from the last pass that saw the old one (a state written in between stays)
-            Some(_) if !at_start => field("checked").unwrap_or(now),
-            _ => now,
-        };
+        let since = epoch_since(prev.as_ref(), &hash, now, at_start);
         if let Err(e) = std::fs::write(&path, json!({"hash": hash, "since": since, "checked": now}).to_string()) {
             tracing::warn!("saved states: {}: {e}", path.display());
             return;
@@ -920,12 +913,13 @@ impl Engine {
             }
         }
         let epoch = std::time::UNIX_EPOCH + std::time::Duration::from_secs(since);
-        let e = self.experts.prune(self.cfg.expert_states_max_gib.saturating_mul(1 << 30), epoch).await;
-        // with no record yet (the first run), a parked state's context is unknown: only a gone thread's goes
-        let park_epoch = if prev.is_some() { epoch } else { std::time::UNIX_EPOCH };
+        // the first record: an expert's current-context states were just marked, so the rest of its states (other
+        // contexts) are known superseded; a parked state's context cannot be told, so only a gone thread's goes
+        let expert_epoch = if prev.is_none() { std::time::UNIX_EPOCH + std::time::Duration::from_secs(now) } else { epoch };
+        let e = self.experts.prune(self.cfg.expert_states_max_gib.saturating_mul(1 << 30), expert_epoch).await;
         let p = self.parking.as_ref().map(|park| park.prune(|f, written| {
             let thread = f.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            written < park_epoch || matches!(self.store.thread(thread), Ok(None))
+            written < epoch || matches!(self.store.thread(thread), Ok(None))
         })).unwrap_or_default();
         let gb = |b: u64| b as f64 / 1e9;
         tracing::info!("saved states (context {hash} since {since}): experts {} kept ({:.1} GB), {:.1} GB superseded, {:.1} GB over cap; parked {} kept ({:.1} GB), {:.1} GB superseded, {:.1} GB over cap",
@@ -1204,8 +1198,36 @@ fn until(args: &Value) -> Result<u64, String> {
     Ok((local.timestamp_millis().max(0)) as u64)
 }
 
+/// Since when (unix seconds) the current system prompt and tool set (`hash`) have held, from the previous record.
+/// 0 = no change seen since the record began: what was made before it has an unknown context, and only a change
+/// observed later supersedes it (the first record once dated from its own start, and the next restart dropped every
+/// parked state as superseded though the prompt had not changed: 62.6 GB on the pod, 2026-11-12).
+fn epoch_since(prev: Option<&Value>, hash: &str, now: u64, at_start: bool) -> u64 {
+    let field = |k: &str| prev.and_then(|p| p[k].as_u64());
+    match prev.and_then(|p| p["hash"].as_str()) {
+        Some(h) if h == hash => field("since").unwrap_or(0),
+        // the prompt is set at start, so a change found then dates from now; the tool set changes while running, so a
+        // change found later dates from the last pass that saw the old one (a state written in between stays)
+        Some(_) if !at_start => field("checked").unwrap_or(now),
+        Some(_) => now,
+        None => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_epoch_moves_only_on_an_observed_change() {
+        // first record: nothing before it is judged; a restart under the same prompt keeps that
+        assert_eq!(epoch_since(None, "a", 100, true), 0);
+        let rec = |h: &str, since: u64, checked: u64| json!({"hash": h, "since": since, "checked": checked});
+        assert_eq!(epoch_since(Some(&rec("a", 0, 100)), "a", 200, true), 0);
+        // a new prompt at start dates from that start; a tool change found while running, from the last pass before it
+        assert_eq!(epoch_since(Some(&rec("a", 0, 100)), "b", 200, true), 200);
+        assert_eq!(epoch_since(Some(&rec("a", 0, 100)), "b", 200, false), 100);
+        assert_eq!(epoch_since(Some(&rec("b", 200, 300)), "b", 400, true), 200);
+    }
+
     #[test]
     fn resident_pins_show_in_the_notice_region_until_the_next_cut() {
         let h: Vec<Value> = (0..6).map(|i| json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": format!("message {i}")})).collect();
