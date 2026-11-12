@@ -48,7 +48,7 @@ enough to run FreeFitty as described here.
 |---|---|---|
 | `POST /v1/chat/completions` with OpenAI tool calls | every turn | any OpenAI-compatible server |
 | `GET /health` with `slots`, `busy_slots`, `queued`, `context_length` | placement and the context budget | upstream strixite; StrixFold's `max_batch_size` and `live` are read too |
-| `POST /cache/export`, `/cache/import`, `/cache/probe` | parking, moving a thread with its cache, frozen experts | pod patches (strixite `cache-xfer`, StrixFold) |
+| `POST /cache/export`, `/cache/import`, `/cache/probe` | parking, moving a thread with its cache, frozen experts | pod patches (strixite `cache-xfer`, StrixFold); the contract is [docs/cache-routes.md](docs/cache-routes.md) |
 | `GET /steer`, `steer` and `steer_scope` in requests | persona experts | pod patches to strixite |
 | `shared_messages`, `keep_step` | an expert's shared prefix on StrixFold | pod patches to StrixFold |
 
