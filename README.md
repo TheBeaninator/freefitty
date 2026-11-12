@@ -4,8 +4,10 @@ Durable agents on a cluster of Strix Halos. One Rust binary, one data file, a sy
 
 A thread is its stored conversation. Something arrives for it (a person's message, a tool's result, a wake-up it
 asked for), the model runs once over the conversation, the turn is committed, and the thread holds nothing again
-until the next thing arrives. Tools are HTTP servers that answer whenever they are done. Sleeping is free, however
-long. A thread lives as long as its work does, days if need be, and never grows past the node's context.
+until the next thing arrives. Tools are HTTP servers that answer whenever they are done, over the Reactive Agent
+Protocol ([RAP](https://infinity.hydro.run/docs/rap/what-is-rap), from
+[hydro-project/infinity](https://github.com/hydro-project/infinity);
+[spec](https://infinity.hydro.run/docs/rap/spec/overview)). Sleeping is free, however long. A thread lives as long as its work does, days if need be, and never grows past the node's context.
 
 Put differently: FreeFitty is a durable actor system whose actor state is a transcript and whose behaviour function
 is a language model. The model has no loop; the scheduler is the loop and the model is a pure step. Every tool call
@@ -14,14 +16,37 @@ once falls out of the commit boundary. Everything else in this file follows from
 
 ## Where it runs
 
-The pod: pod-control (the scheduler) and the strixite nodes on a 100 GbE rail. Each node serves one model, by
-default `model`; `node_meta` names another per node, with its context length and slots, so the strixite workers
-(two slots, 262,144 tokens) and the StrixFold pair (DeepSeek V4.1 over two nodes) are nodes of one router, and a
-turn runs only on nodes serving its model. The pod's work cards run as FreeFitty threads: pod-ff opens a thread per
-card round and watches it, pod-hands is the tool server the threads call, and the board decides what runs.
+The pod: pod-control (the scheduler) and the [strixite](https://github.com/shawnshekari/strixite) nodes on a 100 GbE
+rail, all Strix Halo machines. Each node serves one model, by default `model`; `node_meta` names another per node,
+with its context length and slots, so the strixite workers (two slots, 262,144 tokens) and the StrixFold pair
+(DeepSeek V4.1 across two nodes; [StrixFold](https://github.com/TheBeaninator/StrixFold), from
+[TensorFold](https://github.com/ashhart/TensorFold)) are nodes of one router, and a turn runs only on nodes serving
+its model. The pod's work cards run as FreeFitty threads: pod-ff opens a thread per card round and watches it, pod-hands is the tool server the threads call, and the board decides what runs.
 In about 6,900 lines of Rust: a queue with due times and a scheduler; one [redb](https://github.com/cberner/redb)
 file for every table; the nodes' own slot counts for capacity; one process for the API, the queue, the router, the
 tool calls and their callbacks; a systemd unit.
+
+## What it needs from a node
+
+FreeFitty is built for the pod's own inference servers, and several features depend on endpoints only they have.
+Those endpoints are the pod's patches to strixite and StrixFold, and the patches are not in the public strixite or
+StrixFold repositories, so outside the pod those features are off, and a plain OpenAI-compatible endpoint is not
+enough to run FreeFitty as described here.
+
+| Needs | Used for | Where it comes from |
+|---|---|---|
+| `POST /v1/chat/completions` with OpenAI tool calls | every turn | any OpenAI-compatible server |
+| `GET /health` with `slots`, `busy_slots`, `queued`, `context_length` | placement and the context budget | upstream strixite; StrixFold's `max_batch_size` and `live` are read too |
+| `POST /cache/export`, `/cache/import`, `/cache/probe` | parking, moving a thread with its cache, frozen experts | pod patches (strixite `cache-xfer`, StrixFold) |
+| `GET /steer`, `steer` and `steer_scope` in requests | persona experts | pod patches to strixite |
+| `shared_messages`, `keep_step` | an expert's shared prefix on StrixFold | pod patches to StrixFold |
+
+Against a server that has only the first row (vLLM, llama.cpp's server, and the like): a 404 on `/health` falls back
+to `GET /v1/models` to tell whether the node is up; nothing is parked, moved with its cache or frozen (each answers
+with an error and the thread reads its prompt again); set `max_context_tokens`, since without a context length the
+budget window and the pre-send check are off; leave steering unset. FreeFitty sends no credentials to a node, so a
+hosted endpoint that needs an API key does not work at all. Placement assumes each node keeps a prefix cache per
+conversation; without one every turn re-reads its whole prompt.
 
 ## Run it
 
@@ -352,7 +377,9 @@ into every up node (a reading on each, where nodes cannot take state); `warm_on_
 practice of choosing what an expert reads is the work.
 
 **Goldfish.** Elephants are long threads that hold a piece of work; goldfish are threads born for one brief,
-which answer once and are gone. Three built-ins make that general:
+which answer once and are gone (the names are from Dave Rensin's
+[Elephant-Goldfish Model](https://research.google/pubs/elephants-goldfish-and-the-new-golden-age-of-software-engineering/);
+see also [google/elephant-goldfish-model](https://github.com/google/elephant-goldfish-model)). Three built-ins make that general:
 - `experts` is the catalog an elephant chooses from: each expert's name, its line, and the tools its goldfish may
   use. It is a tool, not part of the tool definitions, so a new expert never changes the bytes every thread
   shares.
