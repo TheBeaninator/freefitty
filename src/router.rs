@@ -335,6 +335,7 @@ impl Router {
         let patience = Duration::from_millis(self.cfg.newcomer_wait_s * 1000 + rand::random_range(0..=self.cfg.newcomer_wait_s * 500));
         let mut waiting_on: Option<Hold> = None;
         let mut waited = false;
+        let mut reported = Instant::now();
         loop {
             let notified = self.notify.notified();
             {
@@ -408,6 +409,15 @@ impl Router {
                             nodes[w].queue.insert(ticket);
                             waiting_on = Some(Hold { r: self, i: w, slot: false, ticket });
                         }
+                    }
+                    // a wait past 10 min says every 5 min where it stands, so a starved turn shows why (pod 2026-11-13:
+                    // new threads waited up to 62 min on 196d44e while the median wait was 3 min)
+                    if started.elapsed() >= Duration::from_secs(600) && reported.elapsed() >= Duration::from_secs(300) {
+                        reported = Instant::now();
+                        let at = waiting_on.as_ref().map(|w| w.i);
+                        let line = at.map(|j| format!("{}: {} ahead, {} free, {} waiting, {} tickets", nodes[j].url, nodes[j].ahead(my(j)), nodes[j].free(), nodes[j].wanted, nodes[j].queue.len())).unwrap_or_else(|| "in no line".into());
+                        tracing::warn!("{}: waiting {} s for a slot; home {:?}, overdue {overdue}, priority waiting {yield_to_priority}, {line}",
+                                       thread.unwrap_or("(no thread)"), started.elapsed().as_secs(), h.map(|h| nodes[h].url.as_str()));
                     }
                     if prio && _prio_wait.is_none() {
                         *self.priority_waiting.lock().unwrap().entry(model.to_owned()).or_default() += 1;
