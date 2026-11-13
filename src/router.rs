@@ -377,8 +377,11 @@ impl Router {
                     // an overdue newcomer with no spare slot anywhere waits on one node as that node's own threads do,
                     // and takes a slot there on their terms. Taking only slots no home-waiter wanted, it was never
                     // placed while every node had two or more waiting (pod, 2026-11-11: a djinn thread, 3.5 h)
+                    // it keeps the line it joined while that node stays up and unheld: picking the least busy node
+                    // afresh each poll, it hopped whenever another line got shorter and joined each at the back
+                    // (pod 2026-11-13: new threads waited 30-45 min on 19ff469 while home-waiters waited 5)
                     let adopt = if overdue && choice.is_none() && !yield_to_priority {
-                        up.iter().copied().filter(|&i| !nodes[i].held).min_by_key(|&i| (nodes[i].waiting_besides(my(i)) as i64 - nodes[i].free(), nodes[i].load(), i))
+                        wt.map(|(j, _)| j).filter(|j| up.contains(j) && !nodes[*j].held).or_else(|| up.iter().copied().filter(|&i| !nodes[i].held).min_by_key(|&i| (nodes[i].waiting_besides(my(i)) as i64 - nodes[i].free(), nodes[i].load(), i)))
                     } else { None };
                     let choice = choice.or_else(|| adopt.filter(|&a| turn_at(a)).map(|a| match h {
                         None => (a, None, "new"),
@@ -949,6 +952,28 @@ mod tests {
         assert_eq!(order, ["t0", "t1", "t2", "t3"]);
         let n = r.lock_nodes().await;
         assert_eq!((n[0].wanted, n[0].queue.len()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn an_overdue_newcomer_keeps_its_place_when_another_line_gets_shorter() {
+        // pod 2026-11-13: it rejoined the least busy node's line each poll, at the back, and waited 45 min
+        let (mut a, mut b) = (node("a", false, true), node("b", false, true));
+        (a.mine, a.wanted, b.mine, b.wanted) = (2, 1, 2, 2);  // both full, a has the shorter line
+        let mut r = router(vec![a, b], true);
+        r.cfg.newcomer_wait_s = 0;
+        r.cfg.node_down_wait_s = 30;
+        let r = Arc::new(r);
+        let p = { let r = r.clone(); tokio::spawn(async move { r.placed(M, None, None, 10, &[]).await.unwrap() }) };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let ticket = { let n = r.lock_nodes().await; assert_eq!((n[0].wanted, n[1].wanted), (2, 2)); *n[0].queue.last().unwrap() };
+        { let mut n = r.lock_nodes().await; n[1].wanted = 0; }  // b's line empties, b still full
+        r.notify.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        { let n = r.lock_nodes().await; assert_eq!((n[0].wanted, n[1].wanted, n[0].queue.last().copied()), (2, 0, Some(ticket)), "it stays in a's line"); }
+        { let mut n = r.lock_nodes().await; (n[0].mine, n[0].wanted) = (0, 1); }  // a's earlier waiter served; slots free
+        r.notify.notify_waiters();
+        let placed = tokio::time::timeout(Duration::from_secs(3), p).await.expect("placed on a").unwrap();
+        assert_eq!(placed, (0, None));
     }
 
     #[tokio::test]
