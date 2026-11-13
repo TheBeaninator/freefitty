@@ -26,6 +26,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 
 const POLL: Duration = Duration::from_secs(1);
+/// How much further forward another line must put a waiting turn before it moves there (a move costs a cache
+/// transfer or a re-read of the prompt).
+const REBALANCE_TURNS: i64 = 3;
 
 #[derive(Debug, Clone)]
 struct NodeState {
@@ -378,12 +381,20 @@ impl Router {
                     // an overdue newcomer with no spare slot anywhere waits on one node as that node's own threads do,
                     // and takes a slot there on their terms. Taking only slots no home-waiter wanted, it was never
                     // placed while every node had two or more waiting (pod, 2026-11-11: a djinn thread, 3.5 h)
-                    // it keeps the line it joined while that node stays up and unheld: picking the least busy node
-                    // afresh each poll, it hopped whenever another line got shorter and joined each at the back
-                    // (pod 2026-11-13: new threads waited 30-45 min on 19ff469 while home-waiters waited 5)
-                    let adopt = if overdue && choice.is_none() && !yield_to_priority {
-                        wt.map(|(j, _)| j).filter(|j| up.contains(j) && !nodes[*j].held).or_else(|| up.iter().copied().filter(|&i| !nodes[i].held).min_by_key(|&i| (nodes[i].waiting_besides(my(i)) as i64 - nodes[i].free(), nodes[i].load(), i)))
-                    } else { None };
+                    // the line a turn waits in: its home's, or for an overdue turn the one it joined (else the shortest).
+                    // It moves to another line only where it would stand REBALANCE_TURNS further forward, at that line's
+                    // back: hopping whenever another line was shorter, it joined each at the back and waited 30-45 min
+                    // (pod 2026-11-13, 19ff469); never moving, B's 22-deep line kept its turns while A and C sat near
+                    // idle after a window (f5bdcd8). A home-waiter leaves only where its cache moves or its prompt is small
+                    let pos = |i: usize| nodes[i].ahead(my(i)) - nodes[i].free();
+                    let may_leave = overdue || tokens <= self.cfg.spill_tokens || h.is_some_and(|h| self.cfg.move_threads && nodes[h].xfer == Some(true));
+                    let best = up.iter().copied().filter(|&i| !nodes[i].held).min_by_key(|&i| (pos(i), nodes[i].load(), i));
+                    let line = if overdue { wt.map(|(j, _)| j).filter(|j| up.contains(j) && !nodes[*j].held).or(best) } else { h.filter(|&h| !nodes[h].held) };
+                    let line = match (line, best) {
+                        (Some(l), Some(b)) if may_leave && b != l && pos(b) + REBALANCE_TURNS < pos(l) => Some(b),
+                        (l, _) => l,
+                    };
+                    let adopt = if choice.is_none() && !yield_to_priority { line.filter(|&l| Some(l) != h) } else { None };
                     let choice = choice.or_else(|| adopt.filter(|&a| turn_at(a)).map(|a| match h {
                         None => (a, None, "new"),
                         Some(h) if tokens <= self.cfg.spill_tokens || !self.cfg.move_threads || nodes[h].xfer == Some(false) => (a, None, "spilled"),
@@ -404,7 +415,7 @@ impl Router {
                     // priority turn waited, overdue turns never reached the front (pod 2026-11-13: 40-62 min waits
                     // while pod-ff's expedited rounds waited for slots, the median wait 3 min)
                     let kept = wt.map(|(j, _)| j).filter(|j| up.contains(j) && !nodes[*j].held);
-                    let target = if yield_to_priority { kept.or(h.filter(|&h| !nodes[h].held)) } else { h.filter(|&h| !nodes[h].held).or(adopt) };
+                    let target = if yield_to_priority { kept.or(h.filter(|&h| !nodes[h].held)) } else { line };
                     if wt.map(|(j, _)| j) != target {
                         if let Some(w) = waiting_on.take() { w.release_in(&mut nodes); }
                         if let Some(w) = target {
@@ -1014,6 +1025,26 @@ mod tests {
         { let mut n = r.lock_nodes().await; (n[0].mine, n[0].wanted) = (0, 1); }  // the earlier waiter was served
         r.notify.notify_waiters();
         assert_eq!(tokio::time::timeout(Duration::from_secs(3), p).await.expect("placed").unwrap(), (0, None));
+    }
+
+    #[tokio::test]
+    async fn a_waiting_turn_moves_to_a_line_far_shorter_than_its_own() {
+        // pod 2026-11-13: after a window 22 turns waited in B's line while A and C had two or three
+        for overdue in [false, true] {
+            let (mut a, mut b) = (node("a", false, true), node("b", false, true));
+            (a.mine, b.mine, b.wanted) = (2, 2, 6);  // both full; b has six waiting, a none
+            let mut r = router(vec![a, b], true);
+            r.cfg.newcomer_wait_s = 0;
+            r.cfg.node_down_wait_s = 30;
+            let r = Arc::new(r);
+            let home = if overdue { None } else { Some("b") };
+            let p = { let r = r.clone(); tokio::spawn(async move { r.placed(M, Some("t"), home, 10, &[]).await.unwrap() }) };
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            { let n = r.lock_nodes().await; assert_eq!((n[0].wanted, n[1].wanted), (1, 6), "it waits in a's line (overdue {overdue})"); }
+            r.lock_nodes().await[0].mine = 1;
+            r.notify.notify_waiters();
+            assert_eq!(tokio::time::timeout(Duration::from_secs(3), p).await.expect("placed on a").unwrap().0, 0);
+        }
     }
 
     #[tokio::test]
