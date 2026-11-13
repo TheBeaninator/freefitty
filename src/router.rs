@@ -36,6 +36,10 @@ struct NodeState {
     mine: u32,
     mine_at_poll: u32,
     wanted: u32,
+    /// The tickets of the turns in `wanted`, oldest first: a freed slot goes to the turn that has waited longest.
+    /// Woken together and racing for the lock, the waiters took slots by lottery, and under load one waited about
+    /// an hour while the average wait was minutes (pod 2026-11-13: 44 turns on six slots, waits up to 3444 s).
+    queue: std::collections::BTreeSet<u64>,
     held: bool,
     xfer: Option<bool>,
     context_length: u64,
@@ -53,6 +57,18 @@ impl NodeState {
     }
     fn free(&self) -> i64 {
         self.slots as i64 - self.load() as i64
+    }
+    /// Turns waiting here other than the one holding `mine` (its ticket when it waits here).
+    fn waiting_besides(&self, mine: Option<u64>) -> u32 {
+        self.wanted - mine.is_some_and(|t| self.queue.contains(&t)) as u32
+    }
+    /// Turns waiting here ahead of the one holding `mine`: every one, for a turn not waiting here yet. A wait
+    /// counted in `wanted` without a ticket counts as ahead.
+    fn ahead(&self, mine: Option<u64>) -> i64 {
+        match mine {
+            Some(t) if self.queue.contains(&t) => self.wanted as i64 - self.queue.range(t..).count() as i64,
+            _ => self.wanted as i64,
+        }
     }
 }
 
@@ -90,7 +106,9 @@ pub struct Router {
     /// the slots it waits for (one waiting for strixite never holds a DeepSeek turn off the StrixFold pair).
     priority_waiting: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     /// Holds dropped while the nodes were locked: (node, slot rather than wait), applied at the next `lock_nodes`.
-    released: std::sync::Mutex<Vec<(usize, bool)>>,
+    released: std::sync::Mutex<Vec<(usize, bool, u64)>>,
+    /// The next wait's ticket (`NodeState::queue`).
+    tickets: std::sync::atomic::AtomicU64,
 }
 
 /// Counts a priority turn as waiting until it is placed, fails or is dropped (a cancelled slice).
@@ -110,12 +128,14 @@ struct Hold<'a> {
     r: &'a Router,
     i: usize,
     slot: bool,
+    /// A wait's place in the node's queue (0 for a slot).
+    ticket: u64,
 }
 
 impl Hold<'_> {
     /// Give it back under a lock the caller holds already.
     fn release_in(self, nodes: &mut [NodeState]) {
-        release(&mut nodes[self.i], self.slot);
+        release(&mut nodes[self.i], self.slot, self.ticket);
         std::mem::forget(self);
     }
 }
@@ -123,15 +143,15 @@ impl Hold<'_> {
 impl Drop for Hold<'_> {
     fn drop(&mut self) {
         match self.r.nodes.try_lock() {
-            Ok(mut nodes) => release(&mut nodes[self.i], self.slot),
-            Err(_) => self.r.released.lock().unwrap_or_else(|e| e.into_inner()).push((self.i, self.slot)),
+            Ok(mut nodes) => release(&mut nodes[self.i], self.slot, self.ticket),
+            Err(_) => self.r.released.lock().unwrap_or_else(|e| e.into_inner()).push((self.i, self.slot, self.ticket)),
         }
         self.r.notify.notify_waiters();
     }
 }
 
-fn release(n: &mut NodeState, slot: bool) {
-    if slot { n.mine = n.mine.saturating_sub(1) } else { n.wanted = n.wanted.saturating_sub(1) }
+fn release(n: &mut NodeState, slot: bool, ticket: u64) {
+    if slot { n.mine = n.mine.saturating_sub(1) } else { n.wanted = n.wanted.saturating_sub(1); n.queue.remove(&ticket); }
 }
 
 pub struct Turn {
@@ -171,7 +191,7 @@ impl Router {
             .iter()
             .map(|u| {
                 let m = cfg.node_meta.get(u);
-                NodeState { url: u.clone(), up: false, slots: m.and_then(|m| m.slots).unwrap_or(cfg.node_slots), busy: None, mine: 0, mine_at_poll: 0, wanted: 0, held: false, xfer: None,
+                NodeState { url: u.clone(), up: false, slots: m.and_then(|m| m.slots).unwrap_or(cfg.node_slots), busy: None, mine: 0, mine_at_poll: 0, wanted: 0, queue: Default::default(), held: false, xfer: None,
                             context_length: m.and_then(|m| m.context_length).unwrap_or(0), model: None, serves: cfg.node_model(u).to_owned() }
             })
             .collect();
@@ -186,6 +206,7 @@ impl Router {
             priority: Default::default(),
             priority_waiting: Default::default(),
             released: Default::default(),
+            tickets: Default::default(),
         });
         for i in 0..cfg.nodes.len() {
             let r = r.clone();
@@ -215,7 +236,7 @@ impl Router {
     /// The nodes, locked, with the holds dropped since the last lock given back.
     async fn lock_nodes(&self) -> tokio::sync::MutexGuard<'_, Vec<NodeState>> {
         let mut nodes = self.nodes.lock().await;
-        for (i, slot) in std::mem::take(&mut *self.released.lock().unwrap_or_else(|e| e.into_inner())) { release(&mut nodes[i], slot); }
+        for (i, slot, ticket) in std::mem::take(&mut *self.released.lock().unwrap_or_else(|e| e.into_inner())) { release(&mut nodes[i], slot, ticket); }
         nodes
     }
 
@@ -318,7 +339,9 @@ impl Router {
             let notified = self.notify.notified();
             {
                 let mut nodes = self.lock_nodes().await;
-                if let Some(w) = waiting_on.take() { w.release_in(&mut nodes); }
+                // the wait (and its place in the queue) is kept across polls while it stays on one node
+                let wt = waiting_on.as_ref().map(|w| (w.i, w.ticket));
+                let my = |i: usize| wt.filter(|&(j, _)| j == i).map(|(_, t)| t);
                 if self.is_stopping() { bail!("the daemon is stopping"); }
                 let up: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].up && nodes[i].serves == model && !avoid.contains(&i)).collect();
                 if up.is_empty() {
@@ -337,12 +360,14 @@ impl Router {
                     // leaves them one (a burst of overdue newcomers never takes a node's every slot from its own threads)
                     // a priority turn takes any free slot, home-waiters' included
                     let reserve = |w: u32| if prio { 0 } else if overdue { (w as i64 - 1).max(0) } else { w as i64 };
-                    let mut free: Vec<usize> = up.iter().copied().filter(|&i| !nodes[i].held && nodes[i].free() - reserve(nodes[i].wanted) > 0).collect();
+                    let mut free: Vec<usize> = up.iter().copied().filter(|&i| !nodes[i].held && nodes[i].free() - reserve(nodes[i].waiting_besides(my(i))) > 0).collect();
                     // a node a thread can later leave with its cache first; then the least loaded
-                    free.sort_by_key(|&i| (nodes[i].xfer == Some(false), nodes[i].wanted as i64 - nodes[i].free(), nodes[i].load(), i));
+                    free.sort_by_key(|&i| (nodes[i].xfer == Some(false), nodes[i].waiting_besides(my(i)) as i64 - nodes[i].free(), nodes[i].load(), i));
                     let yield_to_priority = !prio && self.priority_waiting.lock().unwrap().get(model).is_some_and(|&n| n > 0);
+                    // a slot on the node a turn waits for goes to the turns that have waited there longest
+                    let turn_at = |i: usize| nodes[i].free() > if prio { 0 } else { nodes[i].ahead(my(i)) };
                     let choice = if yield_to_priority { None } else { match h {
-                        Some(h) if !nodes[h].held && nodes[h].free() > 0 => Some((h, None, "kept")),
+                        Some(h) if !nodes[h].held && turn_at(h) => Some((h, None, "kept")),
                         None if !free.is_empty() => Some((free[0], None, "new")),
                         // a held home is left like a full one, and spilled when its state cannot move
                         Some(h) if !free.is_empty() && (tokens <= self.cfg.spill_tokens || (self.cfg.move_threads && nodes[h].xfer == Some(false)) || (nodes[h].held && (!self.cfg.move_threads || nodes[h].xfer == Some(false)))) => Some((free[0], None, "spilled")),
@@ -353,14 +378,15 @@ impl Router {
                     // and takes a slot there on their terms. Taking only slots no home-waiter wanted, it was never
                     // placed while every node had two or more waiting (pod, 2026-11-11: a djinn thread, 3.5 h)
                     let adopt = if overdue && choice.is_none() && !yield_to_priority {
-                        up.iter().copied().filter(|&i| !nodes[i].held).min_by_key(|&i| (nodes[i].wanted as i64 - nodes[i].free(), nodes[i].load(), i))
+                        up.iter().copied().filter(|&i| !nodes[i].held).min_by_key(|&i| (nodes[i].waiting_besides(my(i)) as i64 - nodes[i].free(), nodes[i].load(), i))
                     } else { None };
-                    let choice = choice.or_else(|| adopt.filter(|&a| nodes[a].free() > 0).map(|a| match h {
+                    let choice = choice.or_else(|| adopt.filter(|&a| turn_at(a)).map(|a| match h {
                         None => (a, None, "new"),
                         Some(h) if tokens <= self.cfg.spill_tokens || !self.cfg.move_threads || nodes[h].xfer == Some(false) => (a, None, "spilled"),
                         Some(h) => (a, Some(h), "moved"),
                     }));
                     if let Some((n, from, why)) = choice {
+                        if let Some(w) = waiting_on.take() { w.release_in(&mut nodes); }
                         nodes[n].mine += 1;
                         let mut c = self.counts.lock().await;
                         match why { "kept" => c.kept += 1, "new" => c.new += 1, "spilled" => c.spilled += 1, _ => c.moved += 1 }
@@ -368,9 +394,18 @@ impl Router {
                         if why == "spilled" {
                             tracing::info!("thread leaves {} (full) for {}; it reads its ~{tokens}-token prompt again there", nodes[h.unwrap()].url, nodes[n].url);
                         }
-                        return Ok((Hold { r: self, i: n, slot: true }, from));
+                        return Ok((Hold { r: self, i: n, slot: true, ticket: 0 }, from));
                     }
-                    if let Some(w) = h.filter(|&h| !nodes[h].held).or(adopt) { nodes[w].wanted += 1; waiting_on = Some(Hold { r: self, i: w, slot: false }); }
+                    let target = h.filter(|&h| !nodes[h].held).or(adopt);
+                    if wt.map(|(j, _)| j) != target {
+                        if let Some(w) = waiting_on.take() { w.release_in(&mut nodes); }
+                        if let Some(w) = target {
+                            let ticket = self.tickets.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            nodes[w].wanted += 1;
+                            nodes[w].queue.insert(ticket);
+                            waiting_on = Some(Hold { r: self, i: w, slot: false, ticket });
+                        }
+                    }
                     if prio && _prio_wait.is_none() {
                         *self.priority_waiting.lock().unwrap().entry(model.to_owned()).or_default() += 1;
                         _prio_wait = Some(PriorityWait(&self.priority_waiting, model.to_owned()));
@@ -796,7 +831,7 @@ mod tests {
 
     fn router(nodes: Vec<NodeState>, move_threads: bool) -> Router {
         let cfg = Config { move_threads, spill_tokens: 1000, ..Config::default() };
-        Router { cfg, client: reqwest::Client::new(), xfer_client: reqwest::Client::new(), nodes: Mutex::new(nodes), counts: Mutex::new(Counts::default()), notify: Notify::new(), stopping: Default::default(), priority: Default::default(), priority_waiting: Default::default(), released: Default::default() }
+        Router { cfg, client: reqwest::Client::new(), xfer_client: reqwest::Client::new(), nodes: Mutex::new(nodes), counts: Mutex::new(Counts::default()), notify: Notify::new(), stopping: Default::default(), priority: Default::default(), priority_waiting: Default::default(), released: Default::default(), tickets: Default::default() }
     }
 
     impl Router {
@@ -826,7 +861,7 @@ mod tests {
     }
 
     fn node(url: &str, held: bool, xfer: bool) -> NodeState {
-        NodeState { url: url.into(), up: true, slots: 2, busy: Some(0), mine: 0, mine_at_poll: 0, wanted: 0, held, xfer: Some(xfer), context_length: 0, model: None, serves: M.into() }
+        NodeState { url: url.into(), up: true, slots: 2, busy: Some(0), mine: 0, mine_at_poll: 0, wanted: 0, queue: Default::default(), held, xfer: Some(xfer), context_length: 0, model: None, serves: M.into() }
     }
 
     #[tokio::test]
@@ -878,11 +913,42 @@ mod tests {
         let p = { let r = r.clone(); tokio::spawn(async move { r.placed(M, None, None, 10, &[]).await.unwrap() }) };
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(r.lock_nodes().await[0].wanted, 3, "it waits beside the home-waiters");
-        r.lock_nodes().await[0].mine = 1;  // a slot frees: it takes it on the same terms as they do
+        r.lock_nodes().await[0].mine = 1;  // a slot frees: the two who waited first come first
+        r.notify.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!p.is_finished(), "it does not jump the queue");
+        { let mut n = r.lock_nodes().await; n[0].wanted = 1; }  // they were served: its turn
         r.notify.notify_waiters();
         let placed = tokio::time::timeout(Duration::from_secs(3), p).await.expect("placed when a slot frees").unwrap();
         assert_eq!(placed, (0, None));
-        assert_eq!(r.lock_nodes().await[0].wanted, 2, "its wait is given back");
+        assert_eq!(r.lock_nodes().await[0].wanted, 0, "its wait is given back");
+    }
+
+    #[tokio::test]
+    async fn a_freed_slot_goes_to_the_turn_that_waited_longest() {
+        // pod 2026-11-13: woken together, waiters took freed slots by lottery; one waited 57 min, the average minutes
+        let mut a = node("a", false, true);
+        a.mine = 2;  // full
+        let r = Arc::new(router(vec![a], true));
+        let mut waiting = Vec::new();
+        for t in ["t0", "t1", "t2", "t3"] {
+            let rt = r.clone();
+            waiting.push(tokio::spawn(async move { rt.placed(M, Some(t), Some("a"), 10, &[]).await.unwrap(); t }));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(r.lock_nodes().await[0].queue.len(), 4);
+        let mut order = Vec::new();
+        for _ in 0..4 {
+            { let mut n = r.lock_nodes().await; n[0].mine -= 1; }  // one slot frees
+            r.notify.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let done: Vec<usize> = (0..waiting.len()).filter(|&i| waiting[i].is_finished()).collect();
+            assert_eq!(done.len(), 1, "one slot, one turn placed");
+            order.push(waiting.remove(done[0]).await.unwrap());
+        }
+        assert_eq!(order, ["t0", "t1", "t2", "t3"]);
+        let n = r.lock_nodes().await;
+        assert_eq!((n[0].wanted, n[0].queue.len()), (0, 0));
     }
 
     #[tokio::test]
