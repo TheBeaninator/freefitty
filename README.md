@@ -59,6 +59,32 @@ budget window and the pre-send check are off; leave steering unset. A node behin
 `node_meta."<url>".bearer_token`, sent as `Authorization: Bearer` on every request to that node. Placement assumes each node keeps a prefix cache per
 conversation; without one every turn re-reads its whole prompt.
 
+### Minimal setup: public strixite or StrixFold
+
+Turns, sleeps, RAP tools, compaction, the budget window, experts and goldfish need only the public routes; what is
+off without the pod patches is everything that moves a cache (parking, moves, frozen experts: an expert is read again at each birth) and
+steering. A test (`a_stock_node_runs_turns_tools_and_goldfish_with_the_pod_features_off`) runs that flow against a
+scripted node with only upstream strixite's routes and against one with only `/v1/chat/completions` and
+`/v1/models`.
+
+```
+# one upstream strixite server (its /health says slots and context length)
+freefitty init --nodes http://127.0.0.1:8080 --model <the model it serves> --listen 127.0.0.1:8191
+```
+
+For a public StrixFold server, when it runs with an API key (its `/health` then says only `{"status":"ok"}`), add
+the key and what `/health` would have said:
+
+```toml
+[node_meta."http://10.0.0.5:18080"]
+bearer_token = "<the server's API key>"
+slots = 1                                  # its max_batch_size
+context_length = 131072
+```
+
+Leave `grant_cmd`, `[[steer]]` in experts and `node_meta` `shared_messages` unset. Without `tool_servers` a thread
+has only the built-in tools (sleep, experts, recall and the like).
+
 ## Run it
 
 ```

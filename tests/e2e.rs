@@ -62,7 +62,7 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
     let tool_names: Vec<&str> = body["tools"].as_array().expect("every request carries tools").iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
     // a goldfish sees only the plain built-ins and what it was granted; everyone else sees every tool
     let goldfish = msgs.iter().any(|m| m["content"].as_str().is_some_and(|c| c.starts_with("You are a goldfish")));
-    assert!(tool_names.contains(&"sleep") && (goldfish || tool_names.contains(&"echo")), "tools offered: {tool_names:?}");
+    assert!(tool_names.contains(&"sleep") && (goldfish || tool_names.contains(&"echo")), "tools offered: {tool_names:?} to {}", serde_json::to_string(&msgs).unwrap().chars().take(600).collect::<String>());
     if content.starts_with("Stop working and refocus") {
         // the refocus ask: notes name how many messages they replace and the focus
         let focus = content.split("The focal point to write around: ").nth(1).map(|f| f.lines().next().unwrap_or("").to_owned());
@@ -1688,4 +1688,50 @@ async fn a_node_naming_another_cache_routes_version_is_not_used_for_transfers() 
     }
     assert_eq!(xfer, (json!(true), json!(false)), "version 1 (or no header) takes transfers; another version does not");
     r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stock_node_runs_turns_tools_and_goldfish_with_the_pod_features_off() {
+    // minimal public setup: upstream strixite (/health, no cache, steer or shared-prefix routes) and a plain
+    // OpenAI-compatible server (no /health either, only /v1/models): every turn, tool and goldfish works, and
+    // FreeFitty sends neither a pod-only field nor a request to a pod-only route beyond the one discovery probe
+    for plain in [false, true] {
+        let mut h = harness().await;
+        let missed: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let m = missed.clone();
+        let mut app = Router::new().route("/v1/chat/completions", post(completions));
+        app = if plain {
+            app.route("/v1/models", get(|| async { Json(json!({"object": "list", "data": [{"id": "fake", "object": "model"}]})) }))
+        } else {
+            app.route("/health", get(health))
+        };
+        let url = serve(app.fallback(move |uri: axum::http::Uri| async move { m.lock().unwrap().push(uri.path().to_owned()); axum::http::StatusCode::NOT_FOUND }).with_state(h.model.clone())).await;
+        h.cfg.nodes = vec![url];
+        if plain { h.cfg.max_context_tokens = 100_000; }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("railhand.toml"), "description = \"knows the rail\"\nack = \"Read.\"\n[[reads]]\ntext = \"B is .51\"\n").unwrap();
+        h.cfg.experts_dir = Some(dir.path().to_path_buf());
+        let r = freefitty::start(h.cfg.clone()).await.unwrap();
+        let api = Api::new(&r);
+        let t = "stock";
+        api.say("sleep please", Some(t)).await;
+        assert!(api.output(t, 10).await.unwrap()["text"].as_str().unwrap().contains("[Tool Call: sleep"));
+        assert_eq!(api.output(t, 10).await.unwrap()["text"], "done: Slept for 1 seconds", "plain={plain}");
+        api.say("echo foo", Some(t)).await;
+        assert!(api.output(t, 10).await.unwrap()["text"].as_str().unwrap().contains("[Tool Call: echo"));
+        assert_eq!(api.output(t, 10).await.unwrap()["text"], "done: echo: foo");
+        api.say("ask what is B", Some(t)).await;
+        assert!(api.output(t, 10).await.unwrap()["text"].as_str().unwrap().contains("[Tool Call: goldfish"));
+        let out = api.output(t, 10).await.unwrap()["text"].as_str().unwrap().to_owned();
+        assert!(out.ends_with("): what is B"), "{out}");
+        let bodies = h.model.bodies.lock().unwrap().clone();
+        assert!(bodies.iter().any(|b| b["messages"][1]["content"].as_str().is_some_and(|c| c.contains("B is .51"))), "the goldfish read its expert");
+        for f in ["steer", "steer_scope", "shared_messages"] {
+            assert!(bodies.iter().all(|b| b.get(f).is_none()), "no {f} sent");
+        }
+        assert!(missed.lock().unwrap().iter().all(|p| p == "/cache/export" || (plain && p == "/health")), "plain={plain}: {:?}", missed.lock().unwrap());
+        let node = api.get("/health").await["nodes"][0].clone();
+        assert_eq!((node["up"].as_bool(), node["xfer"].as_bool()), (Some(true), Some(false)), "{node}");
+        r.shutdown().await;
+    }
 }
