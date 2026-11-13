@@ -400,7 +400,11 @@ impl Router {
                         }
                         return Ok((Hold { r: self, i: n, slot: true, ticket: 0 }, from));
                     }
-                    let target = h.filter(|&h| !nodes[h].held).or(adopt);
+                    // yielding to a priority turn, a wait keeps its place: dropped and rejoined at the back each time a
+                    // priority turn waited, overdue turns never reached the front (pod 2026-11-13: 40-62 min waits
+                    // while pod-ff's expedited rounds waited for slots, the median wait 3 min)
+                    let kept = wt.map(|(j, _)| j).filter(|j| up.contains(j) && !nodes[*j].held);
+                    let target = if yield_to_priority { kept.or(h.filter(|&h| !nodes[h].held)) } else { h.filter(|&h| !nodes[h].held).or(adopt) };
                     if wt.map(|(j, _)| j) != target {
                         if let Some(w) = waiting_on.take() { w.release_in(&mut nodes); }
                         if let Some(w) = target {
@@ -984,6 +988,32 @@ mod tests {
         r.notify.notify_waiters();
         let placed = tokio::time::timeout(Duration::from_secs(3), p).await.expect("placed on a").unwrap();
         assert_eq!(placed, (0, None));
+    }
+
+    #[tokio::test]
+    async fn an_overdue_newcomer_keeps_its_place_while_a_priority_turn_waits() {
+        // pod 2026-11-13: each priority wait dropped overdue turns from their line; they rejoined at the back, 40-62 min
+        let mut a = node("a", false, true);
+        (a.mine, a.wanted) = (2, 1);  // full, one earlier waiter
+        let mut r = router(vec![a], true);
+        r.cfg.newcomer_wait_s = 0;
+        r.cfg.node_down_wait_s = 30;
+        let r = Arc::new(r);
+        let p = { let r = r.clone(); tokio::spawn(async move { r.placed(M, None, None, 10, &[]).await.unwrap() }) };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let ticket = *r.lock_nodes().await[0].queue.last().expect("it waits in a's line");
+        r.set_priority("p", true);
+        let prio = { let r = r.clone(); tokio::spawn(async move { r.placed(M, Some("p"), Some("a"), 10, &[]).await.unwrap() }) };
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(r.lock_nodes().await[0].queue.contains(&ticket), "it keeps its ticket while the priority turn waits");
+        r.lock_nodes().await[0].mine = 1;  // a slot frees: the priority turn takes it
+        r.notify.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(3), prio).await.expect("priority placed").unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(r.lock_nodes().await[0].queue.contains(&ticket), "and after it");
+        { let mut n = r.lock_nodes().await; (n[0].mine, n[0].wanted) = (0, 1); }  // the earlier waiter was served
+        r.notify.notify_waiters();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(3), p).await.expect("placed").unwrap(), (0, None));
     }
 
     #[tokio::test]
