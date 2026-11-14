@@ -197,6 +197,10 @@ struct Say {
     /// Start the thread from this expert's prefix (new threads only).
     #[serde(default)]
     expert: Option<String>,
+    /// The tools this thread may see and call besides the plain built-ins (new threads only), the way an expert's
+    /// list scopes a goldfish. Names from `optin_tool_servers` reach a thread only through such a list.
+    #[serde(default)]
+    tools: Option<Vec<String>>,
 }
 
 async fn say(State(app): Shared, headers: HeaderMap, body: Bytes) -> Response {
@@ -220,10 +224,18 @@ async fn say(State(app): Shared, headers: HeaderMap, body: Bytes) -> Response {
             None => expert_key = Some(key),
         }
     }
+    if let Some(tools) = &req.tools {
+        if tools.len() > 256 || tools.iter().any(|t| t.is_empty() || t.len() > 64) {
+            return err(StatusCode::BAD_REQUEST, "tools must be up to 256 names of 1-64 characters");
+        }
+        if existing.as_ref().is_some_and(|t| t.tools.as_ref() != Some(tools)) {
+            return err(StatusCode::CONFLICT, "the thread exists with another tool list; tools apply to new threads only");
+        }
+    }
     let id = config::id();
     let ev = Event { id: id.clone(), thread: thread.clone(), due_ms: 0, created_ms: 0, attempts: 0, kind: EventKind::User { text: req.text, metadata } };
-    if let Some(key) = expert_key {
-        if let Err(e) = app.store.new_thread_with_expert(&thread, &key, &ev) { return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()); }
+    if existing.is_none() && (expert_key.is_some() || req.tools.is_some()) {
+        if let Err(e) = app.store.new_thread_with(&thread, expert_key.as_deref(), req.tools.clone(), &ev) { return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()); }
     }
     match app.queue.push(ev) {
         Ok(_) => Json(json!({"thread": thread, "id": id})).into_response(),
@@ -368,11 +380,13 @@ async fn compact(State(app): Shared, headers: HeaderMap, Path(id): Path<String>,
 /// Freeze the current experts that have no state for this context, in the background.
 async fn freeze_in_background(app: &Arc<App>) {
     let mut defs = rap::builtin_defs(app.cfg.compaction, app.cfg.window);
-    defs.extend(app.tools.current().await.defs.iter().cloned());
+    let all = app.tools.current().await;
+    defs.extend(all.defs.iter().cloned());
     let defs = app.experts.with_tools(defs).await;
+    let optin = all.optin_defs.clone();
     let app = app.clone();
     tokio::spawn(async move {
-        app.experts.freeze_all(&app.store, &app.router, &app.engine.system, &defs, app.cfg.max_output_tokens).await;
+        app.experts.freeze_all(&app.store, &app.router, &app.engine.system, &defs, &optin, app.cfg.max_output_tokens).await;
     });
 }
 

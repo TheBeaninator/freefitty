@@ -31,10 +31,6 @@ pub struct Tools {
     pub optin_defs: Vec<Value>,
 }
 
-/// The opt-in definitions as last loaded, for `scope_defs`. A thread without a tool list never sees them, so
-/// adding an opt-in server leaves every other thread's request (and its cached prompt) byte for byte as it was.
-static OPTIN: std::sync::RwLock<Vec<Value>> = std::sync::RwLock::new(Vec::new());
-
 pub const SLEEP: &str = "sleep";
 pub const SLEEP_UNTIL: &str = "sleep_until";
 pub const SLEEP_UNTIL_EVENT: &str = "sleep_until_event_or_input";
@@ -55,19 +51,19 @@ pub fn is_builtin(name: &str) -> bool {
 }
 
 /// The definitions a thread with this tool list sees: the plain built-ins and the named tools; None = all.
-/// A named opt-in tool joins the list here; without a list a thread has no opt-in tool at all.
-pub fn scope_defs(defs: Vec<Value>, allow: Option<&[String]>) -> Vec<Value> {
+/// `optin` is `Tools::optin_defs`: a named opt-in tool joins the list here, and without a list a thread has no
+/// opt-in tool at all, so adding an opt-in server leaves every other thread's request byte for byte as it was.
+pub fn scope_defs(defs: Vec<Value>, allow: Option<&[String]>, optin: &[Value]) -> Vec<Value> {
     let Some(allow) = allow else { return defs };
-    let optin = OPTIN.read().map(|v| v.clone()).unwrap_or_default();
     let keep = |d: &Value| {
         let n = d.pointer("/function/name").and_then(|n| n.as_str()).unwrap_or("");
         PLAIN.contains(&n) || allow.iter().any(|a| a == n)
     };
     let mut out: Vec<Value> = defs.into_iter().filter(|d| keep(d)).collect();
     // opt-in tools join after the rest, once each, and only when named
-    for d in optin.into_iter().filter(|d| keep(d)) {
+    for d in optin.iter().filter(|d| keep(d)) {
         if !out.iter().any(|o| o.pointer("/function/name") == d.pointer("/function/name")) {
-            out.push(d);
+            out.push(d.clone());
         }
     }
     out
@@ -196,7 +192,6 @@ pub async fn load_tools(cfg: &Config, store: &Store, client: &reqwest::Client) -
         }
     }
     let t = Tools::from_manifests(&manifests)?;
-    if let Ok(mut o) = OPTIN.write() { *o = t.optin_defs.clone(); }
     tracing::info!("tools: {} from {} server(s), {} opt-in", t.defs.len(), manifests.len(), t.optin_defs.len());
     Ok(t)
 }
@@ -432,11 +427,11 @@ mod tests {
         let t = Tools::from_manifests(&[("a".into(), m("open_tool"), false), ("b".into(), m("buzz_post"), true)]).unwrap();
         assert_eq!(t.defs.len(), 1);
         assert!(t.get("buzz_post").is_some(), "an opt-in tool is still dispatched by name");
-        *OPTIN.write().unwrap() = t.optin_defs.clone();
         let names = |v: Vec<Value>| v.iter().map(|d| d["function"]["name"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
-        assert_eq!(names(scope_defs(t.defs.clone(), None)), ["open_tool"]);
-        assert_eq!(names(scope_defs(t.defs.clone(), Some(&["buzz_post".to_owned()]))), ["buzz_post"]);
-        assert_eq!(names(scope_defs(t.defs.clone(), Some(&["open_tool".to_owned(), "buzz_post".to_owned()]))), ["open_tool", "buzz_post"]);
+        let o = &t.optin_defs;
+        assert_eq!(names(scope_defs(t.defs.clone(), None, o)), ["open_tool"]);
+        assert_eq!(names(scope_defs(t.defs.clone(), Some(&["buzz_post".to_owned()]), o)), ["buzz_post"]);
+        assert_eq!(names(scope_defs(t.defs.clone(), Some(&["open_tool".to_owned(), "buzz_post".to_owned()]), o)), ["open_tool", "buzz_post"]);
     }
 
     #[test]

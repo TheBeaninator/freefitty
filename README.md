@@ -234,7 +234,7 @@ server that is down. An invocation is posted to the
 manifest's endpoint after its slice committed; one the server does not acknowledge is posted again with a growing
 wait (30 s to 10 min) and, after twelve tries or a 4xx other than 429, becomes an error result so the thread is
 not stuck forever. Manifests are read at start and every `toolset_refresh_s` (300, at least 10).
-A server in `optin_tool_servers` is read the same way, but its tools are left out of every thread's tool list unless that list names them (an expert that declares them, a goldfish granted them), so adding one changes no other thread's request and no cached prompt.
+A server in `optin_tool_servers` is read the same way, but its tools are left out of every thread's tool list unless that list names them (an expert that declares them, a goldfish granted them), so adding one changes no other thread's request and no cached prompt. `POST /say` with `tools` gives a new thread its list (with or without an `expert`): a long-lived thread that acts through an opt-in server, such as a Buzz member through buzz-rap.
 On start the daemon resumes invocations a crash left unacknowledged. Results come back to
 `<callback_base>/rap/callback/<callback_token>` (or with the token as a bearer); a result posted twice queues once,
 however close together; the callback also takes RAP's `subscription_event`, `oauth` and `user_choice` messages. A
@@ -257,7 +257,7 @@ limit (`max_body_bytes`) bounds what a tool can send, so a tool should downscale
 **API** (`listen`, loopback by default; a front door with TLS is Caddy's or a wireguard peer's job):
 
 ```
-POST /say                 {text, thread?, expert?, metadata?}  -> {thread, id}         operator token
+POST /say                 {text, thread?, expert?, tools?, metadata?}  -> {thread, id} operator token
 GET  /output?wait&thread  the oldest uncollected reply; removed once sent; 204 if none  operator token
 GET  /threads             id, size, pending calls, last message kind, node, closed      operator token
 GET  /threads/{id}        meta: live_tokens, prompt_tokens, window, compaction, expert  operator token

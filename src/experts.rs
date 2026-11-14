@@ -375,12 +375,12 @@ impl Experts {
     }
 
     /// Freeze every current expert that has no state for this context; failures are logged.
-    pub async fn freeze_all(&self, store: &Store, router: &Router, system: &str, defs: &[Value], max_tokens: u64) {
+    pub async fn freeze_all(&self, store: &Store, router: &Router, system: &str, defs: &[Value], optin: &[Value], max_tokens: u64) {
         let keys: Vec<String> = self.current.read().await.values().cloned().collect();
         for key in keys {
             // frozen in the context a thread born from it sees: the tools its list allows
             let tools = store.expert(&key).ok().flatten().and_then(|e| e.tools);
-            let scoped = rap::scope_defs(defs.to_vec(), tools.as_deref());
+            let scoped = rap::scope_defs(defs.to_vec(), tools.as_deref(), optin);
             if let Err(e) = self.freeze(&key, store, router, system, &scoped, max_tokens).await { tracing::warn!("expert {key}: not frozen: {e:#}"); }
         }
     }

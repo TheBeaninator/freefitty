@@ -62,6 +62,8 @@ async fn completions(State(m): State<Arc<FakeModel>>, Json(body): Json<Value>) -
     let tool_names: Vec<&str> = body["tools"].as_array().expect("every request carries tools").iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
     // a goldfish sees only the plain built-ins and what it was granted; everyone else sees every tool
     let goldfish = msgs.iter().any(|m| m["content"].as_str().is_some_and(|c| c.starts_with("You are a goldfish")));
+    // the opt-in test's threads lack the echo tool on purpose
+    let goldfish = goldfish || msgs.iter().any(|m| m["content"].as_str().is_some_and(|c| c.starts_with("optin ")));
     assert!(tool_names.contains(&"sleep") && (goldfish || tool_names.contains(&"echo")), "tools offered: {tool_names:?} to {}", serde_json::to_string(&msgs).unwrap().chars().take(600).collect::<String>());
     if content.starts_with("Stop working and refocus") {
         // the refocus ask: notes name how many messages they replace and the focus
@@ -1734,4 +1736,32 @@ async fn a_stock_node_runs_turns_tools_and_goldfish_with_the_pod_features_off() 
         assert_eq!((node["up"].as_bool(), node["xfer"].as_bool()), (Some(true), Some(false)), "{node}");
         r.shutdown().await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn optin_tools_reach_only_threads_that_list_them() {
+    let mut h = harness().await;
+    h.cfg.optin_tool_servers = std::mem::take(&mut h.cfg.tool_servers);
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    api.say("optin plain", Some("plain")).await;
+    let listed = api.post("/say", json!({"text": "optin listed", "thread": "listed", "tools": ["echo"]})).await;
+    assert_eq!(listed["thread"], "listed", "{listed}");
+    let tools_of = |needle: &str| -> Option<Vec<String>> {
+        h.model.bodies.lock().unwrap().iter().find(|b| b.to_string().contains(needle))
+            .map(|b| b["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_owned()).collect())
+    };
+    for _ in 0..100 {
+        if tools_of("optin plain").is_some() && tools_of("optin listed").is_some() { break; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let plain = tools_of("optin plain").expect("the plain thread ran");
+    let listed = tools_of("optin listed").expect("the listed thread ran");
+    let has = |v: &[String], n: &str| v.iter().any(|x| x == n);
+    assert!(has(&plain, "sleep") && !has(&plain, "echo"), "a thread without a list gets no opt-in tool: {plain:?}");
+    assert!(has(&listed, "echo") && has(&listed, "sleep"), "a listed thread gets its opt-in tool: {listed:?}");
+    assert!(!has(&listed, "goldfish"), "a listed thread sees the plain built-ins and its list only: {listed:?}");
+    let again = api.post("/say", json!({"text": "optin again", "thread": "listed", "tools": ["other"]})).await;
+    assert!(again["error"].as_str().is_some_and(|e| e.contains("another tool list")), "{again}");
+    r.shutdown().await;
 }

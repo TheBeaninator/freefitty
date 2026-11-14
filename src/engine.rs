@@ -335,7 +335,7 @@ impl Engine {
         defs.extend(tools.defs.iter().cloned());
         let defs = self.experts.with_tools(defs).await;
         // a thread born with a tool list (a goldfish, an expert that declares one) sees and may call only those
-        let defs = rap::scope_defs(defs, meta.tools.as_deref());
+        let defs = rap::scope_defs(defs, meta.tools.as_deref(), &tools.optin_defs);
         let allowed: std::collections::HashSet<String> = defs.iter().filter_map(|d| d.pointer("/function/name").and_then(|n| n.as_str()).map(str::to_owned)).collect();
         self.note_instructions(&mut meta, history.len() as u64, &defs);
         let mut asked = 0usize;
@@ -826,9 +826,10 @@ impl Engine {
         // frozen in the context its goldfish will see: the plain built-ins and its own tools (from the whole set,
         // not the commissioning thread's, which may be scoped)
         let mut full = rap::builtin_defs(self.cfg.compaction, self.cfg.window);
-        full.extend(self.tools.current().await.defs.iter().cloned());
+        let all = self.tools.current().await;
+        full.extend(all.defs.iter().cloned());
         let full = self.experts.with_tools(full).await;
-        let scoped = rap::scope_defs(full, e.tools.as_deref());
+        let scoped = rap::scope_defs(full, e.tools.as_deref(), &all.optin_defs);
         let (experts, store, router, system, max) = (self.experts.clone(), self.store.clone(), self.router.clone(), self.system.clone(), self.cfg.max_output_tokens);
         tokio::spawn(async move {
             let text = match experts.freeze(&key, &store, &router, &system, &scoped, max).await {
@@ -905,12 +906,13 @@ impl Engine {
             // what a thread born now would import stays: every current expert in the current context, with every
             // tool and with its own tool list (a goldfish's)
             let mut defs = rap::builtin_defs(self.cfg.compaction, self.cfg.window);
-            defs.extend(self.tools.current().await.defs.iter().cloned());
+            let all = self.tools.current().await;
+            defs.extend(all.defs.iter().cloned());
             let defs = self.experts.with_tools(defs).await;
             for key in self.experts.current.read().await.values() {
                 let own = self.store.expert(key).ok().flatten().and_then(|e| e.tools).unwrap_or_default();
                 for scope in [None, Some(own.as_slice())] {
-                    let ctx = crate::experts::context(&self.system, &rap::scope_defs(defs.clone(), scope));
+                    let ctx = crate::experts::context(&self.system, &rap::scope_defs(defs.clone(), scope, &all.optin_defs));
                     if let Some(p) = self.experts.state(key, &ctx) { crate::park::touch(&p); }
                 }
             }
@@ -936,8 +938,9 @@ impl Engine {
         let history = self.store.messages(thread).ok()?;
         let p = prefix(&self.system, &self.store, &meta).ok()?;
         let mut defs = rap::builtin_defs(self.cfg.compaction, self.cfg.window);
-        defs.extend(self.tools.current().await.defs.iter().cloned());
-        let defs = rap::scope_defs(self.experts.with_tools(defs).await, meta.tools.as_deref());
+        let all = self.tools.current().await;
+        defs.extend(all.defs.iter().cloned());
+        let defs = rap::scope_defs(self.experts.with_tools(defs).await, meta.tools.as_deref(), &all.optin_defs);
         let mut messages = live_view(&p, &meta, &history, &meta.pending, self.page_min());
         self.fade(&mut messages, &meta, &history);
         let mut body = json!({"model": self.model_of(&meta), "messages": messages, "tools": defs, "max_tokens": self.cfg.max_output_tokens, "stream": false});

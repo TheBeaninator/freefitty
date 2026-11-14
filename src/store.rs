@@ -461,13 +461,15 @@ impl Store {
     }
 
     /// Create a thread pinned to an expert version before its first event is queued.
-    pub fn new_thread_with_expert(&self, thread: &str, key: &str, first: &Event) -> Result<()> {
+    /// Create a thread before its first message is queued: started from an expert's prefix, given a tool list,
+    /// or both. A thread that exists already is left as it is.
+    pub fn new_thread_with(&self, thread: &str, expert: Option<&str>, tools: Option<Vec<String>>, first: &Event) -> Result<()> {
         let w = self.db.begin_write()?;
         {
             let mut threads = w.open_table(THREADS)?;
             if threads.get(thread)?.is_none() {
                 let md = match &first.kind { EventKind::User { metadata, .. } => metadata.clone(), _ => Value::Null };
-                let t = ThreadMeta { created_ms: now_ms(), updated_ms: now_ms(), metadata: md, expert: Some(key.to_owned()), ..Default::default() };
+                let t = ThreadMeta { created_ms: now_ms(), updated_ms: now_ms(), metadata: md, expert: expert.map(str::to_owned), tools, ..Default::default() };
                 threads.insert(thread, enc(&t).as_slice())?;
             }
         }
