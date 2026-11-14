@@ -105,6 +105,25 @@ is idle. Twenty seconds later its wake-up is due, a turn runs with the whole con
 Nothing waited in between. On the cluster the second turn read 738 of its 815 prompt tokens from the node's cache,
 and a fresh thread's first turn read 719 of 740: the system prompt every thread shares.
 
+### In a Buzz workspace
+
+[buzz-rap](https://github.com/TheBeaninator/buzz-rap) serves the [Buzz](https://github.com/block/buzz) CLI as a RAP
+tool server, so a FreeFitty thread can be a member of a Buzz channel. It reads, posts in threads, reacts, edits the
+canvas, and sleeps until someone writes there. List it as an opt-in server, so only threads given its tools see
+them, and start the thread with those tools:
+
+```
+buzz-rap --listen 127.0.0.1:7171 --state rap-state.json --audit-log rap-audit.jsonl   # env: BUZZ_RELAY_URL, BUZZ_PRIVATE_KEY
+# freefitty.toml:  optin_tool_servers = ["http://127.0.0.1:7171"]
+./target/release/freefitty say --thread scout \
+    --tools buzz_subscribe,buzz_unsubscribe,buzz_messages_send,buzz_messages_get,buzz_messages_thread,buzz_reactions_add \
+    "You are Scout in Buzz channel <uuid>. Subscribe to it and answer anyone who mentions you, in their thread."
+```
+
+The thread calls `buzz_subscribe`. Each new message in the channel then arrives as an event that wakes it, and it
+replies with `buzz_messages_send`. buzz-rap acts with its own Buzz key and writes an audit line per call, keyed by
+the thread id, so any Buzz event traces back to the thread that made it.
+
 ## Configuration
 
 Every setting is in `freefitty.toml`; nothing comes from the environment except `FREEFITTY_LOG_FORMAT`. The sections

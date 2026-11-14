@@ -47,6 +47,9 @@ enum Cmd {
         /// Start the thread from this expert's prefix.
         #[arg(short, long)]
         expert: Option<String>,
+        /// A new thread's tool list, comma-separated: it sees the plain built-ins and these (opt-in tools included).
+        #[arg(long, value_delimiter = ',')]
+        tools: Option<Vec<String>>,
     },
     /// Send a message and print the thread's replies as they arrive (Ctrl-C to stop).
     Chat {
@@ -55,6 +58,9 @@ enum Cmd {
         thread: Option<String>,
         #[arg(short, long)]
         expert: Option<String>,
+        /// A new thread's tool list, comma-separated (see `say`).
+        #[arg(long, value_delimiter = ',')]
+        tools: Option<Vec<String>>,
     },
     /// Refocus a thread before its next turn (compaction must be on); --focus names the focal point.
     Compact {
@@ -176,14 +182,14 @@ async fn main() -> Result<()> {
             running.shutdown().await;
             Ok(())
         }
-        Cmd::Say { text, thread, expert } => {
+        Cmd::Say { text, thread, expert, tools } => {
             let c = Client::new(&cli.config)?;
-            println!("{}", c.say(&text, thread.as_deref(), expert.as_deref()).await?);
+            println!("{}", c.say(&text, thread.as_deref(), expert.as_deref(), tools.as_deref()).await?);
             Ok(())
         }
-        Cmd::Chat { text, thread, expert } => {
+        Cmd::Chat { text, thread, expert, tools } => {
             let c = Client::new(&cli.config)?;
-            let sent = c.say(&text, thread.as_deref(), expert.as_deref()).await?;
+            let sent = c.say(&text, thread.as_deref(), expert.as_deref(), tools.as_deref()).await?;
             let t = sent["thread"].as_str().unwrap_or_default().to_owned();
             eprintln!("thread {t}");
             c.watch(Some(&t)).await
@@ -400,10 +406,11 @@ impl Client {
         Self::check(self.http.delete(format!("{}{path}", self.base)).bearer_auth(&self.token).send().await.context("is the daemon running?")?).await
     }
 
-    async fn say(&self, text: &str, thread: Option<&str>, expert: Option<&str>) -> Result<Value> {
+    async fn say(&self, text: &str, thread: Option<&str>, expert: Option<&str>, tools: Option<&[String]>) -> Result<Value> {
         let mut body = json!({"text": text});
         if let Some(t) = thread { body["thread"] = json!(t); }
         if let Some(e) = expert { body["expert"] = json!(e); }
+        if let Some(t) = tools { body["tools"] = json!(t); }
         self.post("/say", &body).await
     }
 
