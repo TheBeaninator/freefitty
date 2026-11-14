@@ -27,6 +27,9 @@ enum Cmd {
         /// RAP tool servers, comma-separated.
         #[arg(long, value_delimiter = ',')]
         tool_servers: Vec<String>,
+        /// Opt-in RAP tool servers, comma-separated: their tools reach only threads whose tool list names them.
+        #[arg(long, value_delimiter = ',')]
+        optin_tool_servers: Vec<String>,
         #[arg(long)]
         listen: Option<String>,
         #[arg(long)]
@@ -142,11 +145,12 @@ enum Cmd {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Init { nodes, tool_servers, listen, model, data_dir, callback_base } => {
+        Cmd::Init { nodes, tool_servers, optin_tool_servers, listen, model, data_dir, callback_base } => {
             if cli.config.exists() { bail!("{} exists; delete it to start over", cli.config.display()); }
             let mut c = Config::fresh();
             c.nodes = nodes;
             c.tool_servers = tool_servers;
+            c.optin_tool_servers = optin_tool_servers;
             if let Some(l) = listen { c.listen = l; }
             if let Some(m) = model { c.model = m; }
             if let Some(d) = data_dir { c.data_dir = d; }

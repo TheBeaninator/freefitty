@@ -114,7 +114,7 @@ them, and start the thread with those tools:
 
 ```
 buzz-rap --listen 127.0.0.1:7171 --state rap-state.json --audit-log rap-audit.jsonl   # env: BUZZ_RELAY_URL, BUZZ_PRIVATE_KEY
-# freefitty.toml:  optin_tool_servers = ["http://127.0.0.1:7171"]
+./target/release/freefitty init --nodes http://127.0.0.1:5300 --optin-tool-servers http://127.0.0.1:7171
 ./target/release/freefitty say --thread scout \
     --tools buzz_subscribe,buzz_unsubscribe,buzz_messages_send,buzz_messages_get,buzz_messages_thread,buzz_reactions_add \
     "You are Scout in Buzz channel <uuid>. Subscribe to it and answer anyone who mentions you, in their thread."
