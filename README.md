@@ -124,6 +124,7 @@ below explain each one; this is the list, with defaults.
 | `node_down_wait_s` | 120 | how long a turn waits while no node serving its model is up |
 | `grant_cmd`, `grant_check_s` | none, 5 | the command that says a node is held, and how often it runs |
 | `tool_servers`, `toolset_refresh_s` | none, 300 | RAP servers and how often their manifests are read |
+| `optin_tool_servers` | none | RAP servers whose tools only a thread with a tool list naming them sees (an expert's list, a goldfish's grant); threads without a list keep exactly the `tool_servers` tools |
 | `callback_base` | `http://<listen>` | the URL tool servers call back |
 | `operator_token`, `callback_token` | written by `init` | 16+ URL-safe characters each, different |
 | `max_output_tokens` | 16384 | a turn's output cap |
@@ -233,6 +234,7 @@ server that is down. An invocation is posted to the
 manifest's endpoint after its slice committed; one the server does not acknowledge is posted again with a growing
 wait (30 s to 10 min) and, after twelve tries or a 4xx other than 429, becomes an error result so the thread is
 not stuck forever. Manifests are read at start and every `toolset_refresh_s` (300, at least 10).
+A server in `optin_tool_servers` is read the same way, but its tools are left out of every thread's tool list unless that list names them (an expert that declares them, a goldfish granted them), so adding one changes no other thread's request and no cached prompt.
 On start the daemon resumes invocations a crash left unacknowledged. Results come back to
 `<callback_base>/rap/callback/<callback_token>` (or with the token as a bearer); a result posted twice queues once,
 however close together; the callback also takes RAP's `subscription_event`, `oauth` and `user_choice` messages. A

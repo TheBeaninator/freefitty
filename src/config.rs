@@ -100,6 +100,10 @@ pub struct Config {
     /// RAP tool servers; each one's /.well-known/rap-toolset is read at start and every `toolset_refresh_s`.
     #[serde(default)]
     pub tool_servers: Vec<String>,
+    /// RAP tool servers whose tools only a thread with a tool list naming them sees (an expert's list, a
+    /// goldfish's grant). Threads without a list keep exactly the tools above, so their cached prompts hold.
+    #[serde(default)]
+    pub optin_tool_servers: Vec<String>,
     #[serde(default = "d_toolset_refresh")]
     pub toolset_refresh_s: u64,
     /// The address tool servers post results to. They append /rap/callback/<callback_token>.

@@ -25,9 +25,15 @@ pub struct Tool {
 #[derive(Default)]
 pub struct Tools {
     by_name: HashMap<String, Tool>,
-    /// The `tools` array of a chat completion request, built once.
+    /// The `tools` array of a chat completion request, built once: every tool but the opt-in servers'.
     pub defs: Vec<Value>,
+    /// Tools of `optin_tool_servers`: offered only to a thread whose tool list names them.
+    pub optin_defs: Vec<Value>,
 }
+
+/// The opt-in definitions as last loaded, for `scope_defs`. A thread without a tool list never sees them, so
+/// adding an opt-in server leaves every other thread's request (and its cached prompt) byte for byte as it was.
+static OPTIN: std::sync::RwLock<Vec<Value>> = std::sync::RwLock::new(Vec::new());
 
 pub const SLEEP: &str = "sleep";
 pub const SLEEP_UNTIL: &str = "sleep_until";
@@ -49,12 +55,22 @@ pub fn is_builtin(name: &str) -> bool {
 }
 
 /// The definitions a thread with this tool list sees: the plain built-ins and the named tools; None = all.
+/// A named opt-in tool joins the list here; without a list a thread has no opt-in tool at all.
 pub fn scope_defs(defs: Vec<Value>, allow: Option<&[String]>) -> Vec<Value> {
     let Some(allow) = allow else { return defs };
-    defs.into_iter().filter(|d| {
+    let optin = OPTIN.read().map(|v| v.clone()).unwrap_or_default();
+    let keep = |d: &Value| {
         let n = d.pointer("/function/name").and_then(|n| n.as_str()).unwrap_or("");
         PLAIN.contains(&n) || allow.iter().any(|a| a == n)
-    }).collect()
+    };
+    let mut out: Vec<Value> = defs.into_iter().filter(|d| keep(d)).collect();
+    // opt-in tools join after the rest, once each, and only when named
+    for d in optin.into_iter().filter(|d| keep(d)) {
+        if !out.iter().any(|o| o.pointer("/function/name") == d.pointer("/function/name")) {
+            out.push(d);
+        }
+    }
+    out
 }
 
 /// A goldfish's tool list: what it was granted, less what only an elephant may call.
@@ -128,9 +144,9 @@ impl Tools {
         self.by_name.get(name)
     }
 
-    fn from_manifests(manifests: &[(String, Value)]) -> Result<Tools> {
+    fn from_manifests(manifests: &[(String, Value, bool)]) -> Result<Tools> {
         let mut t = Tools::default();
-        for (url, m) in manifests {
+        for (url, m, optin) in manifests {
             let endpoint = m.get("endpoint").and_then(|e| e.as_str()).with_context(|| format!("{url}: manifest has no endpoint"))?.to_owned();
             for tool in m.get("tools").and_then(|t| t.as_array()).into_iter().flatten() {
                 let name = tool.get("name").and_then(|n| n.as_str()).with_context(|| format!("{url}: a tool has no name"))?.to_owned();
@@ -147,7 +163,7 @@ impl Tools {
                     "description": tool.get("description").and_then(|d| d.as_str()).unwrap_or(""),
                     "parameters": tool.get("inputSchema").cloned().unwrap_or(json!({"type": "object", "properties": {}})),
                 }});
-                t.defs.push(def.clone());
+                if *optin { t.optin_defs.push(def.clone()) } else { t.defs.push(def.clone()) }
                 t.by_name.insert(name.clone(), Tool { name, endpoint: endpoint.clone(), def });
             }
         }
@@ -158,28 +174,30 @@ impl Tools {
 /// Read every server's manifest; a server that does not answer keeps the manifest last stored for it.
 pub async fn load_tools(cfg: &Config, store: &Store, client: &reqwest::Client) -> Result<Tools> {
     let mut manifests = Vec::new();
-    for url in &cfg.tool_servers {
+    let servers = cfg.tool_servers.iter().map(|u| (u, false)).chain(cfg.optin_tool_servers.iter().map(|u| (u, true)));
+    for (url, optin) in servers {
         let base = url.trim_end_matches('/');
         match client.get(format!("{base}/.well-known/rap-toolset")).send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                 Ok(m) => {
                     store.save_toolset(base, &m)?;
-                    manifests.push((base.to_owned(), m));
+                    manifests.push((base.to_owned(), m, optin));
                 }
                 Err(e) => tracing::warn!("tool server {base}: manifest is not JSON ({e})"),
             },
             Ok(r) => tracing::warn!("tool server {base}: manifest answered {}", r.status()),
             Err(e) => tracing::warn!("tool server {base}: {e}"),
         }
-        if manifests.last().is_none_or(|(u, _)| u != base) {
+        if manifests.last().is_none_or(|(u, _, _)| u != base) {
             if let Some(m) = store.toolset(base)? {
                 tracing::info!("tool server {base}: using the manifest stored earlier");
-                manifests.push((base.to_owned(), m));
+                manifests.push((base.to_owned(), m, optin));
             }
         }
     }
     let t = Tools::from_manifests(&manifests)?;
-    tracing::info!("tools: {} from {} server(s)", t.defs.len(), manifests.len());
+    if let Ok(mut o) = OPTIN.write() { *o = t.optin_defs.clone(); }
+    tracing::info!("tools: {} from {} server(s), {} opt-in", t.defs.len(), manifests.len(), t.optin_defs.len());
     Ok(t)
 }
 
@@ -406,6 +424,19 @@ mod tests {
         let mut other = body.clone();
         other["content"][1]["data"] = json!("ZZZ=");
         assert_ne!(callback_event(&other).unwrap().unwrap().id, ev.id);
+    }
+
+    #[test]
+    fn optin_tools_reach_only_threads_that_name_them() {
+        let m = |name: &str| json!({"endpoint": "http://s/invoke", "tools": [{"name": name}]});
+        let t = Tools::from_manifests(&[("a".into(), m("open_tool"), false), ("b".into(), m("buzz_post"), true)]).unwrap();
+        assert_eq!(t.defs.len(), 1);
+        assert!(t.get("buzz_post").is_some(), "an opt-in tool is still dispatched by name");
+        *OPTIN.write().unwrap() = t.optin_defs.clone();
+        let names = |v: Vec<Value>| v.iter().map(|d| d["function"]["name"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        assert_eq!(names(scope_defs(t.defs.clone(), None)), ["open_tool"]);
+        assert_eq!(names(scope_defs(t.defs.clone(), Some(&["buzz_post".to_owned()]))), ["buzz_post"]);
+        assert_eq!(names(scope_defs(t.defs.clone(), Some(&["open_tool".to_owned(), "buzz_post".to_owned()]))), ["open_tool", "buzz_post"]);
     }
 
     #[test]
