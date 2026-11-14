@@ -14,6 +14,7 @@ pub mod engine;
 pub mod park;
 pub mod experts;
 pub mod metrics;
+pub mod ondemand;
 pub mod queue;
 pub mod rap;
 pub mod router;

@@ -32,7 +32,7 @@ rail, all Strix Halo machines. Each node serves one model, by default `model`; `
 with its context length and slots, so the strixite workers (two slots, 262,144 tokens) and the StrixFold pair
 (DeepSeek V4.1 across two nodes; [StrixFold](https://github.com/TheBeaninator/StrixFold), from
 [TensorFold](https://github.com/ashhart/TensorFold)) are nodes of one router, and a turn runs only on nodes serving
-its model. The pod's work cards run as FreeFitty threads: pod-ff opens a thread per card round and watches it, pod-hands is the tool server the threads call, and the board decides what runs.
+its model. A node can be an on-demand window engine (`window_url`, `window_up`): when a turn of its model finds it down, FreeFitty asks for a window, a capped number of turns wait while it loads, the rest are deferred without counting an attempt, and the window's own time limit ends it. The pod's work cards run as FreeFitty threads: pod-ff opens a thread per card round and watches it, pod-hands is the tool server the threads call, and the board decides what runs.
 In about 6,900 lines of Rust: a queue with due times and a scheduler; one [redb](https://github.com/cberner/redb)
 file for every table; the nodes' own slot counts for capacity; one process for the API, the queue, the router, the
 tool calls and their callbacks; a systemd unit.
@@ -116,7 +116,7 @@ below explain each one; this is the list, with defaults.
 | `data_dir` | `data` | store, parked and frozen states, backups, instructions |
 | `model` | `qwen3.8-flash-next` | the model a thread runs on unless its expert names another, and every node's unless `node_meta` says |
 | `nodes` | none | node URLs |
-| `node_meta."<url>"` | none | per node: `model`, `context_length`, `slots`, `bearer_token`, `grant` (false: not under `grant_cmd`), `down_wait_s`, `shared_messages`, `keep_step` |
+| `node_meta."<url>"` | none | per node: `model`, `context_length`, `slots`, `bearer_token`, `grant` (false: not under `grant_cmd`), `down_wait_s`, `shared_messages`, `keep_step`, `window_url`/`window_up`/`window_park`/`window_retry_s` (an on-demand window engine) |
 | `node_slots` | 2 | slots assumed while a node's `/health` does not say |
 | `spill_tokens` | 16384 | a thread under this may leave a full node and read its prompt again |
 | `move_threads` | on | a thread over it leaves a full node with its cache |

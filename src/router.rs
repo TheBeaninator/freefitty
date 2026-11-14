@@ -112,6 +112,8 @@ pub struct Router {
     released: std::sync::Mutex<Vec<(usize, bool, u64)>>,
     /// The next wait's ticket (`NodeState::queue`).
     tickets: std::sync::atomic::AtomicU64,
+    /// On-demand window engines' state (ondemand.rs).
+    windows: crate::ondemand::Windows,
 }
 
 /// Counts a priority turn as waiting until it is placed, fails or is dropped (a cancelled slice).
@@ -177,11 +179,14 @@ pub enum ChatError {
     Rejected(String),
     /// The daemon is stopping and the turn never reached a node: nothing ran, the slice re-queues as it was.
     Stopping,
+    /// The turn's model is an on-demand window engine whose window is not open and enough turns wait for it:
+    /// nothing ran, the slice runs again in the given seconds without counting an attempt.
+    Pending(String, u64),
 }
 impl std::fmt::Display for ChatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ChatError::Transient(s) | ChatError::Rejected(s) => f.write_str(s),
+            ChatError::Transient(s) | ChatError::Rejected(s) | ChatError::Pending(s, _) => f.write_str(s),
             ChatError::Stopping => f.write_str("the daemon is stopping"),
         }
     }
@@ -210,6 +215,7 @@ impl Router {
             priority_waiting: Default::default(),
             released: Default::default(),
             tickets: Default::default(),
+            windows: Default::default(),
         });
         for i in 0..cfg.nodes.len() {
             let r = r.clone();
@@ -339,8 +345,11 @@ impl Router {
         let mut waiting_on: Option<Hold> = None;
         let mut waited = false;
         let mut reported = Instant::now();
+        let window = self.cfg.window_for(model);
+        let mut _parked: Option<crate::ondemand::Parked> = None;
         loop {
             let notified = self.notify.notified();
+            let mut want_window = false;
             {
                 let mut nodes = self.lock_nodes().await;
                 // the wait (and its place in the queue) is kept across polls while it stays on one node
@@ -349,7 +358,13 @@ impl Router {
                 if self.is_stopping() { bail!("the daemon is stopping"); }
                 let up: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].up && nodes[i].serves == model && !avoid.contains(&i)).collect();
                 if up.is_empty() {
-                    if started.elapsed() >= Duration::from_secs(self.cfg.down_wait_s(model)) {
+                    if let Some(w) = &window {
+                        if _parked.is_none() { _parked = Some(self.windows.park(model, w)?); }
+                        if started.elapsed() >= Duration::from_secs(self.cfg.down_wait_s(model)) {
+                            return Err(crate::ondemand::WindowPending { msg: format!("{model} window not open after {} s; retry in {} s", started.elapsed().as_secs(), w.retry_s), retry_s: w.retry_s }.into());
+                        }
+                        want_window = true;
+                    } else if started.elapsed() >= Duration::from_secs(self.cfg.down_wait_s(model)) {
                         bail!("no node serving {model} is up");
                     }
                 } else {
@@ -440,6 +455,8 @@ impl Router {
                     }
                 }
             }
+            // asked outside the node lock: window_url is a process
+            if let (true, Some(w)) = (want_window, &window) { self.windows.poke(model, w).await?; }
             waited = true;
             let _ = tokio::time::timeout(POLL, notified).await;
         }
@@ -644,7 +661,9 @@ impl Router {
         let placed_at = Instant::now();
         loop {
             let (slot, from) = self.place(&model, thread, home, tokens, &avoid).await
-                .map_err(|e| if self.is_stopping() { ChatError::Stopping } else { ChatError::Transient(e.to_string()) })?;
+                .map_err(|e| if self.is_stopping() { ChatError::Stopping } else {
+                    match e.downcast_ref::<crate::ondemand::WindowPending>() { Some(p) => ChatError::Pending(p.msg.clone(), p.retry_s), None => ChatError::Transient(e.to_string()) }
+                })?;
             let i = slot.i;
             let (waited, sent_at) = (placed_at.elapsed(), Instant::now());
             let (url, from_url) = {
@@ -859,7 +878,7 @@ mod tests {
 
     fn router(nodes: Vec<NodeState>, move_threads: bool) -> Router {
         let cfg = Config { move_threads, spill_tokens: 1000, ..Config::default() };
-        Router { cfg, client: reqwest::Client::new(), xfer_client: reqwest::Client::new(), nodes: Mutex::new(nodes), counts: Mutex::new(Counts::default()), notify: Notify::new(), stopping: Default::default(), priority: Default::default(), priority_waiting: Default::default(), released: Default::default(), tickets: Default::default() }
+        Router { cfg, client: reqwest::Client::new(), xfer_client: reqwest::Client::new(), nodes: Mutex::new(nodes), counts: Mutex::new(Counts::default()), notify: Notify::new(), stopping: Default::default(), priority: Default::default(), priority_waiting: Default::default(), released: Default::default(), tickets: Default::default(), windows: Default::default() }
     }
 
     impl Router {
@@ -1108,5 +1127,41 @@ mod tests {
         assert!(!grant_held(&sh("2"), "http://n:1").await);
         assert!(!grant_held(&sh("1"), "http://other:1").await, "{{node}} is the node's url");
         assert!(!grant_held(&["/nonexistent/grant".to_string()], "http://n:1").await, "a missing tool is free");
+    }
+
+    #[tokio::test]
+    async fn a_window_model_starts_its_window_parks_and_defers_past_the_cap() {
+        // Ornith 397B (DECIDE 005bc072f2): no node up -> window_up runs once; park cap 1 -> the second turn is deferred
+        let d = tempfile::tempdir().unwrap();
+        let ups = d.path().join("ups");
+        let mut cfg = Config { nodes: vec!["a".into(), "w".into()], ..Config::default() };
+        cfg.node_meta.insert("w".into(), crate::config::NodeMeta { model: Some("orn".into()), down_wait_s: Some(30),
+            window_url: Some(format!("test -s {} && exit 2 || exit 1", ups.display())), window_up: Some(format!("echo up >> {}", ups.display())),
+            window_park: Some(1), window_retry_s: Some(90), ..Default::default() });
+        let mut w = serving(node("w", false, false), "orn");
+        w.up = false;
+        let r = Arc::new(Router { cfg, ..router(vec![node("a", false, true), w], true) });
+        let r1 = r.clone();
+        let first = tokio::spawn(async move { r1.placed("orn", Some("t1"), None, 10, &[]).await.map_err(|e| e.to_string()) });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(std::fs::read_to_string(&ups).unwrap().lines().count(), 1, "one window start");
+        let e = r.place("orn", Some("t2"), None, 10, &[]).await.err().expect("past the park cap");
+        let p = e.downcast_ref::<crate::ondemand::WindowPending>().expect("a WindowPending");
+        assert_eq!(p.retry_s, 90);
+        // the window opens: the parked turn is placed there
+        r.nodes.lock().await[1].up = true;
+        r.notify.notify_waiters();
+        let got = tokio::time::timeout(Duration::from_secs(3), first).await.unwrap().unwrap().unwrap();
+        assert_eq!(got, (1, None));
+        assert_eq!(std::fs::read_to_string(&ups).unwrap().lines().count(), 1, "no second start");
+    }
+
+    #[test]
+    fn a_window_engine_needs_its_own_model() {
+        let mut c = Config { nodes: vec!["http://a:1".into(), "http://w:2".into()], ..Config::default() };
+        c.node_meta.insert("http://w:2".into(), crate::config::NodeMeta { window_url: Some("true".into()), window_up: Some("true".into()), ..Default::default() });
+        assert!(c.check().is_err());
+        c.node_meta.get_mut("http://w:2").unwrap().model = Some("orn".into());
+        assert!(c.window_for("orn").is_some() && c.window_for(&c.model.clone()).is_none());
     }
 }

@@ -508,6 +508,23 @@ impl Store {
 
     /// A slice failed: count the attempt and set when it runs again. Past `max`, the events dead-letter.
     /// Returns the events that dead-lettered.
+    /// Run these events again in `retry_ms`, no attempt counted (nothing ran: an on-demand window is not open).
+    pub fn defer(&self, seqs: &[u64], retry_ms: u64) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut events = w.open_table(EVENTS)?;
+            for &s in seqs {
+                let Some(v) = events.get(s)? else { continue };
+                let mut ev: Event = dec(v.value())?;
+                drop(v);
+                ev.due_ms = now_ms() + retry_ms;
+                events.insert(s, enc(&ev).as_slice())?;
+            }
+        }
+        w.commit()?;
+        Ok(())
+    }
+
     pub fn failed(&self, seqs: &[u64], retry_ms: u64, max: u32) -> Result<Vec<Event>> {
         let w = self.db.begin_write()?;
         let mut dead = Vec::new();

@@ -224,7 +224,7 @@ impl Queue {
                 Outcome::Transient(format!("panic: {why}"))
             }
         };
-        let kind = match &outcome { Outcome::Done => "done", Outcome::Requeue => "requeued", Outcome::Transient(w) if w.starts_with("panic: ") => "", Outcome::Transient(_) => "transient", Outcome::Fatal(_) => "fatal" };
+        let kind = match &outcome { Outcome::Done => "done", Outcome::Requeue => "requeued", Outcome::Transient(w) if w.starts_with("panic: ") => "", Outcome::Transient(_) => "transient", Outcome::Fatal(_) => "fatal", Outcome::Defer(..) => "deferred" };
         if !kind.is_empty() { self.engine.metrics.slice(kind, began.elapsed().as_secs_f64()); }
         let result = match outcome {
             Outcome::Done => {
@@ -254,6 +254,12 @@ impl Queue {
                     }
                     Err(e) => Err(e),
                 }
+            }
+            Outcome::Defer(why, secs) => {
+                tracing::info!("{thread}: deferred {secs} s ({why})");
+                let r = self.store.defer(&seqs, secs * 1000);
+                self.reload_due(&seqs);
+                r
             }
             Outcome::Requeue => {
                 // nothing ran: the stored events are untouched (no attempt counted) and the next start runs them

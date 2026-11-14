@@ -61,6 +61,8 @@ pub enum Outcome {
     Transient(String),
     /// Nothing was committed and no retry can help; the events dead-letter now and the thread is closed.
     Fatal(String),
+    /// Nothing ran (an on-demand window is not open yet): the events run again in the given seconds, no attempt counted.
+    Defer(String, u64),
 }
 
 const UNKNOWN_TOOL_ROUNDS: usize = 3;
@@ -469,6 +471,7 @@ impl Engine {
                     return Ok(Outcome::Fatal(format!("the node refuses this thread's steering: {e}")));
                 }
                 Err(ChatError::Stopping) => return Ok(Outcome::Requeue),
+                Err(ChatError::Pending(e, s)) => return Ok(Outcome::Defer(e, s)),
                 Err(ChatError::Transient(e)) | Err(ChatError::Rejected(e)) => return Ok(Outcome::Transient(e)),
             };
             meta.node = Some(turn.node.clone());
@@ -1049,7 +1052,7 @@ impl Engine {
             let turn = match self.router.chat(Some(thread), meta.node.as_deref(), &body).await {
                 Ok(t) => t,
                 Err(ChatError::Stopping) => return Ok(Refocused::Stopping),
-                Err(ChatError::Transient(e)) => return Ok(Refocused::Failed(format!("refocus: {e}"))),
+                Err(ChatError::Transient(e)) | Err(ChatError::Pending(e, _)) => return Ok(Refocused::Failed(format!("refocus: {e}"))),
                 Err(ChatError::Rejected(_)) if body.get("tool_choice").is_some() => {
                     body.as_object_mut().unwrap().remove("tool_choice");
                     match self.router.chat(Some(thread), meta.node.as_deref(), &body).await {

@@ -268,6 +268,17 @@ pub struct NodeMeta {
     pub bearer_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_step: Option<u64>,
+    /// An on-demand window engine (ondemand.rs): `window_url` exits 0 open / 2 pending / 1 none, `window_up` starts a
+    /// window and returns at once. Both or neither, and only on a node with its own `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_up: Option<String>,
+    /// Turns that may wait for a loading window (default 8); the rest are deferred by `window_retry_s` (default 120).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_park: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_retry_s: Option<u64>,
 }
 
 impl Config {
@@ -289,6 +300,13 @@ impl Config {
     pub fn min_cover(&self, node: &str, prompt_tokens: u64) -> u64 {
         let step = self.node_meta.get(node).and_then(|m| m.keep_step).unwrap_or(0);
         prompt_tokens.saturating_sub(64 + step)
+    }
+
+    /// The window commands of `model`, when a node serving it is an on-demand window engine.
+    pub fn window_for(&self, model: &str) -> Option<crate::ondemand::WindowCmds> {
+        self.nodes.iter().filter(|u| self.node_model(u) == model).filter_map(|u| self.node_meta.get(u.as_str())).find_map(|m| {
+            Some(crate::ondemand::WindowCmds { url: m.window_url.clone()?, up: m.window_up.clone()?, park: m.window_park.unwrap_or(8), retry_s: m.window_retry_s.unwrap_or(120) })
+        })
     }
 
     /// The model a node serves: its `node_meta` model, else `model`.
@@ -338,8 +356,12 @@ impl Config {
         if self.operator_token == self.callback_token {
             bail!("operator_token and callback_token must differ");
         }
-        for u in self.node_meta.keys() {
+        for (u, m) in &self.node_meta {
             if !self.nodes.contains(u) { bail!("node_meta names {u:?}, which is not in nodes"); }
+            if m.window_url.is_some() != m.window_up.is_some() { bail!("node_meta {u:?}: window_url and window_up go together"); }
+            if m.window_url.is_some() && m.model.as_deref().is_none_or(|x| x == self.model) {
+                bail!("node_meta {u:?}: a window engine needs its own model (a turn of the default model must never start a window)");
+            }
         }
         for n in &self.nodes {
             if !(n.starts_with("http://") || n.starts_with("https://")) || n.ends_with('/') {
