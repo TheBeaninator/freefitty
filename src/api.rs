@@ -108,13 +108,17 @@ fn thread_id_ok(t: &str) -> bool {
 }
 
 async fn health(State(app): Shared) -> Json<Value> {
+    // the router's counts, with the live threads' reservations beside them (`live`, `live_held_slots`)
+    let mut router = serde_json::to_value(app.router.counts()).unwrap_or(Value::Null);
+    let (live, held) = app.router.live_view().await;
+    if let Value::Object(m) = &mut router { m.insert("live".into(), json!(live)); m.insert("live_held_slots".into(), json!(held)); }
     Json(json!({
         "status": "ok",
         "build": crate::BUILD,
         "uptime_s": now_ms().saturating_sub(app.started_ms) / 1000,
         "model": app.cfg.model,
         "nodes": app.router.view().await,
-        "router": app.router.counts(),
+        "router": router,
         "priority": app.router.priority_threads(),
         "queue": app.queue.stats(),
         "store": app.store.counts().unwrap_or(Value::Null),
@@ -286,8 +290,9 @@ async fn output(State(app): Shared, headers: HeaderMap, Query(q): Query<OutputQu
 
 async fn threads(State(app): Shared, headers: HeaderMap) -> Response {
     if let Err(r) = operator(&app, &headers) { return *r; }
+    let live = app.router.live_threads();
     match app.store.threads() {
-        Ok(ts) => Json(ts.into_iter().map(|(id, m)| json!({"thread": id, "created_ms": m.created_ms, "updated_ms": m.updated_ms, "node": m.node, "messages": m.messages, "bytes": m.bytes, "pending": m.pending.len(), "last": m.last, "closed": m.closed})).collect::<Vec<_>>()).into_response(),
+        Ok(ts) => Json(ts.into_iter().map(|(id, m)| json!({"live": live.contains(&id), "thread": id, "created_ms": m.created_ms, "updated_ms": m.updated_ms, "node": m.node, "messages": m.messages, "bytes": m.bytes, "pending": m.pending.len(), "last": m.last, "closed": m.closed})).collect::<Vec<_>>()).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -493,6 +498,7 @@ async fn delete_thread(State(app): Shared, headers: HeaderMap, Path(id): Path<St
     if app.queue.is_inflight(&id) { return err(StatusCode::CONFLICT, "a slice of this thread is running; try again when it has committed, or DELETE ?cancel=true"); }
     app.queue.forget_thread(&id);
     if let Some(p) = &app.engine.parking { p.forget(&id); }
+    app.router.end_live(&id);
     match app.store.delete_thread(&id) {
         Ok(()) => Json(json!({"deleted": id})).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),

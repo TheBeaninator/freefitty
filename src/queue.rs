@@ -66,6 +66,8 @@ impl Queue {
         }
         if ev.created_ms == 0 { ev.created_ms = now_ms(); }   // the mirror's copy ages from now too
         let seq = self.store.push(ev.clone())?;
+        // a person talking to a live-matching thread (live_threads): its slot is held from now, before its slice starts
+        if matches!(ev.kind, crate::store::EventKind::User { .. } | crate::store::EventKind::Subscription { .. }) { self.engine.touch_live(&ev.thread); }
         self.events.lock().unwrap().insert(seq, ev);
         self.notify.notify_one();
         Ok(Some(seq))
@@ -269,6 +271,7 @@ impl Queue {
             Outcome::Fatal(why) => {
                 tracing::error!("{thread}: {why}; its events are set aside and the thread is closed");
                 let r = self.store.bury(&seqs, &thread, &why).map(|_| ());
+                self.engine.router.end_live(&thread);
                 let _ = self.store.push_reply(&thread, &format!("Error: {why}. The thread is closed; start a new one."), reply_to.as_deref(), "error");
                 if let Some(ev) = self.engine.goldfish_failed(&thread, &why) { let _ = self.push(ev); }
                 self.replies.notify_waiters();

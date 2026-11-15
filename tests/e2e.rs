@@ -872,7 +872,6 @@ async fn old_results_page_out_in_batches_and_recall_pins_them() {
 #[tokio::test]
 async fn a_sleeper_is_parked_and_its_state_restored_on_waking() {
     let mut h = harness().await;
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     // any sleep counts as long here; the scripted one is 1 s
     h.cfg.park_after_s = 0;
     *h.model.kv.lock().unwrap() = Some(vec![7u8; 3 << 19]);
@@ -1479,6 +1478,67 @@ async fn the_operator_marks_and_unmarks_a_priority_thread() {
     api.post("/threads/thread-p/priority", json!({})).await;
     api.say("first", Some("thread-p")).await;
     assert!(api.output("thread-p", 10).await.is_some(), "a reply");
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_conversation_holds_a_slot_while_other_threads_fill_the_node() {
+    // a person talking to an agent: its replies must not wait behind other threads' long turns
+    let mut h = harness().await;
+    h.cfg.slice_timeout_s = 60;
+    h.cfg.live_threads = vec!["agent-*".into()];
+    h.cfg.live_idle_s = 4;
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    let calls = || h.model.calls.load(Ordering::Relaxed);
+    // a person's first message: the thread is live, holds a slot on its node, and answers
+    api.say("hello", Some("agent-x")).await;
+    assert_eq!(api.output("agent-x", 10).await.expect("a reply")["text"], "hi: hello");
+    let health = api.get("/health").await;
+    assert_eq!(health["router"]["live"][0]["thread"], "agent-x");
+    assert_eq!(health["router"]["live_held_slots"], 1);
+    let threads = api.get("/threads").await;
+    assert_eq!(threads.as_array().unwrap().iter().find(|t| t["thread"] == "agent-x").unwrap()["live"], true);
+    // three slow turns of other threads: the 2-slot node runs one, the other slot stays held for the live thread
+    for t in ["w1", "w2", "w3"] { api.say("slow turn", Some(t)).await; }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(calls(), 2, "hello and one slow turn; the other slow turns wait");
+    // the person speaks again: the turn runs at once, not after the 20 s slow turns
+    let t = std::time::Instant::now();
+    api.say("again", Some("agent-x")).await;
+    assert_eq!(api.output("agent-x", 5).await.expect("a prompt reply")["text"], "hi: again");
+    assert!(t.elapsed() < Duration::from_secs(3), "the live turn waited {:?}", t.elapsed());
+    assert_eq!(calls(), 3, "the slow turns still wait for the held slot");
+    // idle past live_idle_s, the slot returns to the others: the next slow turn starts long before the first ends
+    let freed = tokio::time::timeout(Duration::from_secs(10), async { while calls() < 4 { tokio::time::sleep(Duration::from_millis(100)).await; } }).await;
+    assert!(freed.is_ok(), "the held slot never returned to the other threads");
+    assert!(t.elapsed() >= Duration::from_secs(3), "it came back only once the thread went idle ({:?})", t.elapsed());
+    let health = api.get("/health").await;
+    assert_eq!((health["router"]["live"].as_array().unwrap().len(), health["router"]["live_held_slots"].as_u64()), (0, Some(0)));
+    for t in ["w3", "w2", "w1"] {
+        let d = api.c.delete(format!("{}/threads/{t}?cancel=true", api.base)).bearer_auth(&api.token).send().await.unwrap();
+        assert!(d.status().is_success(), "deleting {t}: {}", d.status());
+    }
+    r.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_live_threads_a_persons_thread_waits_like_any_other() {
+    let mut h = harness().await;
+    h.cfg.slice_timeout_s = 60;
+    let r = freefitty::start(h.cfg.clone()).await.unwrap();
+    let api = Api::new(&r);
+    for t in ["w1", "w2"] { api.say("slow turn", Some(t)).await; }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    api.say("hello", Some("agent-x")).await;
+    assert!(api.output("agent-x", 2).await.is_none(), "both slots run slow turns: the turn waits");
+    let health = api.get("/health").await;
+    assert_eq!((health["router"]["live"].as_array().unwrap().len(), health["router"]["live_held_slots"].as_u64()), (0, Some(0)));
+    // the waiting turn goes first: a turn committing while a cancelled thread is deleted would queue it again
+    for t in ["agent-x", "w1", "w2"] {
+        let d = api.c.delete(format!("{}/threads/{t}?cancel=true", api.base)).bearer_auth(&api.token).send().await.unwrap();
+        assert!(d.status().is_success(), "deleting {t}: {}", d.status());
+    }
     r.shutdown().await;
 }
 

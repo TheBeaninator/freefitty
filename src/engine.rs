@@ -685,6 +685,7 @@ impl Engine {
         let covered = meta.node.as_deref().map_or(meta.prompt_tokens.saturating_sub(64), |n| self.cfg.min_cover(n, meta.prompt_tokens));
         self.store.commit(Commit { thread, meta, messages: new_messages, done, done_ids, replies, events, invocations, new_threads })?;
         for c in commissions { self.register(c).await; }
+        if closed { self.router.end_live(thread); }
         if let Some(p) = &self.parking {
             // the node's cache is newer than any parked copy from here on, including one whose write began
             // before this slice and ended during it
@@ -709,6 +710,16 @@ impl Engine {
         let low = meta.compactions.last().map(|c| c.from as usize).unwrap_or(0);
         let from = (meta.window_from as usize).max(low).min(history.len());
         window::fade_images_before(messages, window::count_images(&history[..from]), meta.images_kept_from);
+    }
+
+    /// A person's message (a `User` or `Subscription` event) reached `thread`: with `live_threads` matching it, the
+    /// router holds a slot for it from now until `live_idle_s` after the last such message (router.rs, `Live`).
+    pub fn touch_live(&self, thread: &str) {
+        if !self.cfg.live_match(thread) { return; }
+        let meta = self.store.thread(thread).ok().flatten();
+        if meta.as_ref().is_some_and(|m| m.closed.is_some()) { return; }
+        let model = meta.as_ref().map_or_else(|| self.cfg.model.clone(), |m| self.model_of(m));
+        self.router.touch_live(thread, meta.and_then(|m| m.node), &model);
     }
 
     /// The model this thread runs on: its expert's, else the config's (the router places the turn on a node
