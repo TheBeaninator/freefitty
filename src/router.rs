@@ -16,6 +16,10 @@
 //! request's `model`, so a thread born from a DeepSeek expert lands on the StrixFold pair and every other thread
 //! stays on strixite. StrixFold's /health says `max_batch_size` and `live` {connections, waiting} where strixite
 //! says `slots`, `busy_slots` and `queued`; both are read.
+//!
+//! Live conversations (`live_threads`): a thread a person is talking to holds one slot for itself while it is live
+//! (`Live`), so its reply never waits behind other threads' long turns. Every other turn counts that slot as taken
+//! (`held_for_others`); the live thread's own turn takes it at once, ahead of every line.
 
 use crate::config::Config;
 use anyhow::{bail, Result};
@@ -114,6 +118,9 @@ pub struct Router {
     tickets: std::sync::atomic::AtomicU64,
     /// On-demand window engines' state (ondemand.rs).
     windows: crate::ondemand::Windows,
+    /// Live threads, oldest first (`Live`). Locked only briefly, with or without the nodes held, never across an
+    /// await: the nodes are never locked while this is.
+    live: std::sync::Mutex<Vec<Live>>,
 }
 
 /// Counts a priority turn as waiting until it is placed, fails or is dropped (a cancelled slice).
@@ -135,13 +142,22 @@ struct Hold<'a> {
     slot: bool,
     /// A wait's place in the node's queue (0 for a slot).
     ticket: u64,
+    /// The live thread whose held slot this is: given back, the slot is held for it again.
+    live: Option<String>,
 }
 
 impl Hold<'_> {
     /// Give it back under a lock the caller holds already.
     fn release_in(self, nodes: &mut [NodeState]) {
         release(&mut nodes[self.i], self.slot, self.ticket);
+        self.unbusy();
         std::mem::forget(self);
+    }
+    fn unbusy(&self) {
+        if let Some(t) = &self.live {
+            let mut live = self.r.live.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(l) = live.iter_mut().find(|l| &l.thread == t && l.node == Some(self.i)) { l.busy = false; }
+        }
     }
 }
 
@@ -151,12 +167,34 @@ impl Drop for Hold<'_> {
             Ok(mut nodes) => release(&mut nodes[self.i], self.slot, self.ticket),
             Err(_) => self.r.released.lock().unwrap_or_else(|e| e.into_inner()).push((self.i, self.slot, self.ticket)),
         }
+        self.unbusy();
         self.r.notify.notify_waiters();
     }
 }
 
 fn release(n: &mut NodeState, slot: bool, ticket: u64) {
     if slot { n.mine = n.mine.saturating_sub(1) } else { n.wanted = n.wanted.saturating_sub(1); n.queue.remove(&ticket); }
+}
+
+/// A live thread (`live_threads`: a person is talking to it) and the slot held for it. Live from a person's
+/// message until `until`; `node` is where its slot is held (None: not placed yet, its node went down or held, or
+/// `live_max` slots are held already; such a thread's turns go first as a priority thread's do).
+#[derive(Debug, Clone)]
+struct Live {
+    thread: String,
+    model: String,
+    /// The node of its last turn: the slot is held there when it can be.
+    home: Option<String>,
+    until: Instant,
+    node: Option<usize>,
+    /// Its own turn runs on `node` now: the slot it holds is in the node's load, not held besides it.
+    busy: bool,
+}
+
+/// Slots on node `i` held for live threads other than `me`. A live thread whose turn runs there now is not counted:
+/// its turn is in the node's load already. Every other turn sees `NodeState::free() - held_for_others(..)` free.
+fn held_for_others(live: &[Live], i: usize, me: Option<&str>) -> i64 {
+    live.iter().filter(|l| l.node == Some(i) && !l.busy && Some(l.thread.as_str()) != me).count() as i64
 }
 
 pub struct Turn {
@@ -216,6 +254,7 @@ impl Router {
             released: Default::default(),
             tickets: Default::default(),
             windows: Default::default(),
+            live: Default::default(),
         });
         for i in 0..cfg.nodes.len() {
             let r = r.clone();
@@ -240,6 +279,93 @@ impl Router {
         let mut v: Vec<String> = self.priority.lock().unwrap().iter().cloned().collect();
         v.sort();
         v
+    }
+
+    /// A person's message reached `thread` (home: the node of its last turn; model: the one its turns run on): a
+    /// thread matching `live_threads` is live for `live_idle_s` from now. Its slot is found at the next poll or at its
+    /// turn, whichever comes first (`tend_live`). False when the thread does not match.
+    pub fn touch_live(&self, thread: &str, home: Option<String>, model: &str) -> bool {
+        if !self.cfg.live_match(thread) { return false; }
+        let until = Instant::now() + Duration::from_secs(self.cfg.live_idle_s);
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        match live.iter_mut().find(|l| l.thread == thread) {
+            Some(l) => { l.until = until; if l.node.is_none() { l.home = home.or(l.home.take()); } }
+            None => {
+                tracing::info!("{thread}: live (a person is talking to it) for {} s", self.cfg.live_idle_s);
+                live.push(Live { thread: thread.to_owned(), model: model.to_owned(), home, until, node: None, busy: false });
+            }
+        }
+        drop(live);
+        self.notify.notify_waiters();
+        true
+    }
+
+    /// The thread is deleted or closed: it is live no more and its slot returns to the others.
+    pub fn end_live(&self, thread: &str) {
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let before = live.len();
+        live.retain(|l| l.thread != thread);
+        if live.len() != before {
+            tracing::info!("{thread}: live no more (deleted or closed); its slot is released");
+            drop(live);
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// The live threads' ids.
+    pub fn live_threads(&self) -> std::collections::HashSet<String> {
+        self.live.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|l| l.thread.clone()).collect()
+    }
+
+    /// The live threads for /health, and how many slots are held for them now: a thread whose turn runs holds its
+    /// slot, and an idle one holds it while its node has the slot free (else it takes the next one that frees there).
+    pub async fn live_view(&self) -> (Vec<Value>, usize) {
+        let nodes = self.lock_nodes().await;
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let now = Instant::now();
+        let mut idle_ahead = vec![0i64; nodes.len()];
+        let mut held = 0;
+        let v = live.iter().map(|l| {
+            let holding = l.node.is_some_and(|i| l.busy || { idle_ahead[i] += 1; nodes[i].free() >= idle_ahead[i] });
+            held += holding as usize;
+            serde_json::json!({"thread": l.thread, "node": l.node.map(|i| nodes[i].url.clone()), "holding": holding, "running": l.busy,
+                               "idle_in_s": l.until.saturating_duration_since(now).as_secs()})
+        }).collect();
+        (v, held)
+    }
+
+    /// Keep the reservations true (under the nodes lock, at every poll and every placement): a thread idle for
+    /// `live_idle_s` is live no more; a slot on a node that went down or is held is released; a live thread
+    /// without a slot gets one while fewer than `live_max` are held, on its home when that node is up and not held,
+    /// else on the node with the most slots free. A node never holds more reservations than it has slots.
+    fn tend_live(&self, nodes: &[NodeState]) {
+        if self.cfg.live_threads.is_empty() { return; }
+        let now = Instant::now();
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        live.retain(|l| {
+            if l.until > now { return true; }
+            tracing::info!("{}: live no more (idle {} s){}", l.thread, self.cfg.live_idle_s, if l.node.is_some() { "; its slot is released" } else { "" });
+            false
+        });
+        for l in live.iter_mut() {
+            if let Some(i) = l.node.filter(|&i| !nodes[i].up || nodes[i].held) {
+                tracing::info!("{}: slot on {} released (node {})", l.thread, nodes[i].url, if nodes[i].up { "held" } else { "down" });
+                (l.node, l.busy) = (None, false);
+            }
+        }
+        let mut count = vec![0u32; nodes.len()];
+        for i in live.iter().filter_map(|l| l.node) { count[i] += 1; }
+        let mut held: usize = count.iter().map(|&c| c as usize).sum();
+        for l in live.iter_mut().filter(|l| l.node.is_none()) {
+            if held >= self.cfg.live_max { break; }
+            let ok = |i: usize| nodes[i].up && !nodes[i].held && nodes[i].serves == l.model && count[i] < nodes[i].slots;
+            let home = l.home.as_deref().and_then(|h| (0..nodes.len()).find(|&i| nodes[i].url == h)).filter(|&i| ok(i));
+            let Some(i) = home.or_else(|| (0..nodes.len()).filter(|&i| ok(i)).max_by_key(|&i| (nodes[i].free() - count[i] as i64, std::cmp::Reverse(i)))) else { continue };
+            tracing::info!("{}: holding a slot on {} while live{}", l.thread, nodes[i].url, if nodes[i].free() - (count[i] as i64) > 0 { "" } else { " (the next one that frees there)" });
+            l.node = Some(i);
+            count[i] += 1;
+            held += 1;
+        }
     }
 
     /// The nodes, locked, with the holds dropped since the last lock given back.
@@ -311,6 +437,7 @@ impl Router {
                 read_health(n, up, &parsed);
                 if n.up && n.xfer.is_none() { xfer_unknown = true; }
                 if !n.up { n.xfer = None; }
+                self.tend_live(&nodes);
             }
             if xfer_unknown {
                 // the cache routes exist only with cache-xfer on: an empty export answers 400 there, 404 elsewhere, 409
@@ -337,7 +464,7 @@ impl Router {
     /// the usable nodes are full, and up to `node_down_wait_s` while none is up.
     async fn place(&self, model: &str, thread: Option<&str>, home: Option<&str>, tokens: u64, avoid: &[usize]) -> Result<(Hold<'_>, Option<usize>)> {
         let started = Instant::now();
-        let prio = thread.is_some_and(|t| self.priority.lock().unwrap().contains(t));
+        let marked = thread.is_some_and(|t| self.priority.lock().unwrap().contains(t));
         let mut _prio_wait: Option<PriorityWait> = None;
         // a newcomer's patience is newcomer_wait_s plus up to half again, so newcomers born together (several
         // goldfish of one turn) do not all turn overdue in the same second
@@ -356,6 +483,15 @@ impl Router {
                 let wt = waiting_on.as_ref().map(|w| (w.i, w.ticket));
                 let my = |i: usize| wt.filter(|&(j, _)| j == i).map(|(_, t)| t);
                 if self.is_stopping() { bail!("the daemon is stopping"); }
+                // live reservations: slots held for other live threads are not free to this turn (`resv`); a live
+                // thread's own held slot (`live_slot`) is its at once; a live thread holding none goes first as a
+                // priority one does. With `live_threads` empty every resv is 0 and nothing changes
+                self.tend_live(&nodes);
+                let (resv, is_live, live_node) = {
+                    let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+                    let me = thread.and_then(|t| live.iter().find(|l| l.thread == t));
+                    ((0..nodes.len()).map(|i| held_for_others(&live, i, thread)).collect::<Vec<i64>>(), me.is_some(), me.and_then(|l| l.node))
+                };
                 let up: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].up && nodes[i].serves == model && !avoid.contains(&i)).collect();
                 if up.is_empty() {
                     if let Some(w) = &window {
@@ -369,6 +505,9 @@ impl Router {
                     }
                 } else {
                     let h = home.and_then(|h| up.iter().copied().find(|&i| nodes[i].url == h));
+                    let live_slot = live_node.filter(|r| up.contains(r));
+                    let prio = marked || (is_live && live_slot.is_none());
+                    let fr = |i: usize| nodes[i].free() - resv[i];
                     // a slot freeing on a node goes to the threads waiting for that node (their cache is there)
                     // before a newcomer; past newcomer_wait_s a newcomer stops yielding, or under steady load new
                     // threads (goldfish, expert freezes) would never be placed (pod, 2026-11-08: 31 min). A thread
@@ -379,13 +518,21 @@ impl Router {
                     // leaves them one (a burst of overdue newcomers never takes a node's every slot from its own threads)
                     // a priority turn takes any free slot, home-waiters' included
                     let reserve = |w: u32| if prio { 0 } else if overdue { (w as i64 - 1).max(0) } else { w as i64 };
-                    let mut free: Vec<usize> = up.iter().copied().filter(|&i| !nodes[i].held && nodes[i].free() - reserve(nodes[i].waiting_besides(my(i))) > 0).collect();
+                    let mut free: Vec<usize> = up.iter().copied().filter(|&i| !nodes[i].held && fr(i) - reserve(nodes[i].waiting_besides(my(i))) > 0).collect();
                     // a node a thread can later leave with its cache first; then the least loaded
-                    free.sort_by_key(|&i| (nodes[i].xfer == Some(false), nodes[i].waiting_besides(my(i)) as i64 - nodes[i].free(), nodes[i].load(), i));
+                    free.sort_by_key(|&i| (nodes[i].xfer == Some(false), nodes[i].waiting_besides(my(i)) as i64 - fr(i), nodes[i].load(), i));
                     let yield_to_priority = !prio && self.priority_waiting.lock().unwrap().get(model).is_some_and(|&n| n > 0);
                     // a slot on the node a turn waits for goes to the turns that have waited there longest
-                    let turn_at = |i: usize| nodes[i].free() > if prio { 0 } else { nodes[i].ahead(my(i)) };
-                    let choice = if yield_to_priority { None } else { match h {
+                    let turn_at = |i: usize| fr(i) > if prio { 0 } else { nodes[i].ahead(my(i)) };
+                    // a live thread's held slot: its at once, ahead of every line; it leaves its home only where its
+                    // slot was found elsewhere (its home down or held), as a thread leaves a held home
+                    let leave = |r: usize| match h {
+                        None => (r, None, "new"),
+                        Some(h) if h == r => (r, None, "kept"),
+                        Some(h) if tokens <= self.cfg.spill_tokens || !self.cfg.move_threads || nodes[h].xfer == Some(false) => (r, None, "spilled"),
+                        Some(h) => (r, Some(h), "moved"),
+                    };
+                    let choice = if let Some(r) = live_slot { (fr(r) > 0).then(|| leave(r)) } else if yield_to_priority { None } else { match h {
                         Some(h) if !nodes[h].held && turn_at(h) => Some((h, None, "kept")),
                         None if !free.is_empty() => Some((free[0], None, "new")),
                         // a held home is left like a full one, and spilled when its state cannot move
@@ -401,7 +548,7 @@ impl Router {
                     // back: hopping whenever another line was shorter, it joined each at the back and waited 30-45 min
                     // (pod 2026-11-13, 19ff469); never moving, B's 22-deep line kept its turns while A and C sat near
                     // idle after a window (f5bdcd8). A home-waiter leaves only where its cache moves or its prompt is small
-                    let pos = |i: usize| nodes[i].ahead(my(i)) - nodes[i].free();
+                    let pos = |i: usize| nodes[i].ahead(my(i)) - fr(i);
                     let may_leave = overdue || tokens <= self.cfg.spill_tokens || h.is_some_and(|h| self.cfg.move_threads && nodes[h].xfer == Some(true));
                     let best = up.iter().copied().filter(|&i| !nodes[i].held).min_by_key(|&i| (pos(i), nodes[i].load(), i));
                     let line = if overdue { wt.map(|(j, _)| j).filter(|j| up.contains(j) && !nodes[*j].held).or(best) } else { h.filter(|&h| !nodes[h].held) };
@@ -409,7 +556,7 @@ impl Router {
                         (Some(l), Some(b)) if may_leave && b != l && pos(b) + REBALANCE_TURNS < pos(l) => Some(b),
                         (l, _) => l,
                     };
-                    let adopt = if choice.is_none() && !yield_to_priority { line.filter(|&l| Some(l) != h) } else { None };
+                    let adopt = if choice.is_none() && !yield_to_priority && live_slot.is_none() { line.filter(|&l| Some(l) != h) } else { None };
                     let choice = choice.or_else(|| adopt.filter(|&a| turn_at(a)).map(|a| match h {
                         None => (a, None, "new"),
                         Some(h) if tokens <= self.cfg.spill_tokens || !self.cfg.move_threads || nodes[h].xfer == Some(false) => (a, None, "spilled"),
@@ -418,26 +565,34 @@ impl Router {
                     if let Some((n, from, why)) = choice {
                         if let Some(w) = waiting_on.take() { w.release_in(&mut nodes); }
                         nodes[n].mine += 1;
+                        // a live thread's slot (held or not) is where its last turn ran: its home from now on
+                        let held_live = if is_live { thread.and_then(|t| {
+                            let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+                            let l = live.iter_mut().find(|l| l.thread == t)?;
+                            l.home = Some(nodes[n].url.clone());
+                            (l.node == Some(n)).then(|| { l.busy = true; t.to_owned() })
+                        }) } else { None };
                         let mut c = self.counts.lock().await;
                         match why { "kept" => c.kept += 1, "new" => c.new += 1, "spilled" => c.spilled += 1, _ => c.moved += 1 }
                         if waited { c.waited += 1; }
                         if why == "spilled" {
                             tracing::info!("thread leaves {} (full) for {}; it reads its ~{tokens}-token prompt again there", nodes[h.unwrap()].url, nodes[n].url);
                         }
-                        return Ok((Hold { r: self, i: n, slot: true, ticket: 0 }, from));
+                        return Ok((Hold { r: self, i: n, slot: true, ticket: 0, live: held_live }, from));
                     }
                     // yielding to a priority turn, a wait keeps its place: dropped and rejoined at the back each time a
                     // priority turn waited, overdue turns never reached the front (pod 2026-11-13: 40-62 min waits
                     // while pod-ff's expedited rounds waited for slots, the median wait 3 min)
                     let kept = wt.map(|(j, _)| j).filter(|j| up.contains(j) && !nodes[*j].held);
-                    let target = if yield_to_priority { kept.or(h.filter(|&h| !nodes[h].held)) } else { line };
+                    // waiting for its held slot's next free one, a live turn stands in no line: the others leave that slot to it
+                    let target = if live_slot.is_some() { None } else if yield_to_priority { kept.or(h.filter(|&h| !nodes[h].held)) } else { line };
                     if wt.map(|(j, _)| j) != target {
                         if let Some(w) = waiting_on.take() { w.release_in(&mut nodes); }
                         if let Some(w) = target {
                             let ticket = self.tickets.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                             nodes[w].wanted += 1;
                             nodes[w].queue.insert(ticket);
-                            waiting_on = Some(Hold { r: self, i: w, slot: false, ticket });
+                            waiting_on = Some(Hold { r: self, i: w, slot: false, ticket, live: None });
                         }
                     }
                     // a wait past 10 min says every 5 min where it stands, so a starved turn shows why (pod 2026-11-13:
@@ -445,7 +600,7 @@ impl Router {
                     if started.elapsed() >= Duration::from_secs(600) && reported.elapsed() >= Duration::from_secs(300) {
                         reported = Instant::now();
                         let at = waiting_on.as_ref().map(|w| w.i);
-                        let line = at.map(|j| format!("{}: {} ahead, {} free, {} waiting, {} tickets", nodes[j].url, nodes[j].ahead(my(j)), nodes[j].free(), nodes[j].wanted, nodes[j].queue.len())).unwrap_or_else(|| "in no line".into());
+                        let line = at.map(|j| format!("{}: {} ahead, {} free, {} waiting, {} tickets", nodes[j].url, nodes[j].ahead(my(j)), nodes[j].free() - resv[j], nodes[j].wanted, nodes[j].queue.len())).unwrap_or_else(|| "in no line".into());
                         tracing::warn!("{}: waiting {} s for a slot; home {:?}, overdue {overdue}, priority waiting {yield_to_priority}, {line}",
                                        thread.unwrap_or("(no thread)"), started.elapsed().as_secs(), h.map(|h| nodes[h].url.as_str()));
                     }
@@ -878,7 +1033,7 @@ mod tests {
 
     fn router(nodes: Vec<NodeState>, move_threads: bool) -> Router {
         let cfg = Config { move_threads, spill_tokens: 1000, ..Config::default() };
-        Router { cfg, client: reqwest::Client::new(), xfer_client: reqwest::Client::new(), nodes: Mutex::new(nodes), counts: Mutex::new(Counts::default()), notify: Notify::new(), stopping: Default::default(), priority: Default::default(), priority_waiting: Default::default(), released: Default::default(), tickets: Default::default(), windows: Default::default() }
+        Router { cfg, client: reqwest::Client::new(), xfer_client: reqwest::Client::new(), nodes: Mutex::new(nodes), counts: Mutex::new(Counts::default()), notify: Notify::new(), stopping: Default::default(), priority: Default::default(), priority_waiting: Default::default(), released: Default::default(), tickets: Default::default(), windows: Default::default(), live: Default::default() }
     }
 
     impl Router {
@@ -1111,6 +1266,106 @@ mod tests {
         r.set_priority("p", false);
         assert_eq!(r.priority_threads(), Vec::<String>::new());
         assert_eq!(r.placed(M, Some("p"), None, 10, &[]).await.unwrap(), (0, None));
+    }
+
+    fn live(thread: &str, node: Option<usize>, busy: bool) -> Live {
+        Live { thread: thread.into(), model: M.into(), home: None, until: Instant::now() + Duration::from_secs(60), node, busy }
+    }
+
+    #[test]
+    fn slots_held_for_live_threads_are_not_free_to_others() {
+        let l = vec![live("x", Some(0), false), live("y", Some(0), true), live("z", Some(1), false), live("w", None, false)];
+        // node 0: x's idle reservation counts against everyone but x; y's turn runs there, so it is in the load
+        assert_eq!(held_for_others(&l, 0, None), 1);
+        assert_eq!(held_for_others(&l, 0, Some("o")), 1);
+        assert_eq!(held_for_others(&l, 0, Some("x")), 0, "its own slot is free to it");
+        assert_eq!(held_for_others(&l, 0, Some("y")), 1);
+        assert_eq!(held_for_others(&l, 1, Some("x")), 1);
+        assert_eq!(held_for_others(&l, 2, None), 0, "w holds nothing");
+        // what a turn sees: slots - load - held for others; a 2-slot node with one turn and x's slot is full to others
+        let mut n = node("a", false, true);
+        n.mine = 1;
+        assert_eq!(n.free() - held_for_others(&l, 0, Some("o")), 0);
+        assert_eq!(n.free() - held_for_others(&l, 0, Some("x")), 1);
+        assert_eq!(held_for_others(&[], 0, Some("o")), 0, "no live threads: nothing changes");
+    }
+
+    fn live_router(nodes: Vec<NodeState>, idle_s: u64, max: usize) -> Arc<Router> {
+        let mut r = router(nodes, true);
+        (r.cfg.live_threads, r.cfg.live_idle_s, r.cfg.live_max) = (vec!["agent-*".into()], idle_s, max);
+        Arc::new(r)
+    }
+
+    #[tokio::test]
+    async fn a_live_thread_holds_a_slot_others_cannot_take_and_takes_it_at_once() {
+        let r = live_router(vec![node("a", false, true)], 2, 2);
+        assert!(!r.touch_live("worker-1", None, M), "a thread not matching live_threads is never live");
+        assert!(r.touch_live("agent-x", Some("a".into()), M));
+        r.tend_live(&r.lock_nodes().await);
+        assert_eq!(r.live.lock().unwrap()[0].node, Some(0), "its slot is held on its home");
+        // one other turn takes the one slot left; the next waits though the node shows a slot free
+        assert_eq!(r.placed(M, Some("w1"), None, 10, &[]).await.unwrap(), (0, None));
+        let waiting = { let r = r.clone(); tokio::spawn(async move { r.placed(M, Some("w2"), None, 10, &[]).await.unwrap() }) };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "the held slot is not free to another thread");
+        // the live thread's turn takes it at once, ahead of the waiting one
+        let (slot, _) = tokio::time::timeout(Duration::from_secs(1), r.place(M, Some("agent-x"), Some("a"), 10, &[])).await.expect("at once").unwrap();
+        assert!(r.live.lock().unwrap()[0].busy);
+        assert_eq!(r.live_view().await.1, 1);
+        drop(slot);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "its turn done, the slot is held for it again");
+        // idle past live_idle_s: the slot returns to the others
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        r.tend_live(&r.lock_nodes().await);
+        r.notify.notify_waiters();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(3), waiting).await.expect("placed once the thread idles").unwrap(), (0, None));
+        assert!(r.live_threads().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_live_thread_on_a_full_node_takes_the_next_slot_that_frees() {
+        let mut a = node("a", false, true);
+        a.mine = 2;  // full of other threads' turns
+        let r = live_router(vec![a], 60, 2);
+        let waiting = { let r = r.clone(); tokio::spawn(async move { r.placed(M, Some("w"), Some("a"), 10, &[]).await.unwrap() }) };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        r.touch_live("agent-x", None, M);
+        r.tend_live(&r.lock_nodes().await);
+        assert_eq!(r.live.lock().unwrap()[0].node, Some(0));
+        assert_eq!(r.live_view().await.1, 0, "not holding yet: no slot is free");
+        { let mut n = r.lock_nodes().await; n[0].mine = 1; }  // a slot frees: held for the live thread, not the waiter
+        r.notify.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!waiting.is_finished(), "the earlier waiter does not take it");
+        assert_eq!(r.live_view().await.1, 1);
+        r.end_live("agent-x");  // deleted or closed: released
+        assert_eq!(tokio::time::timeout(Duration::from_secs(3), waiting).await.expect("placed once released").unwrap(), (0, None));
+    }
+
+    #[tokio::test]
+    async fn past_live_max_a_live_thread_goes_first_as_priority() {
+        let r = live_router(vec![node("a", false, true), node("b", false, true)], 60, 1);
+        r.touch_live("agent-x", Some("a".into()), M);
+        r.touch_live("agent-y", Some("b".into()), M);
+        r.tend_live(&r.lock_nodes().await);
+        { let l = r.live.lock().unwrap(); assert_eq!((l[0].node, l[1].node), (Some(0), None), "live_max 1: one reservation"); }
+        assert_eq!(r.live_view().await.1, 1);
+        { let mut n = r.lock_nodes().await; n[1].mine = 2; n[0].mine = 1; }  // b full; a has only x's slot left
+        let y = { let r = r.clone(); tokio::spawn(async move { r.placed(M, Some("agent-y"), Some("b"), 10, &[]).await.unwrap() }) };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(r.priority_waiting.lock().unwrap().get(M).copied(), Some(1), "y waits as a priority turn");
+        // a node going down releases its reservation, and x's slot is found again on b (the next one that frees)
+        r.lock_nodes().await[0].up = false;
+        r.tend_live(&r.lock_nodes().await);
+        { let l = r.live.lock().unwrap(); assert_eq!((l[0].node, l[1].node), (Some(1), None)); }
+        // x goes (deleted): y gets the reservation, and b's next free slot is its
+        r.end_live("agent-x");
+        r.tend_live(&r.lock_nodes().await);
+        assert_eq!(r.live.lock().unwrap()[0].node, Some(1));
+        r.lock_nodes().await[1].mine = 1;
+        r.notify.notify_waiters();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(3), y).await.expect("y placed").unwrap(), (1, None));
     }
 
     #[tokio::test]
