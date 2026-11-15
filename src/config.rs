@@ -49,6 +49,18 @@ pub struct Config {
     /// any free slot (else steady load starves new threads: goldfish, expert freezes).
     #[serde(default = "d_newcomer_wait")]
     pub newcomer_wait_s: u64,
+    /// Live conversation reservations: thread ids (exact, or a prefix ending in `*`, like `agent-*`) whose turns a
+    /// person waits on. Such a thread is live from a person's message (a `User` or `Subscription` event) until
+    /// `live_idle_s` after the last one, and while live the router holds one slot for it on its node, so its reply
+    /// never waits behind other threads' long turns. Empty (the default): no reservations, scheduling as before.
+    #[serde(default)]
+    pub live_threads: Vec<String>,
+    #[serde(default = "d_live_idle")]
+    pub live_idle_s: u64,
+    /// The most slots held for live threads at once across the cluster; a live thread past it goes first as a
+    /// priority thread does instead.
+    #[serde(default = "d_live_max")]
+    pub live_max: usize,
     /// Park a quiet thread's cached state on this host's disk and put it back into the node that runs its next
     /// turn (strixite cache-xfer = on). A node's own disk tier is small and capped, so a sleeper's state is
     /// otherwise often dropped and its next turn reads the whole prompt again.
@@ -229,6 +241,8 @@ fn d_spill() -> u64 { 16_384 }
 fn d_true() -> bool { true }
 fn d_park_after() -> u64 { 300 }
 fn d_newcomer_wait() -> u64 { 30 }
+fn d_live_idle() -> u64 { 600 }
+fn d_live_max() -> usize { 2 }
 fn d_backup_every() -> u64 { 24 }
 fn d_backup_keep() -> usize { 7 }
 fn d_steer_scale() -> f64 { 8.0 }
@@ -311,6 +325,11 @@ impl Config {
         self.nodes.iter().filter(|u| self.node_model(u) == model).filter_map(|u| self.node_meta.get(u.as_str())).find_map(|m| {
             Some(crate::ondemand::WindowCmds { url: m.window_url.clone()?, up: m.window_up.clone()?, park: m.window_park.unwrap_or(8), retry_s: m.window_retry_s.unwrap_or(120) })
         })
+    }
+
+    /// Whether a thread id matches `live_threads`: exactly, or by the prefix before a trailing `*`.
+    pub fn live_match(&self, thread: &str) -> bool {
+        self.live_threads.iter().any(|p| match p.strip_suffix('*') { Some(pre) => thread.starts_with(pre), None => thread == p })
     }
 
     /// The model a node serves: its `node_meta` model, else `model`.
@@ -512,6 +531,18 @@ mod tests {
         }
         assert!(c.model_read(&p(&home.join("experts/e.toml"))).is_ok(), "expert definitions stay readable");
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn live_threads_match_exactly_or_by_prefix() {
+        let c = Config::default();
+        assert!(c.live_threads.is_empty() && !c.live_match("agent-a"), "off by default");
+        assert_eq!((c.live_idle_s, c.live_max), (600, 2));
+        let c = Config { live_threads: vec!["agent-*".into(), "scout".into()], ..Config::default() };
+        assert!(c.live_match("agent-a") && c.live_match("agent-") && c.live_match("scout"));
+        assert!(!c.live_match("agent") && !c.live_match("scout2") && !c.live_match("my-agent-a"));
+        let all = Config { live_threads: vec!["*".into()], ..Config::default() };
+        assert!(all.live_match("anything"));
     }
 
     #[test]
