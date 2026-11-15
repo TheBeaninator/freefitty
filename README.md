@@ -14,6 +14,11 @@ is a language model. The model has no loop; the scheduler is the loop and the mo
 ends the step, so sleeping costs nothing, a retry re-runs a step that committed nothing, and running a turn exactly
 once falls out of the commit boundary. Everything else in this file follows from that one choice.
 
+**Its siblings.** [strixflerp](https://github.com/TheBeaninator/strixflerp) is a modular Strix Halo engine that
+serves the models FreeFitty's threads run on, and [buzz-rap](https://github.com/TheBeaninator/buzz-rap) gives
+threads their own identities in a [Buzz](https://github.com/block/buzz) workspace, so people reach the agents in
+channels and direct messages from the Buzz apps.
+
 ## Why
 
 [hydro-project/infinity](https://github.com/hydro-project/infinity) showed the model this file builds on: an agent
