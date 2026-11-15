@@ -140,6 +140,9 @@ below explain each one; this is the list, with defaults.
 | `spill_tokens` | 16384 | a thread under this may leave a full node and read its prompt again |
 | `move_threads` | on | a thread over it leaves a full node with its cache |
 | `newcomer_wait_s` | 30 | how long home-waiters keep a freed slot from a new thread |
+| `live_threads` | none | thread ids (exact, or a prefix ending in `*`) that hold a slot while a person talks to them; none: off |
+| `live_idle_s` | 600 | how long after a person's last message a live thread keeps its slot |
+| `live_max` | 2 | the most slots held for live threads at once; a live thread past it goes first as a priority thread |
 | `node_down_wait_s` | 120 | how long a turn waits while no node serving its model is up |
 | `grant_cmd`, `grant_check_s` | none, 5 | the command that says a node is held, and how often it runs |
 | `tool_servers`, `toolset_refresh_s` | none, 300 | RAP servers and how often their manifests are read |
@@ -216,7 +219,18 @@ routes first. While a thread's node is full the turn waits in the router, and a 
 before any newcomer, for at most `newcomer_wait_s` (30, plus up to half again at random): past that a newcomer
 takes any free slot, or steady load would never place a new thread (a goldfish, an expert's freeze); where two or
 more threads wait for their home, one slot stays theirs, and with no free slot at all an overdue newcomer queues on
-one node. A thread whose node is down or held counts as a newcomer. A thread marked priority (`POST /threads/{id}/priority`, in memory until a restart) goes first: while one of its turns waits for a slot no other turn takes one, and it takes any free slot, one that home-waiters want included. A thread leaves its node only when the node is full and the thread is under `spill_tokens` (it
+one node. A thread whose node is down or held counts as a newcomer. A thread marked priority (`POST /threads/{id}/priority`, in memory until a restart) goes first: while one of its turns waits for a slot no other turn takes one, and it takes any free slot, one that home-waiters want included. A thread matching `live_threads` is **live** from a person's message (a `/say`,
+or a subscription event such as a Buzz DM) until `live_idle_s` (600) after the last one; its own tool results,
+wake-ups and refocus do not extend it. While live, the router holds one slot for it: on its home node when that is
+up and not held, else on the node with the most free slots, never more reservations on a node than it has slots.
+Every other turn, priority ones included, counts the slots held for other threads as taken (a node's free slots are
+its `slots` less its load from `/health` and its own turns, less those reservations), and the live thread's turn
+takes its slot at once, ahead of every line; if no slot was free when it went live, the next one that frees on its
+node is its. The slot returns to everyone when the thread goes idle, is deleted or closed, or its node goes down or
+is held (it is found again elsewhere while the thread is still live). At most `live_max` (2) slots are held at
+once; a live thread past that goes first as a priority thread does. `/health` lists the reservations under
+`router.live` with `router.live_held_slots`, `/threads` marks live threads, and each start and end is logged.
+With `live_threads` empty nothing is reserved. A thread leaves its node only when the node is full and the thread is under `spill_tokens` (it
 reads its prompt again) or, with `move_threads`, by taking its state along: `POST /cache/export` on the old node
 streams into `POST /cache/import` on the new one (strixite with `cache-xfer = on`), then the turn runs there. A node
 that refuses a connection is down until its `/health` answers; a turn that never reached it goes to another. While
@@ -278,7 +292,7 @@ limit (`max_body_bytes`) bounds what a tool can send, so a tool should downscale
 ```
 POST /say                 {text, thread?, expert?, tools?, metadata?}  -> {thread, id} operator token
 GET  /output?wait&thread  the oldest uncollected reply; removed once sent; 204 if none  operator token
-GET  /threads             id, size, pending calls, last message kind, node, closed      operator token
+GET  /threads             id, size, pending calls, last message kind, node, closed, live operator token
 GET  /threads/{id}        meta: live_tokens, prompt_tokens, window, compaction, expert  operator token
 GET  /threads/{id}/messages[?view=live][&tail=N]   the store, or what the model sees    operator token
 PUT  /threads/{id}/messages {messages}   a history for a thread that has none           operator token
@@ -290,7 +304,7 @@ GET  /dlq                 POST /dlq/redrive, /dlq/drop with {thread?}           
 GET  /experts             POST /experts/reload, /experts/{name}/warm, /experts/from-thread/{id}   operator token
 GET  /prompt              each hoisted command's version, and whether its output changed  operator token
 POST /rap/callback        or /rap/callback/{token}: a tool's result                    callback token
-GET  /health              status, build, uptime_s, model, priority, tools, prompt.hoisted, nodes, router counts, queue, store
+GET  /health              status, build, uptime_s, model, priority, tools, prompt.hoisted, nodes, router counts and live reservations, queue, store
 GET  /metrics             Prometheus text: slices by outcome, slice/turn/slot-wait histograms, per-node turns and cached tokens
 POST /admin/backup        a consistent snapshot of the store into <data_dir>/backups                    operator token
 ```
@@ -574,7 +588,8 @@ Each of these is a property of the design, not a patch on it.
 ## Tests
 
 `cargo test` runs the unit tests (the window's cut, stubs, notice, paging boundary, batch and handle, and replay; the
-estimate's scaling; argument repair; the router's placement with held nodes; saved-state pruning and its epoch) and
+estimate's scaling; argument repair; the router's placement with held nodes; live reservations' pattern matching, free-slot arithmetic, next-free-slot
+claim, release and `live_max` overflow; saved-state pruning and its epoch) and
 `tests/e2e.rs`: the daemon against a scripted model node and a RAP tool server, in process. What the e2e tests cover:
 
 - **Turns and the queue:** a plain turn; a sleep through the queue; a RAP tool whose result is posted twice;
@@ -608,7 +623,8 @@ estimate's scaling; argument repair; the router's placement with held nodes; sav
   wakes, nothing parked when the node holds nothing, its file removed with the thread; a node already holding a
   state not sent it again; a node behind an API key getting its bearer token; a node naming another cache-routes
   version not used for transfers; a tool's images reaching the model;
-  the operator marking and unmarking a priority thread.
+  the operator marking and unmarking a priority thread; a live conversation answering at once while other threads'
+  slow turns fill the node, its held slot returning to them once it idles, and nothing held with `live_threads` empty.
 - **Operations:** `/metrics` after a turn (outcome, cached tokens per node, histograms); a snapshot on demand that
   reopens with its schema; a store from a newer schema refused.
 
